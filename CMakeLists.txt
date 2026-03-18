@@ -9,13 +9,13 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 find_package(rocprofiler-sdk REQUIRED)
 find_package(LLVM REQUIRED CONFIG)
-add_definitions(${LLVM_DEFINITIONS})
-include_directories(${LLVM_INCLUDE_DIRS})
-link_directories(${LLVM_LIBRARY_DIR})
-
 find_package(SQLite3)
 
 add_subdirectory(3rd_party)
+
+add_definitions(${LLVM_DEFINITIONS})
+include_directories(SYSTEM ${LLVM_INCLUDE_DIRS})
+link_directories(${LLVM_LIBRARY_DIR})
 
 if(EXISTS "${ROCPROF_TRACE_DECODER_PATH}/include/rocprof-trace-decoder/trace_decoder_api.h")
   include_directories("${ROCPROF_TRACE_DECODER_PATH}/include/rocprof-trace-decoder")
