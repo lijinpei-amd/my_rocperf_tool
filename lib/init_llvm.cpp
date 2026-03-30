@@ -1,17 +1,12 @@
+#include "my_rocperf_tool/init_llvm.h"
+
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/CommandLine.h"
-#include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/TargetSelect.h"
 
 namespace my_rocperf_tool {
 
-static union alignas(llvm::InitLLVM) {
-  char storage[sizeof(llvm::InitLLVM)];
-} X;
-
-void init_llvm(int argc, const char *argv[]) {
-  new (&X.storage) llvm::InitLLVM(argc, argv);
-
+InitLLVM::InitLLVM(int &Argc, const char **&Argv) : llvm::InitLLVM(Argc, Argv) {
   // Initialize targets and assembly printers/parsers.
   llvm::InitializeAllTargetInfos();
   llvm::InitializeAllTargetMCs();
@@ -22,11 +17,7 @@ void init_llvm(int argc, const char *argv[]) {
   llvm::cl::AddExtraVersionPrinter(
       llvm::TargetRegistry::printRegisteredTargetsForVersion);
 
-  llvm::cl::ParseCommandLineOptions(argc, argv, "my rocperf tool\n");
-}
-
-void fini_llvm() {
-  static_cast<llvm::InitLLVM *>((void *)&X.storage[0])->~InitLLVM();
+  llvm::cl::ParseCommandLineOptions(Argc, Argv, "my rocperf tool\n");
 }
 
 } // namespace my_rocperf_tool

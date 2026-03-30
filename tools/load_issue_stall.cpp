@@ -210,7 +210,6 @@ void dump_states(my_rocperf_tool::Disassembler &disas,
                                                    virt_addr, llvm::outs());
       if (status == llvm::MCDisassembler::Success) {
         obj.streamer->emitInstruction(inst, *obj.sub_target);
-        std::cout << obj.inst_str;
         const_cast<std::string &>(obj.inst_str).clear();
       } else {
         assert(false);
@@ -220,8 +219,6 @@ void dump_states(my_rocperf_tool::Disassembler &disas,
       auto stats_range = stats.get_inst_at(pc);
       for (const auto &stat : stats_range) {
         assert(stat.stall <= stat.duration);
-        std::cout << "duration: " << stat.stall << ' ' << stat.duration << ' '
-                  << stat.time << '\n';
       }
       sec_offset += inst_size;
       virt_addr += inst_size;
@@ -319,8 +316,8 @@ int main(int argc, char *argv[]) {
     std::cerr << "--att_output_dir not specified\n";
     return 2;
   }
-  my_rocperf_tool::init_llvm(1, (const char **)argv);
-  auto res = run_main(*att_output_dir);
-  my_rocperf_tool::fini_llvm();
-  return res;
+  int LLVMArgc = 1;
+  const char **LLVMArgv = const_cast<const char **>(argv);
+  my_rocperf_tool::InitLLVM X(LLVMArgc, LLVMArgv);
+  return run_main(*att_output_dir);
 }

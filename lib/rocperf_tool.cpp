@@ -9,6 +9,7 @@
 #include "llvm/ADT/StringRef.h"
 
 #include <iostream>
+#include <optional>
 
 namespace my_rocperf_tool {
 
@@ -58,10 +59,14 @@ void RocPerfTool::code_object_tracing_callback(
 
 namespace {
 
+static int LLVMArgc = 1;
+static const char *LLVMArgv[] = {"my-rocperf-tool"};
+static const char **LLVMArgvPtr = LLVMArgv;
+static std::optional<my_rocperf_tool::InitLLVM> LLVMInit;
+
 int init_perftool(rocprofiler_client_finalize_t finalize_func,
                   void *tool_data) {
-  const char *argv[] = {"my-rocperf-tool"};
-  my_rocperf_tool::init_llvm(1, argv);
+  LLVMInit.emplace(LLVMArgc, LLVMArgvPtr);
   auto *perf_tool = static_cast<my_rocperf_tool::RocPerfTool *>(tool_data);
   perf_tool->init();
   return ROCPROFILER_STATUS_SUCCESS;
@@ -70,7 +75,7 @@ int init_perftool(rocprofiler_client_finalize_t finalize_func,
 void fini_perftool(void *tool_data) {
   auto *perf_tool = static_cast<my_rocperf_tool::RocPerfTool *>(tool_data);
   perf_tool->finish();
-  my_rocperf_tool::fini_llvm();
+  LLVMInit.reset();
 }
 
 } // namespace

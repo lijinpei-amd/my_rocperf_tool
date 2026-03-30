@@ -1,6 +1,12 @@
 #pragma once
 
+#include "llvm/Support/InitLLVM.h"
+
 namespace my_rocperf_tool {
-void init_llvm(int argc, const char *argv[]);
-void fini_llvm();
+
+class InitLLVM : public llvm::InitLLVM {
+public:
+  InitLLVM(int &Argc, const char **&Argv);
+};
+
 } // namespace my_rocperf_tool
