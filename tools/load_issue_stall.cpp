@@ -119,15 +119,12 @@ struct trace_decoder_context {
 
 uint64_t att_decoder_se_data_callback(uint8_t **buffer, uint64_t *buffer_size,
                                       void *userdata) {
-  std::cout << "enter att_decoder_se_data_callback\n";
   auto &ctx = *reinterpret_cast<trace_decoder_context *>(userdata);
   if (!ctx.first_run) {
-    std::cout << "early-return zero\n";
     return 0;
   }
   ctx.first_run = false;
   uint64_t data_size = ctx.att_file_size;
-  std::cout << "return " << data_size << std::endl;
   *buffer_size = data_size;
   *buffer = (uint8_t *)ctx.att_file_content.get();
   return data_size;
@@ -137,8 +134,6 @@ rocprofiler_thread_trace_decoder_status_t att_decoder_isa_callback(
     char *isa_instruction, uint64_t *isa_memory_size, uint64_t *isa_size,
     rocprofiler_thread_trace_decoder_pc_t pc, void *userdata) {
   assert(pc.code_object_id != 0);
-  std::cout << "decoding pc: " << pc.address << " " << pc.code_object_id
-            << std::endl;
   auto &ctx = *reinterpret_cast<trace_decoder_context *>(userdata);
   auto &obj_file = ctx.disas.get_object_file_by_id(pc.code_object_id);
   uint64_t inst_size;
@@ -148,25 +143,19 @@ rocprofiler_thread_trace_decoder_status_t att_decoder_isa_callback(
   obj_file.inst_str.clear();
   llvm::StringRef inst_ref = llvm::StringRef(inst_str).trim();
   auto str_size = inst_ref.size();
-  std::cout << "decoding: " << inst_ref.data() << std::endl;
-  std::cout << "isa_memory_size: " << inst_size << std::endl;
   if (*isa_size < str_size) {
     *isa_size = str_size;
-    std::cout << "return out of resrouce\n";
     return ROCPROFILER_THREAD_TRACE_DECODER_STATUS_ERROR_OUT_OF_RESOURCES;
   }
   memcpy(isa_instruction, inst_ref.data(), str_size);
   *isa_size = str_size;
   *isa_memory_size = inst_size;
-  std::cout << "return success\n";
   return ROCPROFILER_THREAD_TRACE_DECODER_STATUS_SUCCESS;
 }
 
 rocprofiler_thread_trace_decoder_status_t att_decoder_trace_callback(
     rocprofiler_thread_trace_decoder_record_type_t record_type_id,
     void *trace_events, uint64_t trace_size, void *userdata) {
-  std::cout << "trace-callback: " << int(record_type_id) << " " << trace_size
-            << std::endl;
   auto &ctx = *reinterpret_cast<trace_decoder_context *>(userdata);
   switch (record_type_id) {
   default:
@@ -177,37 +166,23 @@ rocprofiler_thread_trace_decoder_status_t att_decoder_trace_callback(
     for (size_t wave_n = 0; wave_n < trace_size; wave_n++) {
       const auto &wave = wave_events[wave_n];
 
-      std::cout << "wave instr size: " << wave.instructions_size << std::endl;
-      unsigned real_inst = 0;
-      uint64_t min_pc = ~0ULL, max_pc = 0ULL;
       int64_t last_time = wave.begin_time;
       for (size_t j = 0; j < wave.instructions_size; j++) {
         const auto &inst = wave.instructions_array[j];
         if (inst.pc.code_object_id == 0 && inst.pc.address == 0)
           continue;
-        ++real_inst;
         assert(inst.pc.code_object_id != 0);
         uint32_t idle;
         if (inst.time >= last_time) {
           idle = inst.time - last_time;
           assert(last_time + idle == inst.time);
         } else {
-          std::cout << "misleading idle: " << last_time - inst.time << " @ "
-                    << inst.pc.address << " , " << inst.pc.code_object_id
-                    << std::endl;
           idle = 0;
         }
         auto res = ctx.stats.add_inst(inst, idle);
         last_time = inst.time + inst.duration;
         assert(res);
-        std::cout << "adding pc: " << inst.pc.address << " "
-                  << inst.pc.code_object_id << std::endl;
-        min_pc = std::min(min_pc, inst.pc.address);
-        max_pc = std::max(max_pc, inst.pc.address);
       }
-      std::cout << "real inst size: " << real_inst << std::endl;
-      std::cout << "min_pc: " << min_pc << std::endl;
-      std::cout << "max_pc: " << max_pc << std::endl;
     }
   }
   return ROCPROFILER_THREAD_TRACE_DECODER_STATUS_SUCCESS;
@@ -215,12 +190,6 @@ rocprofiler_thread_trace_decoder_status_t att_decoder_trace_callback(
 
 void dump_states(my_rocperf_tool::Disassembler &disas,
                  my_rocperf_tool::InstStatistics &stats) {
-  auto size = stats.size();
-  std::cout << "stats size: " << size << std::endl;
-  for (const auto &kv : stats.getInsts()) {
-    std::cout << "pc: " << kv.first.address << " " << kv.first.code_object_id
-              << " " << kv.second.size() << std::endl;
-  }
   for (const auto &[obj_id, obj] : disas.get_object_files()) {
     uint64_t text_sec_offset = obj.text_sec_offset;
     uint64_t text_sec_address = obj.text_sec_address;
@@ -234,10 +203,6 @@ void dump_states(my_rocperf_tool::Disassembler &disas,
                                         section_buffer.size()};
     uint64_t virt_addr = load_base;
     uint64_t sec_offset = 0;
-    std::cout << "load_base: " << obj.load_base << "\n";
-    std::cout << "sec-offset: " << text_sec_offset << "\n";
-    std::cout << "sec-addr: " << text_sec_address << "\n";
-    std::cout << "obj-id: " << obj_id << "\n";
     while (!bytes.empty()) {
       llvm::MCInst inst;
       uint64_t inst_size;
@@ -248,11 +213,9 @@ void dump_states(my_rocperf_tool::Disassembler &disas,
         std::cout << obj.inst_str;
         const_cast<std::string &>(obj.inst_str).clear();
       } else {
-        std::cout << "disassemble failed\n";
         assert(false);
       }
       uint64_t addr = sec_offset + text_sec_address;
-      std::cout << "try get pc: " << addr << std::endl;
       rocprofiler_thread_trace_decoder_pc_t pc{addr, obj_id};
       auto stats_range = stats.get_inst_at(pc);
       for (const auto &stat : stats_range) {
@@ -271,14 +234,14 @@ int run_main(const std::string &att_output_dir) {
   auto out_dir = scan_att_output_dir(att_output_dir);
   sqlite3 *db;
   if (sqlite3_open(out_dir.db_path.path.c_str(), &db)) {
-    std::cout << "open db failed: " << sqlite3_errmsg(db) << std::endl;
+    std::cerr << "open db failed: " << sqlite3_errmsg(db) << std::endl;
   }
   std::unordered_map<int, uint64_t> object_load_bases;
   const char *sql = "SELECT * FROM 'code_objects';";
   sqlite3_stmt *stmt;
   int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
   if (rc != SQLITE_OK) {
-    printf("error occurred: %s", sqlite3_errmsg(db));
+    std::cerr << "error occurred: " << sqlite3_errmsg(db) << std::endl;
     return 1;
   }
   int NoOfCols = sqlite3_column_count(stmt);
@@ -327,8 +290,6 @@ int run_main(const std::string &att_output_dir) {
     att_file_content.reset(new char[att_file_size]);
     att_file.read(att_file_content.get(), att_file_size);
   }
-  std::cout << "att_file_size: " << att_file_size << std::endl;
-
   trace_decoder_context decoder_ctx{
       true,
       std::move(att_file_content),

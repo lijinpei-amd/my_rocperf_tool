@@ -13,8 +13,6 @@
 #include "llvm/Support/Format.h"
 #include "llvm/TargetParser/Triple.h"
 
-#include <iostream>
-
 namespace {
 struct IsaInfo {
   llvm::StringRef IsaName;
@@ -142,7 +140,6 @@ void ObjectFileInfo::disassemble(
         if (status == llvm::MCDisassembler::Success) {
           streamer->emitInstruction(inst, *sub_target);
         } else {
-          std::cout << "disassemble failed\n";
           assert(false);
         }
         virt_addr += inst_size;
@@ -150,7 +147,6 @@ void ObjectFileInfo::disassemble(
       }
     }
   }
-  std::cout << inst_str << "\n";
   inst_str.clear();
 }
 
