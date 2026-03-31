@@ -1,10 +1,10 @@
+#include "my_rocperf_tool/att_output_dir.h"
 #include "my_rocperf_tool/disassembler.h"
 #include "my_rocperf_tool/init_llvm.h"
 #include "my_rocperf_tool/inst_statistics.h"
 
 #include "absl/flags/flag.h"
 #include "absl/flags/parse.h"
-#include "sqlite3.h"
 
 #if ROCPROF_TRACE_DECODER_NEW
 #include "trace_decoder_api.h"
@@ -15,99 +15,12 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/MC/MCInst.h"
 
-#include <filesystem>
-#include <fstream>
 #include <iostream>
 #include <optional>
-#include <regex>
 #include <string>
-#include <unordered_map>
 
 ABSL_FLAG(std::optional<std::string>, att_output_dir, std::nullopt,
           "output file dir");
-
-struct CodeObjectPath {
-  std::string path;
-  uint64_t proc_id;
-  std::string arch;
-  uint64_t id;
-};
-
-struct AttPath {
-  std::string path;
-  uint64_t proc_id;
-  uint64_t agent_id;
-  uint64_t se_id;
-  uint64_t dispatch_id;
-};
-
-struct DBPath {
-  std::string path;
-  uint64_t proc_id;
-};
-
-struct AttOutputDirInfo {
-  std::vector<CodeObjectPath> code_objects;
-  AttPath att_path;
-  DBPath db_path;
-};
-
-static std::regex code_object_re =
-    std::regex("(\\d+)_(.+)_code_object_id_(\\d+)\\.out");
-static std::regex att_re =
-    std::regex("(\\d+)_(\\d+)_shader_engine_(\\d+)_(\\d+)\\.att");
-static std::regex db_re = std::regex("(\\d+)_results\\.db");
-
-template <typename T> T parse_string(const std::string &str) {
-  std::istringstream iss(str);
-  T result;
-  iss >> result;
-  return result;
-}
-
-AttOutputDirInfo scan_att_output_dir(const std::string &att_output_dir) {
-  AttOutputDirInfo result;
-  for (const auto &dir_ent :
-       std::filesystem::recursive_directory_iterator(att_output_dir)) {
-    if (!dir_ent.is_regular_file()) {
-      continue;
-    }
-    auto &ent_path = dir_ent.path();
-    auto filename = ent_path.filename().string();
-    {
-      std::smatch mat;
-      if (std::regex_match(filename, mat, code_object_re)) {
-        auto proc_id = parse_string<uint64_t>(mat[1]);
-        std::string arch = mat[2];
-        auto id = parse_string<uint64_t>(mat[3]);
-        result.code_objects.push_back(
-            CodeObjectPath{ent_path.string(), proc_id, arch, id});
-        continue;
-      }
-    }
-    {
-      std::smatch mat;
-      if (std::regex_match(filename, mat, att_re)) {
-        auto proc_id = parse_string<uint64_t>(mat[1]);
-        auto agent_id = parse_string<uint64_t>(mat[2]);
-        auto se_id = parse_string<uint64_t>(mat[3]);
-        auto dispatch_id = parse_string<uint64_t>(mat[4]);
-        result.att_path =
-            AttPath{ent_path.string(), proc_id, agent_id, se_id, dispatch_id};
-        continue;
-      }
-    }
-    {
-      std::smatch mat;
-      if (std::regex_match(filename, mat, db_re)) {
-        auto proc_id = parse_string<uint64_t>(mat[1]);
-        result.db_path = DBPath{ent_path.string(), proc_id};
-        continue;
-      }
-    }
-  }
-  return result;
-}
 
 struct trace_decoder_context {
   bool first_run;
@@ -227,66 +140,11 @@ void dump_states(my_rocperf_tool::Disassembler &disas,
   }
 }
 
-int run_main(const std::string &att_output_dir) {
-  auto out_dir = scan_att_output_dir(att_output_dir);
-  sqlite3 *db;
-  if (sqlite3_open(out_dir.db_path.path.c_str(), &db)) {
-    std::cerr << "open db failed: " << sqlite3_errmsg(db) << std::endl;
-  }
-  std::unordered_map<int, uint64_t> object_load_bases;
-  const char *sql = "SELECT * FROM 'code_objects';";
-  sqlite3_stmt *stmt;
-  int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
-  if (rc != SQLITE_OK) {
-    std::cerr << "error occurred: " << sqlite3_errmsg(db) << std::endl;
-    return 1;
-  }
-  int NoOfCols = sqlite3_column_count(stmt);
-  while (true) {
-    switch (sqlite3_step(stmt)) {
-    case SQLITE_ROW: {
-      int obj_id;
-      int64_t load_base;
-      bool has_obj_id = false, has_load_base = false;
-      for (int i = 0; i < NoOfCols; i++) {
-        const char *col_name = sqlite3_column_name(stmt, i);
-        if (!strcmp(col_name, "load_base")) {
-          load_base = sqlite3_column_int64(stmt, i);
-          assert(!has_load_base);
-          has_load_base = true;
-          continue;
-        }
-        if (!strcmp(col_name, "id")) {
-          obj_id = sqlite3_column_int(stmt, i);
-          assert(!has_obj_id);
-          has_obj_id = true;
-          continue;
-        }
-      }
-      assert(has_obj_id && has_load_base);
-      (void)has_obj_id;
-      (void)has_load_base;
-      object_load_bases[obj_id] = uint64_t(load_base);
-      continue;
-    }
-    case SQLITE_DONE:
-      sqlite3_finalize(stmt);
-      break;
-    }
-    break;
-  }
-  sqlite3_close(db);
+int run_main(const std::string &att_output_dir_path) {
+  my_rocperf_tool::AttOutputDir out_dir(att_output_dir_path);
+  auto object_load_bases = out_dir.read_load_bases();
+  auto [att_file_content, att_file_size] = out_dir.read_att_data();
 
-  std::unique_ptr<char[]> att_file_content;
-  size_t att_file_size;
-  {
-    std::ifstream att_file(out_dir.att_path.path, std::ios::binary);
-    att_file.seekg(0, std::ios::end);
-    att_file_size = att_file.tellg();
-    att_file.seekg(0, std::ios::beg);
-    att_file_content.reset(new char[att_file_size]);
-    att_file.read(att_file_content.get(), att_file_size);
-  }
   trace_decoder_context decoder_ctx{
       true,
       std::move(att_file_content),
