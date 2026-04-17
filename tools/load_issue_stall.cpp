@@ -24,6 +24,28 @@
 #include <tuple>
 #include <vector>
 
+#ifdef ENABLE_TIMERS
+#include <chrono>
+struct PhaseTimer {
+  using clock = std::chrono::steady_clock;
+  std::chrono::time_point<clock> start;
+  const char *name;
+  PhaseTimer(const char *n) : name(n), start(clock::now()) {}
+  ~PhaseTimer() {
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                  clock::now() - start)
+                  .count();
+    std::fprintf(stderr, "[TIMER] %-35s %lld.%03lld ms\n", name,
+                 (long long)(us / 1000), (long long)(us % 1000));
+  }
+};
+#define PHASE_TIMER_CONCAT_(a, b) a##b
+#define PHASE_TIMER_CONCAT(a, b) PHASE_TIMER_CONCAT_(a, b)
+#define PHASE_TIMER(name) PhaseTimer PHASE_TIMER_CONCAT(_timer_, __LINE__)(name)
+#else
+#define PHASE_TIMER(name) ((void)0)
+#endif
+
 ABSL_FLAG(std::optional<std::string>, att_output_dir, std::nullopt,
           "output file dir");
 ABSL_FLAG(bool, detect_loops, true, "detect and report loops in ATT traces");
@@ -43,6 +65,15 @@ ABSL_FLAG(bool, mfma_coexec, false,
           "analyze MFMA shadow coverage for loop instructions");
 ABSL_FLAG(bool, color_mfma_bubble, false,
           "colorize instructions by bubble severity (text output only)");
+ABSL_FLAG(bool, decode_all_insts, false,
+          "decode every instruction in all code objects' .text sections "
+          "(slow for large binaries)");
+
+using PerPCMap =
+    llvm::DenseMap<rocprofiler_thread_trace_decoder_pc_t, uint64_t>;
+using PerLoopMap = llvm::DenseMap<my_rocperf_tool::BackEdge, PerPCMap>;
+
+static const PerPCMap empty_pc_map;
 
 enum class LoopOutputFormat { Text, Csv, Json };
 
@@ -86,11 +117,8 @@ struct trace_decoder_context {
   std::vector<my_rocperf_tool::WaveLoopInfo> wave_loops;
   // MFMA shadow analysis state
   llvm::DenseMap<rocprofiler_thread_trace_decoder_pc_t, bool> mfma_cache;
-  llvm::DenseMap<rocprofiler_thread_trace_decoder_pc_t, uint64_t>
-      bubble_totals;
-  // Per-PC accumulated issue cycle relative to loop iteration start
-  llvm::DenseMap<rocprofiler_thread_trace_decoder_pc_t, uint64_t>
-      rel_issue_totals;
+  PerLoopMap bubble_totals;
+  PerLoopMap rel_issue_totals;
 };
 
 uint64_t att_decoder_se_data_callback(uint8_t **buffer, uint64_t *buffer_size,
@@ -115,17 +143,17 @@ rocprofiler_thread_trace_decoder_status_t att_decoder_isa_callback(
   uint64_t inst_size;
   auto mc_inst = obj_file.decode_at(pc.address, inst_size);
   obj_file.streamer->emitInstruction(mc_inst, *obj_file.sub_target);
-  std::string inst_str = std::move(obj_file.inst_str);
-  obj_file.inst_str.clear();
-  llvm::StringRef inst_ref = llvm::StringRef(inst_str).trim();
+  llvm::StringRef inst_ref = llvm::StringRef(obj_file.inst_str).trim();
   auto str_size = inst_ref.size();
   if (*isa_size < str_size) {
     *isa_size = str_size;
+    obj_file.inst_str.clear();
     return ROCPROFILER_THREAD_TRACE_DECODER_STATUS_ERROR_OUT_OF_RESOURCES;
   }
   memcpy(isa_instruction, inst_ref.data(), str_size);
   *isa_size = str_size;
   *isa_memory_size = inst_size;
+  obj_file.inst_str.clear();
   return ROCPROFILER_THREAD_TRACE_DECODER_STATUS_SUCCESS;
 }
 
@@ -180,7 +208,7 @@ void analyze_mfma_coexec(
         int64_t bubble =
             std::min(static_cast<int64_t>(inst.duration), uncovered);
         if (bubble > 0)
-          ctx.bubble_totals[inst.pc] += static_cast<uint64_t>(bubble);
+          ctx.bubble_totals[edge][inst.pc] += static_cast<uint64_t>(bubble);
       }
     }
   }
@@ -205,7 +233,7 @@ void compute_relative_issue(
     if (iter_start >= 0) {
       int64_t rel = (inst.time + inst.stall) - iter_start;
       if (rel >= 0)
-        ctx.rel_issue_totals[inst.pc] += static_cast<uint64_t>(rel);
+        ctx.rel_issue_totals[edge][inst.pc] += static_cast<uint64_t>(rel);
     }
   }
 }
@@ -258,41 +286,16 @@ rocprofiler_thread_trace_decoder_status_t att_decoder_trace_callback(
 }
 
 void dump_states(my_rocperf_tool::Disassembler &disas,
-                 my_rocperf_tool::InstStatistics &stats) {
-  for (const auto &[obj_id, obj] : disas.get_object_files()) {
-    uint64_t text_sec_offset = obj.text_sec_offset;
-    uint64_t text_sec_address = obj.text_sec_address;
-    uint64_t text_sec_size = obj.text_sec_size;
-    uint64_t load_base = obj.load_base;
-
-    auto buffer = obj.memory_buffer->getBuffer();
-    auto section_buffer =
-        buffer.drop_front(text_sec_offset).take_front(text_sec_size);
-    llvm::ArrayRef<unsigned char> bytes{section_buffer.bytes_begin(),
-                                        section_buffer.size()};
-    uint64_t virt_addr = load_base;
-    uint64_t sec_offset = 0;
-    while (!bytes.empty()) {
-      llvm::MCInst inst;
-      uint64_t inst_size;
-      auto status = obj.mc_dis_asm->getInstruction(inst, inst_size, bytes,
-                                                   virt_addr, llvm::outs());
-      if (status == llvm::MCDisassembler::Success) {
-        obj.streamer->emitInstruction(inst, *obj.sub_target);
-        const_cast<std::string &>(obj.inst_str).clear();
-      } else {
-        assert(false);
-      }
-      uint64_t addr = sec_offset + text_sec_address;
-      rocprofiler_thread_trace_decoder_pc_t pc{addr, obj_id};
-      auto stats_range = stats.get_inst_at(pc);
-      for (const auto &stat : stats_range) {
-        assert(stat.stall <= stat.duration);
-      }
-      sec_offset += inst_size;
-      virt_addr += inst_size;
-      bytes = bytes.drop_front(inst_size);
+                 my_rocperf_tool::InstStatistics &stats,
+                 bool decode_all) {
+  for (const auto &[pc, inst_vec] : stats.getInsts()) {
+    for (const auto &stat : inst_vec) {
+      assert(stat.stall <= stat.duration);
     }
+  }
+  if (decode_all) {
+    for (const auto &[obj_id, obj] : disas.get_object_files())
+      obj.decode_all_sections();
   }
 }
 
@@ -311,10 +314,12 @@ collect_loop_insts(
     my_rocperf_tool::Disassembler &disas,
     my_rocperf_tool::InstStatistics &stats,
     const my_rocperf_tool::BackEdge &edge,
-    const llvm::DenseMap<rocprofiler_thread_trace_decoder_pc_t, uint64_t>
-        &bubbles,
-    const llvm::DenseMap<rocprofiler_thread_trace_decoder_pc_t, uint64_t>
-        &rel_issues) {
+    const PerLoopMap &all_bubbles,
+    const PerLoopMap &all_rel_issues) {
+  auto bi = all_bubbles.find(edge);
+  const auto &bubbles = bi != all_bubbles.end() ? bi->second : empty_pc_map;
+  auto ri = all_rel_issues.find(edge);
+  const auto &rel_issues = ri != all_rel_issues.end() ? ri->second : empty_pc_map;
   std::vector<LoopInstInfo> result;
   auto &obj = disas.get_object_file_by_id(edge.code_object_id);
   uint64_t start_offset = edge.target_addr - obj.text_sec_address;
@@ -460,10 +465,7 @@ void dump_loops_json(
     const std::vector<my_rocperf_tool::WaveLoopInfo> &wave_loops,
     my_rocperf_tool::Disassembler &disas,
     my_rocperf_tool::InstStatistics &stats, const LoopOutputConfig &cfg,
-    const llvm::DenseMap<rocprofiler_thread_trace_decoder_pc_t, uint64_t>
-        &bubbles,
-    const llvm::DenseMap<rocprofiler_thread_trace_decoder_pc_t, uint64_t>
-        &rel_issues) {
+    const PerLoopMap &bubbles, const PerLoopMap &rel_issues) {
   std::printf("[\n");
   bool first_wave = true;
   for (const auto &wl : wave_loops) {
@@ -539,10 +541,7 @@ void dump_loops_csv(
     const std::vector<my_rocperf_tool::WaveLoopInfo> &wave_loops,
     my_rocperf_tool::Disassembler &disas,
     my_rocperf_tool::InstStatistics &stats, const LoopOutputConfig &cfg,
-    const llvm::DenseMap<rocprofiler_thread_trace_decoder_pc_t, uint64_t>
-        &bubbles,
-    const llvm::DenseMap<rocprofiler_thread_trace_decoder_pc_t, uint64_t>
-        &rel_issues) {
+    const PerLoopMap &bubbles, const PerLoopMap &rel_issues) {
   if (cfg.show_contents) {
     std::printf("cu,simd,wave_id,target_addr,source_addr,code_object,"
                 "iterations,total_duration,total_stall,total_idle,"
@@ -626,10 +625,7 @@ void dump_loops_text(
     const std::vector<my_rocperf_tool::WaveLoopInfo> &wave_loops,
     my_rocperf_tool::Disassembler &disas,
     my_rocperf_tool::InstStatistics &stats, const LoopOutputConfig &cfg,
-    const llvm::DenseMap<rocprofiler_thread_trace_decoder_pc_t, uint64_t>
-        &bubbles,
-    const llvm::DenseMap<rocprofiler_thread_trace_decoder_pc_t, uint64_t>
-        &rel_issues) {
+    const PerLoopMap &bubbles, const PerLoopMap &rel_issues) {
   for (const auto &wl : wave_loops) {
     std::printf("=== Wave (CU=%u, SIMD=%u, WaveID=%u) ===\n", wl.cu, wl.simd,
                 wl.wave_id);
@@ -730,10 +726,7 @@ void dump_loops(
     const std::vector<my_rocperf_tool::WaveLoopInfo> &wave_loops,
     my_rocperf_tool::Disassembler &disas,
     my_rocperf_tool::InstStatistics &stats,
-    const llvm::DenseMap<rocprofiler_thread_trace_decoder_pc_t, uint64_t>
-        &bubbles,
-    const llvm::DenseMap<rocprofiler_thread_trace_decoder_pc_t, uint64_t>
-        &rel_issues) {
+    const PerLoopMap &bubbles, const PerLoopMap &rel_issues) {
   auto cfg = LoopOutputConfig::from_flags();
   switch (cfg.format) {
   case LoopOutputFormat::Json:
@@ -749,37 +742,60 @@ void dump_loops(
 }
 
 int run_main(const std::string &att_output_dir_path) {
-  my_rocperf_tool::AttOutputDir out_dir(att_output_dir_path);
-  auto object_load_bases = out_dir.read_load_bases();
-  auto [att_file_content, att_file_size] = out_dir.read_att_data();
+  PHASE_TIMER("TOTAL");
 
   trace_decoder_context decoder_ctx;
-  decoder_ctx.first_run = true;
-  decoder_ctx.att_file_content = std::move(att_file_content);
-  decoder_ctx.att_file_size = att_file_size;
-  decoder_ctx.detect_loops_flag = absl::GetFlag(FLAGS_detect_loops);
-  decoder_ctx.verify_duration = absl::GetFlag(FLAGS_verify_trace_duration);
-  decoder_ctx.mfma_coexec_flag = absl::GetFlag(FLAGS_mfma_coexec);
+  {
+    PHASE_TIMER("directory scan + I/O");
+    my_rocperf_tool::AttOutputDir out_dir(att_output_dir_path);
+    auto object_load_bases = out_dir.read_load_bases();
+    auto [att_file_content, att_file_size] = out_dir.read_att_data();
+    decoder_ctx.first_run = true;
+    decoder_ctx.att_file_content = std::move(att_file_content);
+    decoder_ctx.att_file_size = att_file_size;
+    decoder_ctx.detect_loops_flag = absl::GetFlag(FLAGS_detect_loops);
+    decoder_ctx.verify_duration = absl::GetFlag(FLAGS_verify_trace_duration);
+    decoder_ctx.mfma_coexec_flag = absl::GetFlag(FLAGS_mfma_coexec);
 
-  for (const auto &obj_file : out_dir.code_objects) {
-    decoder_ctx.disas.addCodeObject(obj_file.id, obj_file.path,
-                                    object_load_bases[obj_file.id]);
+    {
+      PHASE_TIMER("load code objects");
+      for (const auto &obj_file : out_dir.code_objects) {
+        decoder_ctx.disas.addCodeObject(obj_file.id, obj_file.path,
+                                        object_load_bases[obj_file.id]);
+      }
+    }
   }
 
-  auto parse_res = rocprof_trace_decoder_parse_data(
-      att_decoder_se_data_callback, att_decoder_trace_callback,
-      att_decoder_isa_callback, &decoder_ctx);
-  assert(parse_res == ROCPROFILER_THREAD_TRACE_DECODER_STATUS_SUCCESS);
-  dump_states(decoder_ctx.disas, decoder_ctx.stats);
-  std::sort(decoder_ctx.wave_loops.begin(), decoder_ctx.wave_loops.end(),
-            [](const my_rocperf_tool::WaveLoopInfo &a,
-               const my_rocperf_tool::WaveLoopInfo &b) {
-              return std::tie(a.cu, a.simd, a.wave_id) <
-                     std::tie(b.cu, b.simd, b.wave_id);
-            });
-  if (decoder_ctx.detect_loops_flag)
-    dump_loops(decoder_ctx.wave_loops, decoder_ctx.disas, decoder_ctx.stats,
-               decoder_ctx.bubble_totals, decoder_ctx.rel_issue_totals);
+  {
+    PHASE_TIMER("trace decode");
+    auto parse_res = rocprof_trace_decoder_parse_data(
+        att_decoder_se_data_callback, att_decoder_trace_callback,
+        att_decoder_isa_callback, &decoder_ctx);
+    assert(parse_res == ROCPROFILER_THREAD_TRACE_DECODER_STATUS_SUCCESS);
+  }
+
+  {
+    PHASE_TIMER("dump_states (verify + decode_all)");
+    dump_states(decoder_ctx.disas, decoder_ctx.stats,
+               absl::GetFlag(FLAGS_decode_all_insts));
+  }
+
+  {
+    PHASE_TIMER("sort wave_loops");
+    std::sort(decoder_ctx.wave_loops.begin(), decoder_ctx.wave_loops.end(),
+              [](const my_rocperf_tool::WaveLoopInfo &a,
+                 const my_rocperf_tool::WaveLoopInfo &b) {
+                return std::tie(a.cu, a.simd, a.wave_id) <
+                       std::tie(b.cu, b.simd, b.wave_id);
+              });
+  }
+
+  {
+    PHASE_TIMER("dump_loops");
+    if (decoder_ctx.detect_loops_flag)
+      dump_loops(decoder_ctx.wave_loops, decoder_ctx.disas, decoder_ctx.stats,
+                 decoder_ctx.bubble_totals, decoder_ctx.rel_issue_totals);
+  }
   return 0;
 }
 

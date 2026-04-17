@@ -44,13 +44,17 @@ class InstStatistics {
         : rocprof_inst_t(inst), idle(idle) {}
     uint32_t idle;
   };
+  static constexpr size_t kInitialReserve = 32;
   llvm::DenseMap<pc_t, std::vector<Inst>> insts;
 
 public:
   bool add_inst(const rocprofiler_thread_trace_decoder_inst_t &inst,
                 uint32_t idle) {
     const auto &pc = inst.pc;
-    auto &states = insts[pc];
+    auto [it, inserted] = insts.try_emplace(pc);
+    auto &states = it->second;
+    if (inserted)
+      states.reserve(kInitialReserve);
     bool res = states.empty();
     if (!res) {
       auto old_category = states[0].category;

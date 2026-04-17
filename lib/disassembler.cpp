@@ -112,6 +112,8 @@ void ObjectFileInfo::scan_section(const typename ELFT::Shdr &section,
     text_sec_offset = section.sh_offset;
     text_sec_address = section.sh_addr;
     text_sec_size = section.sh_size;
+    inst_cache.push_back(
+        {section.sh_addr, section.sh_size, section.sh_offset});
   }
 }
 
@@ -151,6 +153,9 @@ void ObjectFileInfo::disassemble(
 }
 
 void ObjectFileInfo::initialize_mc(Disassembler &disas) {
+  llvm::sort(inst_cache, [](const CachedSection &a, const CachedSection &b) {
+    return a.start_addr < b.start_addr;
+  });
   auto *target = disas.getTarget();
   auto &triple = disas.getTriple();
   sub_target = disas.get_sub_target(processor, "");
@@ -238,20 +243,58 @@ ObjectFileInfo::ObjectFileInfo(Disassembler &disas,
   init_elf(disas);
 }
 
-llvm::MCInst ObjectFileInfo::decode_at(uint64_t addr,
-                                       uint64_t &inst_size) const {
-  auto buffer_size = memory_buffer->getBufferSize();
-  assert(addr >= text_sec_address && addr < text_sec_address + text_sec_size);
-  uint64_t file_offset = addr - text_sec_address + text_sec_offset;
-  llvm::MCInst inst;
-  llvm::ArrayRef<unsigned char> bytes{
-      (unsigned char *)memory_buffer->getBufferStart() + file_offset,
-      buffer_size};
-  auto status = mc_dis_asm->getInstruction(inst, inst_size, bytes,
-                                           addr + load_base, llvm::nulls());
-  assert(status == llvm::MCDisassembler::Success);
-  (void)status;
-  return inst;
+void ObjectFileInfo::ensure_section_decoded(CachedSection &sec) const {
+  if (LLVM_LIKELY(sec.is_decoded))
+    return;
+  sec.slots.resize(sec.byte_size / 4);
+
+  const auto *base =
+      reinterpret_cast<const unsigned char *>(memory_buffer->getBufferStart()) +
+      sec.file_offset;
+  uint64_t remaining = memory_buffer->getBufferSize() - sec.file_offset;
+
+  uint64_t offset = 0;
+  while (offset < sec.byte_size) {
+    uint64_t inst_size;
+    llvm::ArrayRef<unsigned char> bytes{base + offset, remaining - offset};
+    auto &slot = sec.slots[offset / 4];
+    auto status = mc_dis_asm->getInstruction(
+        slot.inst, inst_size, bytes, sec.start_addr + offset + load_base,
+        llvm::nulls());
+    assert(status == llvm::MCDisassembler::Success);
+    (void)status;
+    slot.inst_size = static_cast<uint32_t>(inst_size);
+    offset += inst_size;
+  }
+  sec.is_decoded = true;
+}
+
+const llvm::MCInst &ObjectFileInfo::decode_at(uint64_t addr,
+                                              uint64_t &inst_size) const {
+  // Fast path: check last accessed section.
+  if (LLVM_UNLIKELY(!(hot_section && addr >= hot_section->start_addr &&
+                      addr < hot_section->start_addr + hot_section->byte_size))) {
+    // Binary search for the section containing addr.
+    auto it = llvm::upper_bound(
+        inst_cache, addr,
+        [](uint64_t a, const CachedSection &s) { return a < s.start_addr; });
+    assert(it != inst_cache.begin());
+    --it;
+    assert(addr >= it->start_addr && addr < it->start_addr + it->byte_size);
+    hot_section = &*it;
+  }
+  ensure_section_decoded(*hot_section);
+  size_t slot_idx = (addr - hot_section->start_addr) / 4;
+  assert(slot_idx < hot_section->slots.size());
+  const auto &slot = hot_section->slots[slot_idx];
+  assert(slot.inst_size > 0);
+  inst_size = slot.inst_size;
+  return slot.inst;
+}
+
+void ObjectFileInfo::decode_all_sections() const {
+  for (auto &sec : inst_cache)
+    ensure_section_decoded(sec);
 }
 
 Disassembler::Disassembler() {

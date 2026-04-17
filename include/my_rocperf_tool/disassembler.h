@@ -28,6 +28,7 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace my_rocperf_tool {
 
@@ -132,6 +133,19 @@ public:
   }
 };
 
+struct DecodedSlot {
+  llvm::MCInst inst;
+  uint32_t inst_size = 0; // 0 = continuation of previous multi-dword instruction
+};
+
+struct CachedSection {
+  uint64_t start_addr;
+  uint64_t byte_size;
+  uint64_t file_offset;
+  bool is_decoded = false;
+  std::vector<DecodedSlot> slots;
+};
+
 class ObjectFileInfo {
   template <class ELFT>
   bool process_metadata_note(const typename ELFT::Note &note,
@@ -146,6 +160,9 @@ class ObjectFileInfo {
                     const llvm::object::ELFFile<ELFT> &elf_file);
 
   void initialize_mc(Disassembler &disas);
+  void ensure_section_decoded(CachedSection &sec) const;
+  mutable std::vector<CachedSection> inst_cache;
+  mutable CachedSection *hot_section = nullptr;
 
 public:
   ObjectFileInfo(
@@ -154,7 +171,8 @@ public:
   ObjectFileInfo(Disassembler &disas, const std::string &file_path,
                  uint64_t load_base);
   void init_elf(Disassembler &disas);
-  llvm::MCInst decode_at(uint64_t addr, uint64_t &inst_size) const;
+  const llvm::MCInst &decode_at(uint64_t addr, uint64_t &inst_size) const;
+  void decode_all_sections() const;
 
   llvm::StringRef processor;
   bool sram_ecc_supported = false;
