@@ -33,10 +33,11 @@ public:
   explicit AttOutputDir(const std::string &path);
 
   std::unordered_map<int, uint64_t> read_load_bases() const;
-  std::pair<std::unique_ptr<char[]>, size_t> read_att_data() const;
+  std::pair<std::unique_ptr<char[]>, size_t>
+  read_att_data(const AttPath &path) const;
 
   std::vector<CodeObjectPath> code_objects;
-  AttPath att_path;
+  std::vector<AttPath> att_paths;
   DBPath db_path;
 };
 

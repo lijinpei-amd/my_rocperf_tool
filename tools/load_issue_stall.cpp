@@ -16,12 +16,15 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/MC/MCInst.h"
 
+#include <cctype>
 #include <cinttypes>
 #include <cstdio>
+#include <filesystem>
 #include <iostream>
 #include <optional>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 #ifdef ENABLE_TIMERS
@@ -59,6 +62,10 @@ ABSL_FLAG(bool, loop_inst_avg, false,
           "show average per-execution stats in loop contents");
 ABSL_FLAG(std::string, loop_output_format, "text",
           "output format for loop data: text, csv, json");
+ABSL_FLAG(bool, aggregate_wave, false,
+          "show loop statistics aggregated across waves");
+ABSL_FLAG(bool, aggregate_wave_only, false,
+          "show only loop statistics aggregated across waves");
 ABSL_FLAG(bool, verify_trace_duration, false,
           "verify duration >= stall for each trace record");
 ABSL_FLAG(bool, mfma_coexec, false,
@@ -85,6 +92,8 @@ struct LoopOutputConfig {
   bool show_avg = false;
   bool show_mfma_coexec = false;
   bool color_mfma_bubble = false;
+  bool aggregate_wave = false;
+  bool aggregate_wave_only = false;
 
   static LoopOutputConfig from_flags() {
     LoopOutputConfig cfg;
@@ -94,6 +103,10 @@ struct LoopOutputConfig {
     cfg.show_avg = absl::GetFlag(FLAGS_loop_inst_avg);
     cfg.show_mfma_coexec = absl::GetFlag(FLAGS_mfma_coexec);
     cfg.color_mfma_bubble = absl::GetFlag(FLAGS_color_mfma_bubble);
+    cfg.aggregate_wave = absl::GetFlag(FLAGS_aggregate_wave);
+    cfg.aggregate_wave_only = absl::GetFlag(FLAGS_aggregate_wave_only);
+    if (cfg.aggregate_wave_only)
+      cfg.aggregate_wave = true;
     auto fmt = absl::GetFlag(FLAGS_loop_output_format);
     if (fmt == "json")
       cfg.format = LoopOutputFormat::Json;
@@ -109,17 +122,31 @@ struct trace_decoder_context {
   bool first_run;
   std::unique_ptr<char[]> att_file_content;
   size_t att_file_size;
-  my_rocperf_tool::Disassembler disas;
+  uint64_t dispatch_id;
+  my_rocperf_tool::Disassembler &disas;
   my_rocperf_tool::InstStatistics stats;
   bool detect_loops_flag;
   bool verify_duration;
   bool mfma_coexec_flag;
   std::vector<my_rocperf_tool::WaveLoopInfo> wave_loops;
-  // MFMA shadow analysis state
   llvm::DenseMap<rocprofiler_thread_trace_decoder_pc_t, bool> mfma_cache;
   PerLoopMap bubble_totals;
   PerLoopMap rel_issue_totals;
+
+  explicit trace_decoder_context(my_rocperf_tool::Disassembler &d) : disas(d) {}
 };
+
+std::optional<uint64_t> parse_dispatch_id_from_path(const std::string &path) {
+  auto name = std::filesystem::path(path).filename().string();
+  const std::string marker = "_dispatch_";
+  auto marker_pos = name.rfind(marker);
+  if (marker_pos == std::string::npos)
+    return std::nullopt;
+  auto digit_pos = marker_pos + marker.size();
+  if (digit_pos >= name.size() || !std::isdigit(static_cast<unsigned char>(name[digit_pos])))
+    return std::nullopt;
+  return std::stoull(name.substr(digit_pos));
+}
 
 uint64_t att_decoder_se_data_callback(uint8_t **buffer, uint64_t *buffer_size,
                                       void *userdata) {
@@ -461,309 +488,476 @@ LoopSummary compute_loop_summary(const my_rocperf_tool::LoopStats &s,
   return sum;
 }
 
-void dump_loops_json(
-    const std::vector<my_rocperf_tool::WaveLoopInfo> &wave_loops,
-    my_rocperf_tool::Disassembler &disas,
-    my_rocperf_tool::InstStatistics &stats, const LoopOutputConfig &cfg,
-    const PerLoopMap &bubbles, const PerLoopMap &rel_issues) {
-  std::printf("[\n");
-  bool first_wave = true;
+struct LoopRecord {
+  my_rocperf_tool::BackEdge back_edge;
+  my_rocperf_tool::LoopStats stats;
+  uint32_t wave_count; // 1 for per-wave, N for aggregate
+};
+
+std::vector<LoopRecord> aggregate_loops_by_back_edge(
+    const std::vector<my_rocperf_tool::WaveLoopInfo> &wave_loops) {
+  std::vector<LoopRecord> result;
+  llvm::DenseMap<my_rocperf_tool::BackEdge, size_t> index_by_edge;
   for (const auto &wl : wave_loops) {
-    if (!first_wave) std::printf(",\n");
-    first_wave = false;
-    std::printf("  {\"cu\":%u,\"simd\":%u,\"wave_id\":%u,\"loops\":[\n",
-                wl.cu, wl.simd, wl.wave_id);
-    bool first_loop = true;
     for (const auto &dl : wl.loops) {
-      if (!first_loop) std::printf(",\n");
-      first_loop = false;
-      const auto &e = dl.back_edge;
-      const auto &s = dl.stats;
-      std::printf("    {\"target_addr\":\"0x%" PRIx64
-                  "\",\"source_addr\":\"0x%" PRIx64 "\","
-                  "\"code_object\":%" PRIu64 ","
-                  "\"iterations\":%u,\"total_duration\":%" PRIu64 ","
-                  "\"total_stall\":%" PRIu64 ",\"total_idle\":%" PRIu64,
-                  e.target_addr, e.source_addr, e.code_object_id,
-                  s.iteration_count, s.total_duration, s.total_stall,
-                  s.total_idle);
-      if (cfg.show_contents) {
-        auto insts = collect_loop_insts(disas, stats, e, bubbles, rel_issues);
-        auto sum = compute_loop_summary(s, insts);
-        std::printf(",\"avg_dur\":%.2f,\"avg_stall\":%.2f,\"avg_idle\":%.2f",
-                    sum.avg_dur, sum.avg_stall, sum.avg_idle);
-        if (cfg.show_mfma_coexec)
-          std::printf(",\"avg_bubble\":%.2f", sum.avg_bubble);
-        std::printf(",\"mfma_count\":%u,\"mfma_time\":%u,\"mfma_util\":%.4f",
-                    sum.mfma_count, sum.mfma_time, sum.mfma_util);
-        std::printf(",\"instructions\":[\n");
-        bool first_inst = true;
-        for (const auto &ii : insts) {
-          if (!first_inst) std::printf(",\n");
-          first_inst = false;
-          std::printf("      {\"addr\":\"0x%" PRIx64 "\",\"inst\":\"%s\"",
-                      ii.addr, json_escape(ii.inst_str).c_str());
-          if (cfg.show_stats && ii.has_stats) {
-            std::printf(",\"n\":%zu", ii.n);
-            if (cfg.show_avg) {
-              std::printf(",\"avg_dur\":%.2f,\"avg_stall\":%.2f,"
-                          "\"avg_idle\":%.2f,\"avg_issue\":%.2f",
-                          static_cast<double>(ii.dur) / ii.n,
-                          static_cast<double>(ii.stall) / ii.n,
-                          static_cast<double>(ii.idle) / ii.n,
-                          static_cast<double>(ii.issue) / ii.n);
-              if (cfg.show_mfma_coexec)
-                std::printf(",\"avg_bubble\":%.2f",
-                            static_cast<double>(ii.bubble) / ii.n);
-              std::printf(",\"avg_cycle\":%.2f",
-                          static_cast<double>(ii.rel_issue) / ii.n);
-            } else {
-              std::printf(",\"dur\":%" PRIu64 ",\"stall\":%" PRIu64
-                          ",\"idle\":%" PRIu64 ",\"issue\":%" PRIu64,
-                          ii.dur, ii.stall, ii.idle, ii.issue);
-              if (cfg.show_mfma_coexec)
-                std::printf(",\"bubble\":%" PRIu64, ii.bubble);
-              std::printf(",\"rel_issue\":%" PRIu64, ii.rel_issue);
-            }
-          }
-          std::printf("}");
+      const auto &edge = dl.back_edge;
+      auto it = index_by_edge.find(edge);
+      if (it == index_by_edge.end()) {
+        it = index_by_edge.try_emplace(edge, result.size()).first;
+        result.push_back(LoopRecord{edge, {}, 0});
+      }
+
+      auto &agg = result[it->second];
+      agg.wave_count++;
+      agg.stats.iteration_count += dl.stats.iteration_count;
+      agg.stats.total_inst_count += dl.stats.total_inst_count;
+      agg.stats.total_duration += dl.stats.total_duration;
+      agg.stats.total_stall += dl.stats.total_stall;
+      agg.stats.total_idle += dl.stats.total_idle;
+    }
+  }
+  std::sort(result.begin(), result.end(),
+            [](const LoopRecord &a, const LoopRecord &b) {
+              return std::tie(a.back_edge.code_object_id,
+                              a.back_edge.target_addr,
+                              a.back_edge.source_addr) <
+                     std::tie(b.back_edge.code_object_id,
+                              b.back_edge.target_addr,
+                              b.back_edge.source_addr);
+            });
+  return result;
+}
+
+struct LoopGroup {
+  bool is_aggregate;
+  uint8_t cu = 0;     // valid only when !is_aggregate
+  uint8_t simd = 0;   // valid only when !is_aggregate
+  uint32_t wave_id = 0; // valid only when !is_aggregate
+  std::vector<LoopRecord> loops;
+};
+
+using LoopInstCache =
+    llvm::DenseMap<my_rocperf_tool::BackEdge, std::vector<LoopInstInfo>>;
+
+std::vector<LoopGroup>
+build_loop_groups(const std::vector<my_rocperf_tool::WaveLoopInfo> &wave_loops,
+                  const LoopOutputConfig &cfg) {
+  std::vector<LoopGroup> groups;
+  if (!cfg.aggregate_wave_only) {
+    for (const auto &wl : wave_loops) {
+      LoopGroup g{false, wl.cu, wl.simd, wl.wave_id, {}};
+      g.loops.reserve(wl.loops.size());
+      for (const auto &dl : wl.loops)
+        g.loops.push_back({dl.back_edge, dl.stats, 1});
+      groups.push_back(std::move(g));
+    }
+  }
+  if (cfg.aggregate_wave) {
+    LoopGroup g{true, 0, 0, 0, aggregate_loops_by_back_edge(wave_loops)};
+    groups.push_back(std::move(g));
+  }
+  return groups;
+}
+
+const std::vector<LoopInstInfo> &get_loop_insts(
+    LoopInstCache &cache, my_rocperf_tool::Disassembler &disas,
+    my_rocperf_tool::InstStatistics &stats,
+    const my_rocperf_tool::BackEdge &edge, const PerLoopMap &bubbles,
+    const PerLoopMap &rel_issues) {
+  auto it = cache.find(edge);
+  if (it != cache.end())
+    return it->second;
+  auto insts = collect_loop_insts(disas, stats, edge, bubbles, rel_issues);
+  return cache.try_emplace(edge, std::move(insts)).first->second;
+}
+
+void dump_loop_json(
+    const my_rocperf_tool::BackEdge &e, const my_rocperf_tool::LoopStats &s,
+    const std::vector<LoopInstInfo> &insts, const LoopOutputConfig &cfg,
+    std::optional<uint32_t> wave_count = std::nullopt) {
+  auto sum = compute_loop_summary(s, insts);
+  std::printf("    {\"target_addr\":\"0x%" PRIx64
+              "\",\"source_addr\":\"0x%" PRIx64 "\","
+              "\"code_object\":%" PRIu64,
+              e.target_addr, e.source_addr, e.code_object_id);
+  if (wave_count.has_value())
+    std::printf(",\"wave_count\":%u", *wave_count);
+  std::printf(",\"iterations\":%u,\"total_duration\":%" PRIu64 ","
+              "\"total_stall\":%" PRIu64 ",\"total_idle\":%" PRIu64,
+              s.iteration_count, s.total_duration, s.total_stall,
+              s.total_idle);
+  std::printf(",\"avg_dur\":%.2f,\"avg_stall\":%.2f,\"avg_idle\":%.2f",
+              sum.avg_dur, sum.avg_stall, sum.avg_idle);
+  if (cfg.show_mfma_coexec)
+    std::printf(",\"avg_bubble\":%.2f", sum.avg_bubble);
+  std::printf(",\"mfma_count\":%u,\"mfma_time\":%u,\"mfma_util\":%.4f",
+              sum.mfma_count, sum.mfma_time, sum.mfma_util);
+  if (cfg.show_contents) {
+    std::printf(",\"instructions\":[\n");
+    bool first_inst = true;
+    for (const auto &ii : insts) {
+      if (!first_inst) std::printf(",\n");
+      first_inst = false;
+      std::printf("      {\"addr\":\"0x%" PRIx64 "\",\"inst\":\"%s\"",
+                  ii.addr, json_escape(ii.inst_str).c_str());
+      if (cfg.show_stats && ii.has_stats) {
+        std::printf(",\"n\":%zu", ii.n);
+        if (cfg.show_avg) {
+          std::printf(",\"avg_dur\":%.2f,\"avg_stall\":%.2f,"
+                      "\"avg_idle\":%.2f,\"avg_issue\":%.2f",
+                      static_cast<double>(ii.dur) / ii.n,
+                      static_cast<double>(ii.stall) / ii.n,
+                      static_cast<double>(ii.idle) / ii.n,
+                      static_cast<double>(ii.issue) / ii.n);
+          if (cfg.show_mfma_coexec)
+            std::printf(",\"avg_bubble\":%.2f",
+                        static_cast<double>(ii.bubble) / ii.n);
+          std::printf(",\"avg_cycle\":%.2f",
+                      static_cast<double>(ii.rel_issue) / ii.n);
+        } else {
+          std::printf(",\"dur\":%" PRIu64 ",\"stall\":%" PRIu64
+                      ",\"idle\":%" PRIu64 ",\"issue\":%" PRIu64,
+                      ii.dur, ii.stall, ii.idle, ii.issue);
+          if (cfg.show_mfma_coexec)
+            std::printf(",\"bubble\":%" PRIu64, ii.bubble);
+          std::printf(",\"rel_issue\":%" PRIu64, ii.rel_issue);
         }
-        std::printf("\n    ]");
       }
       std::printf("}");
     }
-    std::printf("\n  ]}");
+    std::printf("\n    ]");
   }
-  std::printf("\n]\n");
+  std::printf("}");
 }
 
-void dump_loops_csv(
-    const std::vector<my_rocperf_tool::WaveLoopInfo> &wave_loops,
-    my_rocperf_tool::Disassembler &disas,
-    my_rocperf_tool::InstStatistics &stats, const LoopOutputConfig &cfg,
-    const PerLoopMap &bubbles, const PerLoopMap &rel_issues) {
+void dump_csv_header(const LoopOutputConfig &cfg) {
+  if (cfg.aggregate_wave)
+    std::printf("record_type,");
+  std::printf("dispatch_id,cu,simd,wave_id,");
+  if (cfg.aggregate_wave)
+    std::printf("wave_count,");
+  std::printf("target_addr,source_addr,code_object,"
+              "iterations,total_duration,total_stall,total_idle,"
+              "loop_avg_dur,loop_avg_stall,loop_avg_idle,");
+  if (cfg.show_mfma_coexec)
+    std::printf("loop_avg_bubble,");
+  std::printf("mfma_count,mfma_time,mfma_util");
   if (cfg.show_contents) {
-    std::printf("cu,simd,wave_id,target_addr,source_addr,code_object,"
-                "iterations,total_duration,total_stall,total_idle,"
-                "loop_avg_dur,loop_avg_stall,loop_avg_idle,");
-    if (cfg.show_mfma_coexec) std::printf("loop_avg_bubble,");
-    std::printf("mfma_count,mfma_time,mfma_util,"
-                "inst_addr,instruction,n,");
+    std::printf(",inst_addr,instruction,n,");
     if (cfg.show_avg) {
       std::printf("avg_dur,avg_stall,avg_idle,avg_issue");
-      if (cfg.show_mfma_coexec) std::printf(",avg_bubble");
-      std::printf(",avg_cycle\n");
+      if (cfg.show_mfma_coexec)
+        std::printf(",avg_bubble");
+      std::printf(",avg_cycle");
     } else {
       std::printf("dur,stall,idle,issue");
-      if (cfg.show_mfma_coexec) std::printf(",bubble");
-      std::printf(",rel_issue\n");
+      if (cfg.show_mfma_coexec)
+        std::printf(",bubble");
+      std::printf(",rel_issue");
     }
-  } else {
-    std::printf("cu,simd,wave_id,target_addr,source_addr,code_object,"
-                "iterations,total_duration,total_stall,total_idle\n");
   }
-  for (const auto &wl : wave_loops) {
-    for (const auto &dl : wl.loops) {
-      const auto &e = dl.back_edge;
-      const auto &s = dl.stats;
-      if (!cfg.show_contents) {
-        std::printf("%u,%u,%u,0x%" PRIx64 ",0x%" PRIx64 ",%" PRIu64
-                    ",%u,%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
-                    wl.cu, wl.simd, wl.wave_id, e.target_addr, e.source_addr,
-                    e.code_object_id, s.iteration_count, s.total_duration,
-                    s.total_stall, s.total_idle);
+  std::printf("\n");
+}
+
+void dump_csv_row_prefix(const LoopOutputConfig &cfg, uint64_t dispatch_id,
+                         const LoopGroup &g, uint32_t wave_count) {
+  if (cfg.aggregate_wave) {
+    const char *record_type = g.is_aggregate ? "aggregate" : "wave";
+    std::printf("%s,%" PRIu64 ",", record_type, dispatch_id);
+    if (g.is_aggregate)
+      std::printf(",,,");
+    else
+      std::printf("%u,%u,%u,", g.cu, g.simd, g.wave_id);
+    std::printf("%u,", wave_count);
+  } else {
+    std::printf("%" PRIu64 ",%u,%u,%u,", dispatch_id, g.cu, g.simd, g.wave_id);
+  }
+}
+
+void dump_csv_loop_rows(
+    const LoopOutputConfig &cfg, uint64_t dispatch_id, const LoopGroup &g,
+    const LoopRecord &lr, const std::vector<LoopInstInfo> &insts) {
+  const auto &e = lr.back_edge;
+  const auto &s = lr.stats;
+  auto sum = compute_loop_summary(s, insts);
+  auto print_loop_fields = [&]() {
+    std::printf("0x%" PRIx64 ",0x%" PRIx64 ",%" PRIu64
+                ",%u,%" PRIu64 ",%" PRIu64 ",%" PRIu64
+                ",%.2f,%.2f,%.2f,",
+                e.target_addr, e.source_addr, e.code_object_id,
+                s.iteration_count, s.total_duration, s.total_stall,
+                s.total_idle, sum.avg_dur, sum.avg_stall, sum.avg_idle);
+    if (cfg.show_mfma_coexec)
+      std::printf("%.2f,", sum.avg_bubble);
+    std::printf("%u,%u,%.4f", sum.mfma_count, sum.mfma_time, sum.mfma_util);
+  };
+
+  if (!cfg.show_contents) {
+    dump_csv_row_prefix(cfg, dispatch_id, g, lr.wave_count);
+    print_loop_fields();
+    std::printf("\n");
+    return;
+  }
+
+  for (const auto &ii : insts) {
+    dump_csv_row_prefix(cfg, dispatch_id, g, lr.wave_count);
+    print_loop_fields();
+    std::printf(",0x%" PRIx64 ",\"%s\",%zu,", ii.addr,
+                csv_escape(ii.inst_str).c_str(), ii.n);
+    if (cfg.show_avg) {
+      if (ii.n > 0) {
+        std::printf("%.2f,%.2f,%.2f,%.2f",
+                    static_cast<double>(ii.dur) / ii.n,
+                    static_cast<double>(ii.stall) / ii.n,
+                    static_cast<double>(ii.idle) / ii.n,
+                    static_cast<double>(ii.issue) / ii.n);
+        if (cfg.show_mfma_coexec)
+          std::printf(",%.2f", static_cast<double>(ii.bubble) / ii.n);
+        std::printf(",%.2f", static_cast<double>(ii.rel_issue) / ii.n);
       } else {
-        auto insts = collect_loop_insts(disas, stats, e, bubbles, rel_issues);
-        auto sum = compute_loop_summary(s, insts);
-        for (const auto &ii : insts) {
-          std::printf("%u,%u,%u,0x%" PRIx64 ",0x%" PRIx64 ",%" PRIu64
-                      ",%u,%" PRIu64 ",%" PRIu64 ",%" PRIu64
-                      ",%.2f,%.2f,%.2f,",
-                      wl.cu, wl.simd, wl.wave_id, e.target_addr,
-                      e.source_addr, e.code_object_id, s.iteration_count,
-                      s.total_duration, s.total_stall, s.total_idle,
-                      sum.avg_dur, sum.avg_stall, sum.avg_idle);
-          if (cfg.show_mfma_coexec)
-            std::printf("%.2f,", sum.avg_bubble);
-          std::printf("%u,%u,%.4f,", sum.mfma_count, sum.mfma_time,
-                      sum.mfma_util);
-          std::printf("0x%" PRIx64 ",\"%s\",%zu,",
-                      ii.addr, csv_escape(ii.inst_str).c_str(), ii.n);
-          if (cfg.show_avg) {
-            if (ii.n > 0) {
-              std::printf("%.2f,%.2f,%.2f,%.2f",
-                          static_cast<double>(ii.dur) / ii.n,
-                          static_cast<double>(ii.stall) / ii.n,
-                          static_cast<double>(ii.idle) / ii.n,
-                          static_cast<double>(ii.issue) / ii.n);
-              if (cfg.show_mfma_coexec)
-                std::printf(",%.2f",
-                            static_cast<double>(ii.bubble) / ii.n);
-              std::printf(",%.2f",
-                          static_cast<double>(ii.rel_issue) / ii.n);
-            } else {
-              std::printf(",,,,");
-              if (cfg.show_mfma_coexec) std::printf(",");
-              std::printf(",");
-            }
-            std::printf("\n");
-          } else {
-            std::printf("%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64,
-                        ii.dur, ii.stall, ii.idle, ii.issue);
-            if (cfg.show_mfma_coexec)
-              std::printf(",%" PRIu64, ii.bubble);
-            std::printf(",%" PRIu64, ii.rel_issue);
-            std::printf("\n");
-          }
-        }
+        std::printf(",,,,");
+        if (cfg.show_mfma_coexec)
+          std::printf(",");
+        std::printf(",");
       }
+      std::printf("\n");
+    } else {
+      std::printf("%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64, ii.dur,
+                  ii.stall, ii.idle, ii.issue);
+      if (cfg.show_mfma_coexec)
+        std::printf(",%" PRIu64, ii.bubble);
+      std::printf(",%" PRIu64 "\n", ii.rel_issue);
     }
   }
 }
 
-void dump_loops_text(
-    const std::vector<my_rocperf_tool::WaveLoopInfo> &wave_loops,
-    my_rocperf_tool::Disassembler &disas,
-    my_rocperf_tool::InstStatistics &stats, const LoopOutputConfig &cfg,
-    const PerLoopMap &bubbles, const PerLoopMap &rel_issues) {
-  for (const auto &wl : wave_loops) {
-    std::printf("=== Wave (CU=%u, SIMD=%u, WaveID=%u) ===\n", wl.cu, wl.simd,
-                wl.wave_id);
-    for (const auto &dl : wl.loops) {
-      const auto &e = dl.back_edge;
-      const auto &s = dl.stats;
+void dump_loops_json(const std::vector<LoopGroup> &groups,
+                     my_rocperf_tool::Disassembler &disas,
+                     my_rocperf_tool::InstStatistics &stats,
+                     const LoopOutputConfig &cfg, const PerLoopMap &bubbles,
+                     const PerLoopMap &rel_issues, LoopInstCache &cache,
+                     uint64_t dispatch_id, bool wrap_array = true,
+                     bool *first_entry_state = nullptr) {
+  if (wrap_array)
+    std::printf("[\n");
+  bool local_first_entry = true;
+  bool &first_entry =
+      first_entry_state != nullptr ? *first_entry_state : local_first_entry;
+  for (const auto &g : groups) {
+    if (!first_entry) std::printf(",\n");
+    first_entry = false;
+    if (g.is_aggregate)
+      std::printf("  {\"dispatch_id\":%" PRIu64
+                  ",\"aggregate\":true,\"loops\":[\n",
+                  dispatch_id);
+    else
+      std::printf("  {\"dispatch_id\":%" PRIu64
+                  ",\"cu\":%u,\"simd\":%u,\"wave_id\":%u,\"loops\":[\n",
+                  dispatch_id, g.cu, g.simd, g.wave_id);
+    bool first_loop = true;
+    for (const auto &lr : g.loops) {
+      if (!first_loop) std::printf(",\n");
+      first_loop = false;
+      const auto &insts =
+          get_loop_insts(cache, disas, stats, lr.back_edge, bubbles, rel_issues);
+      auto wave_count = g.is_aggregate
+                            ? std::optional<uint32_t>(lr.wave_count)
+                            : std::nullopt;
+      dump_loop_json(lr.back_edge, lr.stats, insts, cfg, wave_count);
+    }
+    std::printf("\n  ]}");
+  }
+  if (wrap_array)
+    std::printf("\n]\n");
+}
+
+void dump_loops_csv(const std::vector<LoopGroup> &groups,
+                    my_rocperf_tool::Disassembler &disas,
+                    my_rocperf_tool::InstStatistics &stats,
+                    const LoopOutputConfig &cfg, const PerLoopMap &bubbles,
+                    const PerLoopMap &rel_issues, LoopInstCache &cache,
+                    uint64_t dispatch_id, bool print_header = true) {
+  if (print_header)
+    dump_csv_header(cfg);
+  for (const auto &g : groups) {
+    for (const auto &lr : g.loops) {
+      const auto &insts =
+          get_loop_insts(cache, disas, stats, lr.back_edge, bubbles, rel_issues);
+      dump_csv_loop_rows(cfg, dispatch_id, g, lr, insts);
+    }
+  }
+}
+
+void dump_loop_text_stats(const my_rocperf_tool::LoopStats &s,
+                          const std::vector<LoopInstInfo> &insts,
+                          const LoopOutputConfig &cfg) {
+  auto sum = compute_loop_summary(s, insts);
+  std::printf("    avg/iter: dur=%.2f stall=%.2f idle=%.2f", sum.avg_dur,
+              sum.avg_stall, sum.avg_idle);
+  if (cfg.show_mfma_coexec)
+    std::printf(" bubble=%.2f", sum.avg_bubble);
+  std::printf(" mfma_time=%u (%u mfma * 16) mfma_util=%.1f%%\n",
+              sum.mfma_time, sum.mfma_count, sum.mfma_util * 100.0);
+  if (!cfg.show_contents)
+    return;
+
+  std::printf("    ");
+  if (cfg.show_stats) {
+    std::printf("%-6s ", "n");
+    if (cfg.show_avg)
+      std::printf("%-10s %-10s %-10s %-10s ", "avg_dur", "avg_stall",
+                  "avg_idle", "avg_issue");
+    else
+      std::printf("%-10s %-10s %-10s %-8s ", "dur", "stall", "idle",
+                  "issue");
+    if (cfg.show_mfma_coexec)
+      std::printf("%-10s ", cfg.show_avg ? "avg_bbl" : "bubble");
+    std::printf("%-10s ", "avg_cycle");
+  }
+  if (cfg.show_addr)
+    std::printf("%-14s ", "addr");
+  std::printf("instruction\n");
+
+  uint64_t max_bubble = 0;
+  if (cfg.color_mfma_bubble) {
+    for (const auto &ii : insts)
+      if (ii.bubble > max_bubble)
+        max_bubble = ii.bubble;
+  }
+  for (const auto &ii : insts) {
+    if (cfg.color_mfma_bubble && ii.has_stats)
+      std::printf("%s", bubble_color(ii, max_bubble));
+    std::printf("    ");
+    if (cfg.show_stats && ii.has_stats) {
+      std::printf("%-6zu ", ii.n);
+      if (cfg.show_avg) {
+        std::printf("%-10.2f %-10.2f %-10.2f %-10.2f ",
+                    static_cast<double>(ii.dur) / ii.n,
+                    static_cast<double>(ii.stall) / ii.n,
+                    static_cast<double>(ii.idle) / ii.n,
+                    static_cast<double>(ii.issue) / ii.n);
+      } else {
+        std::printf("%-10" PRIu64 " %-10" PRIu64 " %-10" PRIu64
+                    " %-8" PRIu64 " ",
+                    ii.dur, ii.stall, ii.idle, ii.issue);
+      }
+      if (cfg.show_mfma_coexec) {
+        if (cfg.show_avg)
+          std::printf("%-10.2f ", static_cast<double>(ii.bubble) / ii.n);
+        else
+          std::printf("%-10" PRIu64 " ", ii.bubble);
+      }
+      std::printf("%-10.2f ", static_cast<double>(ii.rel_issue) / ii.n);
+    } else if (cfg.show_stats) {
+      if (cfg.show_avg)
+        std::printf("%-6s %-10s %-10s %-10s %-10s ", "", "", "", "", "");
+      else
+        std::printf("%-6s %-10s %-10s %-10s %-8s ", "", "", "", "", "");
+      if (cfg.show_mfma_coexec)
+        std::printf("%-10s ", "");
+      std::printf("%-10s ", "");
+    }
+    if (cfg.show_addr)
+      std::printf("0x%" PRIx64 ":  ", ii.addr);
+    std::printf("%s", ii.inst_str.c_str());
+    if (cfg.color_mfma_bubble && ii.has_stats)
+      std::printf("\033[0m");
+    std::printf("\n");
+  }
+}
+
+void dump_loops_text(const std::vector<LoopGroup> &groups,
+                     my_rocperf_tool::Disassembler &disas,
+                     my_rocperf_tool::InstStatistics &stats,
+                     const LoopOutputConfig &cfg, const PerLoopMap &bubbles,
+                     const PerLoopMap &rel_issues, LoopInstCache &cache,
+                     uint64_t dispatch_id) {
+  for (const auto &g : groups) {
+    if (g.is_aggregate)
+      std::printf("=== Aggregate Across Waves (DispatchID=%" PRIu64 ") ===\n",
+                  dispatch_id);
+    else
+      std::printf("=== Wave (DispatchID=%" PRIu64
+                  ", CU=%u, SIMD=%u, WaveID=%u) ===\n",
+                  dispatch_id, g.cu, g.simd, g.wave_id);
+    for (const auto &lr : g.loops) {
+      const auto &e = lr.back_edge;
+      const auto &s = lr.stats;
       uint32_t avg_dur =
           s.iteration_count ? s.total_duration / s.iteration_count : 0;
       uint32_t avg_stall =
           s.iteration_count ? s.total_stall / s.iteration_count : 0;
-      std::printf("  Loop [0x%" PRIx64 " -> 0x%" PRIx64
-                  "] code_object=%" PRIu64 ": "
-                  "%u iterations, %" PRIu64 " total cycles (avg %u/iter), "
-                  "stall %" PRIu64 " (avg %u/iter), idle %" PRIu64 "\n",
-                  e.target_addr, e.source_addr, e.code_object_id,
-                  s.iteration_count, s.total_duration, avg_dur, s.total_stall,
-                  avg_stall, s.total_idle);
-      if (cfg.show_contents) {
-        auto insts = collect_loop_insts(disas, stats, e, bubbles, rel_issues);
-        auto sum = compute_loop_summary(s, insts);
-        std::printf("    avg/iter: dur=%.2f stall=%.2f idle=%.2f",
-                    sum.avg_dur, sum.avg_stall, sum.avg_idle);
-        if (cfg.show_mfma_coexec)
-          std::printf(" bubble=%.2f", sum.avg_bubble);
-        std::printf(" mfma_time=%u (%u mfma * 16) mfma_util=%.1f%%\n",
-                    sum.mfma_time, sum.mfma_count, sum.mfma_util * 100.0);
-        // Print header
-        std::printf("    ");
-        if (cfg.show_stats) {
-          std::printf("%-6s ", "n");
-          if (cfg.show_avg)
-            std::printf("%-10s %-10s %-10s %-10s ", "avg_dur", "avg_stall",
-                        "avg_idle", "avg_issue");
-          else
-            std::printf("%-10s %-10s %-10s %-8s ", "dur", "stall", "idle",
-                        "issue");
-          if (cfg.show_mfma_coexec)
-            std::printf("%-10s ", cfg.show_avg ? "avg_bbl" : "bubble");
-          std::printf("%-10s ", "avg_cycle");
-        }
-        if (cfg.show_addr)
-          std::printf("%-14s ", "addr");
-        std::printf("instruction\n");
-        uint64_t max_bubble = 0;
-        if (cfg.color_mfma_bubble) {
-          for (const auto &ii : insts)
-            if (ii.bubble > max_bubble)
-              max_bubble = ii.bubble;
-        }
-        for (const auto &ii : insts) {
-          if (cfg.color_mfma_bubble && ii.has_stats)
-            std::printf("%s", bubble_color(ii, max_bubble));
-          std::printf("    ");
-          if (cfg.show_stats && ii.has_stats) {
-            std::printf("%-6zu ", ii.n);
-            if (cfg.show_avg) {
-              std::printf("%-10.2f %-10.2f %-10.2f %-10.2f ",
-                          static_cast<double>(ii.dur) / ii.n,
-                          static_cast<double>(ii.stall) / ii.n,
-                          static_cast<double>(ii.idle) / ii.n,
-                          static_cast<double>(ii.issue) / ii.n);
-            } else {
-              std::printf("%-10" PRIu64 " %-10" PRIu64 " %-10" PRIu64
-                          " %-8" PRIu64 " ",
-                          ii.dur, ii.stall, ii.idle, ii.issue);
-            }
-            if (cfg.show_mfma_coexec) {
-              if (cfg.show_avg)
-                std::printf("%-10.2f ",
-                            static_cast<double>(ii.bubble) / ii.n);
-              else
-                std::printf("%-10" PRIu64 " ", ii.bubble);
-            }
-            std::printf("%-10.2f ",
-                        static_cast<double>(ii.rel_issue) / ii.n);
-          } else if (cfg.show_stats) {
-            if (cfg.show_avg)
-              std::printf("%-6s %-10s %-10s %-10s %-10s ", "", "", "", "", "");
-            else
-              std::printf("%-6s %-10s %-10s %-10s %-8s ", "", "", "", "", "");
-            if (cfg.show_mfma_coexec)
-              std::printf("%-10s ", "");
-            std::printf("%-10s ", "");
-          }
-          if (cfg.show_addr)
-            std::printf("0x%" PRIx64 ":  ", ii.addr);
-          std::printf("%s", ii.inst_str.c_str());
-          if (cfg.color_mfma_bubble && ii.has_stats)
-            std::printf("\033[0m");
-          std::printf("\n");
-        }
-      }
+      if (g.is_aggregate)
+        std::printf("  Loop [0x%" PRIx64 " -> 0x%" PRIx64
+                    "] code_object=%" PRIu64 ": "
+                    "%u waves, %u iterations, %" PRIu64
+                    " total cycles (avg %u/iter), stall %" PRIu64
+                    " (avg %u/iter), idle %" PRIu64 "\n",
+                    e.target_addr, e.source_addr, e.code_object_id,
+                    lr.wave_count, s.iteration_count, s.total_duration, avg_dur,
+                    s.total_stall, avg_stall, s.total_idle);
+      else
+        std::printf("  Loop [0x%" PRIx64 " -> 0x%" PRIx64
+                    "] code_object=%" PRIu64 ": "
+                    "%u iterations, %" PRIu64 " total cycles (avg %u/iter), "
+                    "stall %" PRIu64 " (avg %u/iter), idle %" PRIu64 "\n",
+                    e.target_addr, e.source_addr, e.code_object_id,
+                    s.iteration_count, s.total_duration, avg_dur,
+                    s.total_stall, avg_stall, s.total_idle);
+      const auto &insts =
+          get_loop_insts(cache, disas, stats, e, bubbles, rel_issues);
+      dump_loop_text_stats(s, insts, cfg);
     }
   }
 }
 
-void dump_loops(
-    const std::vector<my_rocperf_tool::WaveLoopInfo> &wave_loops,
-    my_rocperf_tool::Disassembler &disas,
-    my_rocperf_tool::InstStatistics &stats,
-    const PerLoopMap &bubbles, const PerLoopMap &rel_issues) {
-  auto cfg = LoopOutputConfig::from_flags();
+struct MultiTraceState {
+  bool wrap_json = true;
+  bool print_csv_header = true;
+  bool *json_first_entry = nullptr;
+};
+
+void dump_loops(const std::vector<my_rocperf_tool::WaveLoopInfo> &wave_loops,
+                my_rocperf_tool::Disassembler &disas,
+                my_rocperf_tool::InstStatistics &stats,
+                const LoopOutputConfig &cfg, const PerLoopMap &bubbles,
+                const PerLoopMap &rel_issues, uint64_t dispatch_id,
+                const MultiTraceState &mts) {
+  auto groups = build_loop_groups(wave_loops, cfg);
+  LoopInstCache cache;
   switch (cfg.format) {
   case LoopOutputFormat::Json:
-    dump_loops_json(wave_loops, disas, stats, cfg, bubbles, rel_issues);
+    dump_loops_json(groups, disas, stats, cfg, bubbles, rel_issues, cache,
+                    dispatch_id, mts.wrap_json, mts.json_first_entry);
     break;
   case LoopOutputFormat::Csv:
-    dump_loops_csv(wave_loops, disas, stats, cfg, bubbles, rel_issues);
+    dump_loops_csv(groups, disas, stats, cfg, bubbles, rel_issues, cache,
+                   dispatch_id, mts.print_csv_header);
     break;
   case LoopOutputFormat::Text:
-    dump_loops_text(wave_loops, disas, stats, cfg, bubbles, rel_issues);
+    dump_loops_text(groups, disas, stats, cfg, bubbles, rel_issues, cache,
+                    dispatch_id);
     break;
   }
 }
 
-int run_main(const std::string &att_output_dir_path) {
-  PHASE_TIMER("TOTAL");
-
-  trace_decoder_context decoder_ctx;
+int run_trace(const my_rocperf_tool::AttOutputDir &out_dir,
+              const my_rocperf_tool::AttPath &att_path,
+              my_rocperf_tool::Disassembler &disas,
+              const LoopOutputConfig &cfg,
+              std::optional<uint64_t> dispatch_id_override,
+              const MultiTraceState &mts) {
+  trace_decoder_context decoder_ctx(disas);
   {
-    PHASE_TIMER("directory scan + I/O");
-    my_rocperf_tool::AttOutputDir out_dir(att_output_dir_path);
-    auto object_load_bases = out_dir.read_load_bases();
-    auto [att_file_content, att_file_size] = out_dir.read_att_data();
+    PHASE_TIMER("trace setup + I/O");
+    auto [att_file_content, att_file_size] = out_dir.read_att_data(att_path);
     decoder_ctx.first_run = true;
     decoder_ctx.att_file_content = std::move(att_file_content);
     decoder_ctx.att_file_size = att_file_size;
+    decoder_ctx.dispatch_id = dispatch_id_override.value_or(att_path.dispatch_id);
     decoder_ctx.detect_loops_flag = absl::GetFlag(FLAGS_detect_loops);
     decoder_ctx.verify_duration = absl::GetFlag(FLAGS_verify_trace_duration);
     decoder_ctx.mfma_coexec_flag = absl::GetFlag(FLAGS_mfma_coexec);
-
-    {
-      PHASE_TIMER("load code objects");
-      for (const auto &obj_file : out_dir.code_objects) {
-        decoder_ctx.disas.addCodeObject(obj_file.id, obj_file.path,
-                                        object_load_bases[obj_file.id]);
-      }
-    }
   }
 
   {
@@ -794,8 +988,55 @@ int run_main(const std::string &att_output_dir_path) {
     PHASE_TIMER("dump_loops");
     if (decoder_ctx.detect_loops_flag)
       dump_loops(decoder_ctx.wave_loops, decoder_ctx.disas, decoder_ctx.stats,
-                 decoder_ctx.bubble_totals, decoder_ctx.rel_issue_totals);
+                 cfg, decoder_ctx.bubble_totals, decoder_ctx.rel_issue_totals,
+                 decoder_ctx.dispatch_id, mts);
   }
+  return 0;
+}
+
+int run_main(const std::string &att_output_dir_path) {
+  PHASE_TIMER("TOTAL");
+
+  my_rocperf_tool::AttOutputDir out_dir(att_output_dir_path);
+  if (out_dir.att_paths.empty()) {
+    std::cerr << "no ATT trace files found in " << att_output_dir_path << "\n";
+    return 2;
+  }
+
+  auto object_load_bases = out_dir.read_load_bases();
+  my_rocperf_tool::Disassembler disas;
+  {
+    PHASE_TIMER("load code objects");
+    for (const auto &obj_file : out_dir.code_objects) {
+      auto load_base_it =
+          object_load_bases.find(static_cast<int>(obj_file.id));
+      assert(load_base_it != object_load_bases.end());
+      disas.addCodeObject(obj_file.id, obj_file.path, load_base_it->second);
+    }
+  }
+
+  auto cfg = LoopOutputConfig::from_flags();
+  const bool multi_trace = out_dir.att_paths.size() > 1;
+  const bool multi_json = multi_trace && cfg.format == LoopOutputFormat::Json;
+  bool json_first_entry = true;
+  if (multi_json)
+    std::printf("[\n");
+
+  auto dispatch_id_override =
+      out_dir.att_paths.size() == 1
+          ? parse_dispatch_id_from_path(att_output_dir_path)
+          : std::optional<uint64_t>{};
+  for (size_t i = 0; i < out_dir.att_paths.size(); i++) {
+    MultiTraceState mts;
+    mts.print_csv_header = i == 0;
+    mts.wrap_json = !multi_json;
+    mts.json_first_entry = multi_json ? &json_first_entry : nullptr;
+    run_trace(out_dir, out_dir.att_paths[i], disas, cfg, dispatch_id_override,
+              mts);
+  }
+
+  if (multi_json)
+    std::printf("\n]\n");
   return 0;
 }
 

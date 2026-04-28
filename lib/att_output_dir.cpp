@@ -3,12 +3,14 @@
 #include "sqlite3.h"
 
 #include <cassert>
+#include <algorithm>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <regex>
 #include <sstream>
+#include <tuple>
 
 namespace my_rocperf_tool {
 
@@ -55,8 +57,8 @@ AttOutputDir::AttOutputDir(const std::string &path) {
         auto agent_id = parse_string<uint64_t>(mat[2]);
         auto se_id = parse_string<uint64_t>(mat[3]);
         auto dispatch_id = parse_string<uint64_t>(mat[4]);
-        att_path =
-            AttPath{ent_path.string(), proc_id, agent_id, se_id, dispatch_id};
+        att_paths.push_back(
+            AttPath{ent_path.string(), proc_id, agent_id, se_id, dispatch_id});
         continue;
       }
     }
@@ -69,6 +71,11 @@ AttOutputDir::AttOutputDir(const std::string &path) {
       }
     }
   }
+  std::sort(att_paths.begin(), att_paths.end(),
+            [](const AttPath &a, const AttPath &b) {
+              return std::tie(a.dispatch_id, a.se_id, a.path) <
+                     std::tie(b.dispatch_id, b.se_id, b.path);
+            });
 }
 
 std::unordered_map<int, uint64_t> AttOutputDir::read_load_bases() const {
@@ -124,8 +131,8 @@ std::unordered_map<int, uint64_t> AttOutputDir::read_load_bases() const {
 }
 
 std::pair<std::unique_ptr<char[]>, size_t>
-AttOutputDir::read_att_data() const {
-  std::ifstream att_file(att_path.path, std::ios::binary);
+AttOutputDir::read_att_data(const AttPath &path) const {
+  std::ifstream att_file(path.path, std::ios::binary);
   att_file.seekg(0, std::ios::end);
   size_t att_file_size = att_file.tellg();
   att_file.seekg(0, std::ios::beg);
