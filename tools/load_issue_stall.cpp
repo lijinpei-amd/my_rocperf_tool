@@ -16,13 +16,17 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/MC/MCInst.h"
 
+#include "fmt/format.h"
+
+#include <atomic>
 #include <cctype>
-#include <cinttypes>
 #include <cstdio>
 #include <filesystem>
 #include <iostream>
+#include <iterator>
 #include <optional>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
@@ -38,8 +42,14 @@ struct PhaseTimer {
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   clock::now() - start)
                   .count();
-    std::fprintf(stderr, "[TIMER] %-35s %lld.%03lld ms\n", name,
-                 (long long)(us / 1000), (long long)(us % 1000));
+    // Format then single fwrite so output stays line-atomic when many
+    // worker threads emit timers concurrently. glibc holds a per-FILE
+    // lock around fwrite; the line is well under PIPE_BUF/BUFSIZ.
+    fmt::basic_memory_buffer<char, 128> buf;
+    fmt::format_to(fmt::appender(buf),
+                   "[TIMER] {:<35} {}.{:03} ms\n", name, us / 1000,
+                   us % 1000);
+    std::fwrite(buf.data(), 1, buf.size(), stderr);
   }
 };
 #define PHASE_TIMER_CONCAT_(a, b) a##b
@@ -75,6 +85,9 @@ ABSL_FLAG(bool, color_mfma_bubble, false,
 ABSL_FLAG(bool, decode_all_insts, false,
           "decode every instruction in all code objects' .text sections "
           "(slow for large binaries)");
+ABSL_FLAG(uint32_t, jobs, 0,
+          "number of parallel decode workers; 0 = auto (min of trace count, "
+          "hardware concurrency, and 64)");
 
 using PerPCMap =
     llvm::DenseMap<rocprofiler_thread_trace_decoder_pc_t, uint64_t>;
@@ -216,14 +229,13 @@ void analyze_mfma_coexec(
       int64_t issue_point = inst.time + inst.stall;
       // Verify no two MFMAs issue within each other's shadow.
       if (last_mfma_coexec_end > 0 && issue_point < last_mfma_coexec_end) {
-        std::fprintf(stderr,
-                     "WARNING: MFMA shadow overlap at PC 0x%" PRIx64
-                     " code_object=%" PRIu64
-                     ": issues at %" PRId64 ", previous shadow ends at %" PRId64
-                     " (overlap=%" PRId64 " cycles)\n",
-                     inst.pc.address, inst.pc.code_object_id, issue_point,
-                     last_mfma_coexec_end,
-                     last_mfma_coexec_end - issue_point);
+        fmt::print(stderr,
+                   "WARNING: MFMA shadow overlap at PC 0x{:x} code_object={}: "
+                   "issues at {}, previous shadow ends at {} "
+                   "(overlap={} cycles)\n",
+                   inst.pc.address, inst.pc.code_object_id, issue_point,
+                   last_mfma_coexec_end,
+                   last_mfma_coexec_end - issue_point);
       }
       good_interval = issue_point + 16;
       last_mfma_coexec_end = good_interval;
@@ -286,11 +298,11 @@ rocprofiler_thread_trace_decoder_status_t att_decoder_trace_callback(
         assert(inst.pc.code_object_id != 0);
         uint32_t idle = my_rocperf_tool::compute_idle(inst, last_time);
         if (ctx.verify_duration && inst.duration < static_cast<int32_t>(inst.stall)) {
-          std::fprintf(stderr,
-                       "WARNING: duration < stall at PC 0x%" PRIx64
-                       " code_object=%" PRIu64 ": duration=%d stall=%u\n",
-                       inst.pc.address, inst.pc.code_object_id, inst.duration,
-                       inst.stall);
+          fmt::print(stderr,
+                     "WARNING: duration < stall at PC 0x{:x} "
+                     "code_object={}: duration={} stall={}\n",
+                     inst.pc.address, inst.pc.code_object_id, inst.duration,
+                     inst.stall);
         }
         auto res = ctx.stats.add_inst(inst, idle);
         assert(res);
@@ -571,252 +583,273 @@ const std::vector<LoopInstInfo> &get_loop_insts(
   return cache.try_emplace(edge, std::move(insts)).first->second;
 }
 
+// Per-trace output buffer type. Lower SBO than fmt::memory_buffer's default
+// (500): aggregate_wave_only output fits in <256 B; reduces the upfront
+// allocation of std::vector<TraceBuf>(n_traces) by ~half.
+using TraceBuf = fmt::basic_memory_buffer<char, 256>;
+
+// Small wrapper around fmt::format_to so call sites stay terse.
+// fmt::format_string gives compile-time format-string checks; fmt::appender
+// is fmt's canonical writer for memory_buffer (tighter codegen than
+// std::back_inserter).
+template <typename... T>
+inline void writef(TraceBuf &out, fmt::format_string<T...> f, T &&...args) {
+  fmt::format_to(fmt::appender(out), f, std::forward<T>(args)...);
+}
+
 void dump_loop_json(
-    const my_rocperf_tool::BackEdge &e, const my_rocperf_tool::LoopStats &s,
+    TraceBuf &out, const my_rocperf_tool::BackEdge &e,
+    const my_rocperf_tool::LoopStats &s,
     const std::vector<LoopInstInfo> &insts, const LoopOutputConfig &cfg,
     std::optional<uint32_t> wave_count = std::nullopt) {
   auto sum = compute_loop_summary(s, insts);
-  std::printf("    {\"target_addr\":\"0x%" PRIx64
-              "\",\"source_addr\":\"0x%" PRIx64 "\","
-              "\"code_object\":%" PRIu64,
-              e.target_addr, e.source_addr, e.code_object_id);
+  writef(out,
+         "    {{\"target_addr\":\"0x{:x}\",\"source_addr\":\"0x{:x}\","
+         "\"code_object\":{}",
+         e.target_addr, e.source_addr, e.code_object_id);
   if (wave_count.has_value())
-    std::printf(",\"wave_count\":%u", *wave_count);
-  std::printf(",\"iterations\":%u,\"total_duration\":%" PRIu64 ","
-              "\"total_stall\":%" PRIu64 ",\"total_idle\":%" PRIu64,
-              s.iteration_count, s.total_duration, s.total_stall,
-              s.total_idle);
-  std::printf(",\"avg_dur\":%.2f,\"avg_stall\":%.2f,\"avg_idle\":%.2f",
-              sum.avg_dur, sum.avg_stall, sum.avg_idle);
+    writef(out, ",\"wave_count\":{}", *wave_count);
+  writef(out,
+         ",\"iterations\":{},\"total_duration\":{},"
+         "\"total_stall\":{},\"total_idle\":{}",
+         s.iteration_count, s.total_duration, s.total_stall, s.total_idle);
+  writef(out, ",\"avg_dur\":{:.2f},\"avg_stall\":{:.2f},\"avg_idle\":{:.2f}",
+         sum.avg_dur, sum.avg_stall, sum.avg_idle);
   if (cfg.show_mfma_coexec)
-    std::printf(",\"avg_bubble\":%.2f", sum.avg_bubble);
-  std::printf(",\"mfma_count\":%u,\"mfma_time\":%u,\"mfma_util\":%.4f",
-              sum.mfma_count, sum.mfma_time, sum.mfma_util);
+    writef(out, ",\"avg_bubble\":{:.2f}", sum.avg_bubble);
+  writef(out, ",\"mfma_count\":{},\"mfma_time\":{},\"mfma_util\":{:.4f}",
+         sum.mfma_count, sum.mfma_time, sum.mfma_util);
   if (cfg.show_contents) {
-    std::printf(",\"instructions\":[\n");
+    writef(out, ",\"instructions\":[\n");
     bool first_inst = true;
     for (const auto &ii : insts) {
-      if (!first_inst) std::printf(",\n");
+      if (!first_inst) writef(out, ",\n");
       first_inst = false;
-      std::printf("      {\"addr\":\"0x%" PRIx64 "\",\"inst\":\"%s\"",
-                  ii.addr, json_escape(ii.inst_str).c_str());
+      writef(out, "      {{\"addr\":\"0x{:x}\",\"inst\":\"{}\"", ii.addr,
+             json_escape(ii.inst_str));
       if (cfg.show_stats && ii.has_stats) {
-        std::printf(",\"n\":%zu", ii.n);
+        writef(out, ",\"n\":{}", ii.n);
         if (cfg.show_avg) {
-          std::printf(",\"avg_dur\":%.2f,\"avg_stall\":%.2f,"
-                      "\"avg_idle\":%.2f,\"avg_issue\":%.2f",
-                      static_cast<double>(ii.dur) / ii.n,
-                      static_cast<double>(ii.stall) / ii.n,
-                      static_cast<double>(ii.idle) / ii.n,
-                      static_cast<double>(ii.issue) / ii.n);
+          writef(out,
+                 ",\"avg_dur\":{:.2f},\"avg_stall\":{:.2f},"
+                 "\"avg_idle\":{:.2f},\"avg_issue\":{:.2f}",
+                 static_cast<double>(ii.dur) / ii.n,
+                 static_cast<double>(ii.stall) / ii.n,
+                 static_cast<double>(ii.idle) / ii.n,
+                 static_cast<double>(ii.issue) / ii.n);
           if (cfg.show_mfma_coexec)
-            std::printf(",\"avg_bubble\":%.2f",
-                        static_cast<double>(ii.bubble) / ii.n);
-          std::printf(",\"avg_cycle\":%.2f",
-                      static_cast<double>(ii.rel_issue) / ii.n);
+            writef(out, ",\"avg_bubble\":{:.2f}",
+                   static_cast<double>(ii.bubble) / ii.n);
+          writef(out, ",\"avg_cycle\":{:.2f}",
+                 static_cast<double>(ii.rel_issue) / ii.n);
         } else {
-          std::printf(",\"dur\":%" PRIu64 ",\"stall\":%" PRIu64
-                      ",\"idle\":%" PRIu64 ",\"issue\":%" PRIu64,
-                      ii.dur, ii.stall, ii.idle, ii.issue);
+          writef(out,
+                 ",\"dur\":{},\"stall\":{},\"idle\":{},\"issue\":{}", ii.dur,
+                 ii.stall, ii.idle, ii.issue);
           if (cfg.show_mfma_coexec)
-            std::printf(",\"bubble\":%" PRIu64, ii.bubble);
-          std::printf(",\"rel_issue\":%" PRIu64, ii.rel_issue);
+            writef(out, ",\"bubble\":{}", ii.bubble);
+          writef(out, ",\"rel_issue\":{}", ii.rel_issue);
         }
       }
-      std::printf("}");
+      writef(out, "}}");
     }
-    std::printf("\n    ]");
+    writef(out, "\n    ]");
   }
-  std::printf("}");
+  writef(out, "}}");
 }
 
-void dump_csv_header(const LoopOutputConfig &cfg) {
+void dump_csv_header(TraceBuf &out, const LoopOutputConfig &cfg) {
   if (cfg.aggregate_wave)
-    std::printf("record_type,");
-  std::printf("dispatch_id,cu,simd,wave_id,");
+    writef(out, "record_type,");
+  writef(out, "dispatch_id,cu,simd,wave_id,");
   if (cfg.aggregate_wave)
-    std::printf("wave_count,");
-  std::printf("target_addr,source_addr,code_object,"
+    writef(out, "wave_count,");
+  writef(out, "target_addr,source_addr,code_object,"
               "iterations,total_duration,total_stall,total_idle,"
               "loop_avg_dur,loop_avg_stall,loop_avg_idle,");
   if (cfg.show_mfma_coexec)
-    std::printf("loop_avg_bubble,");
-  std::printf("mfma_count,mfma_time,mfma_util");
+    writef(out, "loop_avg_bubble,");
+  writef(out, "mfma_count,mfma_time,mfma_util");
   if (cfg.show_contents) {
-    std::printf(",inst_addr,instruction,n,");
+    writef(out, ",inst_addr,instruction,n,");
     if (cfg.show_avg) {
-      std::printf("avg_dur,avg_stall,avg_idle,avg_issue");
+      writef(out, "avg_dur,avg_stall,avg_idle,avg_issue");
       if (cfg.show_mfma_coexec)
-        std::printf(",avg_bubble");
-      std::printf(",avg_cycle");
+        writef(out, ",avg_bubble");
+      writef(out, ",avg_cycle");
     } else {
-      std::printf("dur,stall,idle,issue");
+      writef(out, "dur,stall,idle,issue");
       if (cfg.show_mfma_coexec)
-        std::printf(",bubble");
-      std::printf(",rel_issue");
+        writef(out, ",bubble");
+      writef(out, ",rel_issue");
     }
   }
-  std::printf("\n");
+  writef(out, "\n");
 }
 
-void dump_csv_row_prefix(const LoopOutputConfig &cfg, uint64_t dispatch_id,
-                         const LoopGroup &g, uint32_t wave_count) {
+void dump_csv_row_prefix(TraceBuf &out, const LoopOutputConfig &cfg,
+                         uint64_t dispatch_id, const LoopGroup &g,
+                         uint32_t wave_count) {
   if (cfg.aggregate_wave) {
     const char *record_type = g.is_aggregate ? "aggregate" : "wave";
-    std::printf("%s,%" PRIu64 ",", record_type, dispatch_id);
+    writef(out, "{},{},", record_type, dispatch_id);
     if (g.is_aggregate)
-      std::printf(",,,");
+      writef(out, ",,,");
     else
-      std::printf("%u,%u,%u,", g.cu, g.simd, g.wave_id);
-    std::printf("%u,", wave_count);
+      writef(out, "{},{},{},", g.cu, g.simd, g.wave_id);
+    writef(out, "{},", wave_count);
   } else {
-    std::printf("%" PRIu64 ",%u,%u,%u,", dispatch_id, g.cu, g.simd, g.wave_id);
+    writef(out, "{},{},{},{},", dispatch_id, g.cu, g.simd, g.wave_id);
   }
 }
 
 void dump_csv_loop_rows(
-    const LoopOutputConfig &cfg, uint64_t dispatch_id, const LoopGroup &g,
-    const LoopRecord &lr, const std::vector<LoopInstInfo> &insts) {
+    TraceBuf &out, const LoopOutputConfig &cfg, uint64_t dispatch_id,
+    const LoopGroup &g, const LoopRecord &lr,
+    const std::vector<LoopInstInfo> &insts) {
   const auto &e = lr.back_edge;
   const auto &s = lr.stats;
   auto sum = compute_loop_summary(s, insts);
   auto print_loop_fields = [&]() {
-    std::printf("0x%" PRIx64 ",0x%" PRIx64 ",%" PRIu64
-                ",%u,%" PRIu64 ",%" PRIu64 ",%" PRIu64
-                ",%.2f,%.2f,%.2f,",
-                e.target_addr, e.source_addr, e.code_object_id,
-                s.iteration_count, s.total_duration, s.total_stall,
-                s.total_idle, sum.avg_dur, sum.avg_stall, sum.avg_idle);
+    writef(out, "0x{:x},0x{:x},{},{},{},{},{},{:.2f},{:.2f},{:.2f},",
+           e.target_addr, e.source_addr, e.code_object_id, s.iteration_count,
+           s.total_duration, s.total_stall, s.total_idle, sum.avg_dur,
+           sum.avg_stall, sum.avg_idle);
     if (cfg.show_mfma_coexec)
-      std::printf("%.2f,", sum.avg_bubble);
-    std::printf("%u,%u,%.4f", sum.mfma_count, sum.mfma_time, sum.mfma_util);
+      writef(out, "{:.2f},", sum.avg_bubble);
+    writef(out, "{},{},{:.4f}", sum.mfma_count, sum.mfma_time, sum.mfma_util);
   };
 
   if (!cfg.show_contents) {
-    dump_csv_row_prefix(cfg, dispatch_id, g, lr.wave_count);
+    dump_csv_row_prefix(out, cfg, dispatch_id, g, lr.wave_count);
     print_loop_fields();
-    std::printf("\n");
+    writef(out, "\n");
     return;
   }
 
   for (const auto &ii : insts) {
-    dump_csv_row_prefix(cfg, dispatch_id, g, lr.wave_count);
+    dump_csv_row_prefix(out, cfg, dispatch_id, g, lr.wave_count);
     print_loop_fields();
-    std::printf(",0x%" PRIx64 ",\"%s\",%zu,", ii.addr,
-                csv_escape(ii.inst_str).c_str(), ii.n);
+    writef(out, ",0x{:x},\"{}\",{},", ii.addr, csv_escape(ii.inst_str), ii.n);
     if (cfg.show_avg) {
       if (ii.n > 0) {
-        std::printf("%.2f,%.2f,%.2f,%.2f",
-                    static_cast<double>(ii.dur) / ii.n,
-                    static_cast<double>(ii.stall) / ii.n,
-                    static_cast<double>(ii.idle) / ii.n,
-                    static_cast<double>(ii.issue) / ii.n);
+        writef(out, "{:.2f},{:.2f},{:.2f},{:.2f}",
+               static_cast<double>(ii.dur) / ii.n,
+               static_cast<double>(ii.stall) / ii.n,
+               static_cast<double>(ii.idle) / ii.n,
+               static_cast<double>(ii.issue) / ii.n);
         if (cfg.show_mfma_coexec)
-          std::printf(",%.2f", static_cast<double>(ii.bubble) / ii.n);
-        std::printf(",%.2f", static_cast<double>(ii.rel_issue) / ii.n);
+          writef(out, ",{:.2f}", static_cast<double>(ii.bubble) / ii.n);
+        writef(out, ",{:.2f}", static_cast<double>(ii.rel_issue) / ii.n);
       } else {
-        std::printf(",,,,");
+        writef(out, ",,,,");
         if (cfg.show_mfma_coexec)
-          std::printf(",");
-        std::printf(",");
+          writef(out, ",");
+        writef(out, ",");
       }
-      std::printf("\n");
+      writef(out, "\n");
     } else {
-      std::printf("%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64, ii.dur,
-                  ii.stall, ii.idle, ii.issue);
+      writef(out, "{},{},{},{}", ii.dur, ii.stall, ii.idle, ii.issue);
       if (cfg.show_mfma_coexec)
-        std::printf(",%" PRIu64, ii.bubble);
-      std::printf(",%" PRIu64 "\n", ii.rel_issue);
+        writef(out, ",{}", ii.bubble);
+      writef(out, ",{}\n", ii.rel_issue);
     }
   }
 }
 
-void dump_loops_json(const std::vector<LoopGroup> &groups,
-                     my_rocperf_tool::Disassembler &disas,
-                     my_rocperf_tool::InstStatistics &stats,
-                     const LoopOutputConfig &cfg, const PerLoopMap &bubbles,
-                     const PerLoopMap &rel_issues, LoopInstCache &cache,
-                     uint64_t dispatch_id, bool wrap_array = true,
-                     bool *first_entry_state = nullptr) {
-  if (wrap_array)
-    std::printf("[\n");
-  bool local_first_entry = true;
-  bool &first_entry =
-      first_entry_state != nullptr ? *first_entry_state : local_first_entry;
+// Emits per-trace dispatch entries separated by ",\n" with no leading or
+// trailing comma. Caller is responsible for the surrounding "[\n" / "\n]\n"
+// and for inserting ",\n" between non-empty per-trace bodies.
+// Per-trace dump state, threaded through dump_loops*.  Holds references —
+// owners are run_trace (cache, out) and trace_decoder_context (others).
+struct DumpCtx {
+  TraceBuf &out;
+  my_rocperf_tool::Disassembler &disas;
+  my_rocperf_tool::InstStatistics &stats;
+  const LoopOutputConfig &cfg;
+  const PerLoopMap &bubbles;
+  const PerLoopMap &rel_issues;
+  LoopInstCache &cache;
+  uint64_t dispatch_id;
+};
+
+// Emits per-trace dispatch entries separated by ",\n" with no leading or
+// trailing comma. Caller is responsible for the surrounding "[\n" / "\n]\n"
+// and for inserting ",\n" between non-empty per-trace bodies.
+void dump_loops_json(const DumpCtx &ctx,
+                     const std::vector<LoopGroup> &groups) {
+  bool first_entry = true;
   for (const auto &g : groups) {
-    if (!first_entry) std::printf(",\n");
+    if (!first_entry) writef(ctx.out, ",\n");
     first_entry = false;
     if (g.is_aggregate)
-      std::printf("  {\"dispatch_id\":%" PRIu64
-                  ",\"aggregate\":true,\"loops\":[\n",
-                  dispatch_id);
+      writef(ctx.out,
+             "  {{\"dispatch_id\":{},\"aggregate\":true,\"loops\":[\n",
+             ctx.dispatch_id);
     else
-      std::printf("  {\"dispatch_id\":%" PRIu64
-                  ",\"cu\":%u,\"simd\":%u,\"wave_id\":%u,\"loops\":[\n",
-                  dispatch_id, g.cu, g.simd, g.wave_id);
+      writef(ctx.out,
+             "  {{\"dispatch_id\":{},\"cu\":{},\"simd\":{},\"wave_id\":{},"
+             "\"loops\":[\n",
+             ctx.dispatch_id, g.cu, g.simd, g.wave_id);
     bool first_loop = true;
     for (const auto &lr : g.loops) {
-      if (!first_loop) std::printf(",\n");
+      if (!first_loop) writef(ctx.out, ",\n");
       first_loop = false;
-      const auto &insts =
-          get_loop_insts(cache, disas, stats, lr.back_edge, bubbles, rel_issues);
+      const auto &insts = get_loop_insts(ctx.cache, ctx.disas, ctx.stats,
+                                         lr.back_edge, ctx.bubbles,
+                                         ctx.rel_issues);
       auto wave_count = g.is_aggregate
                             ? std::optional<uint32_t>(lr.wave_count)
                             : std::nullopt;
-      dump_loop_json(lr.back_edge, lr.stats, insts, cfg, wave_count);
+      dump_loop_json(ctx.out, lr.back_edge, lr.stats, insts, ctx.cfg,
+                     wave_count);
     }
-    std::printf("\n  ]}");
+    writef(ctx.out, "\n  ]}}");
   }
-  if (wrap_array)
-    std::printf("\n]\n");
 }
 
-void dump_loops_csv(const std::vector<LoopGroup> &groups,
-                    my_rocperf_tool::Disassembler &disas,
-                    my_rocperf_tool::InstStatistics &stats,
-                    const LoopOutputConfig &cfg, const PerLoopMap &bubbles,
-                    const PerLoopMap &rel_issues, LoopInstCache &cache,
-                    uint64_t dispatch_id, bool print_header = true) {
-  if (print_header)
-    dump_csv_header(cfg);
+void dump_loops_csv(const DumpCtx &ctx,
+                    const std::vector<LoopGroup> &groups) {
   for (const auto &g : groups) {
     for (const auto &lr : g.loops) {
-      const auto &insts =
-          get_loop_insts(cache, disas, stats, lr.back_edge, bubbles, rel_issues);
-      dump_csv_loop_rows(cfg, dispatch_id, g, lr, insts);
+      const auto &insts = get_loop_insts(ctx.cache, ctx.disas, ctx.stats,
+                                         lr.back_edge, ctx.bubbles,
+                                         ctx.rel_issues);
+      dump_csv_loop_rows(ctx.out, ctx.cfg, ctx.dispatch_id, g, lr, insts);
     }
   }
 }
 
-void dump_loop_text_stats(const my_rocperf_tool::LoopStats &s,
+void dump_loop_text_stats(TraceBuf &out,
+                          const my_rocperf_tool::LoopStats &s,
                           const std::vector<LoopInstInfo> &insts,
                           const LoopOutputConfig &cfg) {
   auto sum = compute_loop_summary(s, insts);
-  std::printf("    avg/iter: dur=%.2f stall=%.2f idle=%.2f", sum.avg_dur,
-              sum.avg_stall, sum.avg_idle);
+  writef(out, "    avg/iter: dur={:.2f} stall={:.2f} idle={:.2f}", sum.avg_dur,
+         sum.avg_stall, sum.avg_idle);
   if (cfg.show_mfma_coexec)
-    std::printf(" bubble=%.2f", sum.avg_bubble);
-  std::printf(" mfma_time=%u (%u mfma * 16) mfma_util=%.1f%%\n",
-              sum.mfma_time, sum.mfma_count, sum.mfma_util * 100.0);
+    writef(out, " bubble={:.2f}", sum.avg_bubble);
+  writef(out, " mfma_time={} ({} mfma * 16) mfma_util={:.1f}%\n",
+         sum.mfma_time, sum.mfma_count, sum.mfma_util * 100.0);
   if (!cfg.show_contents)
     return;
 
-  std::printf("    ");
+  writef(out, "    ");
   if (cfg.show_stats) {
-    std::printf("%-6s ", "n");
+    writef(out, "{:<6} ", "n");
     if (cfg.show_avg)
-      std::printf("%-10s %-10s %-10s %-10s ", "avg_dur", "avg_stall",
-                  "avg_idle", "avg_issue");
+      writef(out, "{:<10} {:<10} {:<10} {:<10} ", "avg_dur", "avg_stall",
+             "avg_idle", "avg_issue");
     else
-      std::printf("%-10s %-10s %-10s %-8s ", "dur", "stall", "idle",
-                  "issue");
+      writef(out, "{:<10} {:<10} {:<10} {:<8} ", "dur", "stall", "idle",
+             "issue");
     if (cfg.show_mfma_coexec)
-      std::printf("%-10s ", cfg.show_avg ? "avg_bbl" : "bubble");
-    std::printf("%-10s ", "avg_cycle");
+      writef(out, "{:<10} ", cfg.show_avg ? "avg_bbl" : "bubble");
+    writef(out, "{:<10} ", "avg_cycle");
   }
   if (cfg.show_addr)
-    std::printf("%-14s ", "addr");
-  std::printf("instruction\n");
+    writef(out, "{:<14} ", "addr");
+  writef(out, "instruction\n");
 
   uint64_t max_bubble = 0;
   if (cfg.color_mfma_bubble) {
@@ -826,60 +859,55 @@ void dump_loop_text_stats(const my_rocperf_tool::LoopStats &s,
   }
   for (const auto &ii : insts) {
     if (cfg.color_mfma_bubble && ii.has_stats)
-      std::printf("%s", bubble_color(ii, max_bubble));
-    std::printf("    ");
+      writef(out, "{}", bubble_color(ii, max_bubble));
+    writef(out, "    ");
     if (cfg.show_stats && ii.has_stats) {
-      std::printf("%-6zu ", ii.n);
+      writef(out, "{:<6} ", ii.n);
       if (cfg.show_avg) {
-        std::printf("%-10.2f %-10.2f %-10.2f %-10.2f ",
-                    static_cast<double>(ii.dur) / ii.n,
-                    static_cast<double>(ii.stall) / ii.n,
-                    static_cast<double>(ii.idle) / ii.n,
-                    static_cast<double>(ii.issue) / ii.n);
+        writef(out, "{:<10.2f} {:<10.2f} {:<10.2f} {:<10.2f} ",
+               static_cast<double>(ii.dur) / ii.n,
+               static_cast<double>(ii.stall) / ii.n,
+               static_cast<double>(ii.idle) / ii.n,
+               static_cast<double>(ii.issue) / ii.n);
       } else {
-        std::printf("%-10" PRIu64 " %-10" PRIu64 " %-10" PRIu64
-                    " %-8" PRIu64 " ",
-                    ii.dur, ii.stall, ii.idle, ii.issue);
+        writef(out, "{:<10} {:<10} {:<10} {:<8} ", ii.dur, ii.stall, ii.idle,
+               ii.issue);
       }
       if (cfg.show_mfma_coexec) {
         if (cfg.show_avg)
-          std::printf("%-10.2f ", static_cast<double>(ii.bubble) / ii.n);
+          writef(out, "{:<10.2f} ", static_cast<double>(ii.bubble) / ii.n);
         else
-          std::printf("%-10" PRIu64 " ", ii.bubble);
+          writef(out, "{:<10} ", ii.bubble);
       }
-      std::printf("%-10.2f ", static_cast<double>(ii.rel_issue) / ii.n);
+      writef(out, "{:<10.2f} ", static_cast<double>(ii.rel_issue) / ii.n);
     } else if (cfg.show_stats) {
       if (cfg.show_avg)
-        std::printf("%-6s %-10s %-10s %-10s %-10s ", "", "", "", "", "");
+        writef(out, "{:<6} {:<10} {:<10} {:<10} {:<10} ", "", "", "", "", "");
       else
-        std::printf("%-6s %-10s %-10s %-10s %-8s ", "", "", "", "", "");
+        writef(out, "{:<6} {:<10} {:<10} {:<10} {:<8} ", "", "", "", "", "");
       if (cfg.show_mfma_coexec)
-        std::printf("%-10s ", "");
-      std::printf("%-10s ", "");
+        writef(out, "{:<10} ", "");
+      writef(out, "{:<10} ", "");
     }
     if (cfg.show_addr)
-      std::printf("0x%" PRIx64 ":  ", ii.addr);
-    std::printf("%s", ii.inst_str.c_str());
+      writef(out, "0x{:x}:  ", ii.addr);
+    writef(out, "{}", ii.inst_str);
     if (cfg.color_mfma_bubble && ii.has_stats)
-      std::printf("\033[0m");
-    std::printf("\n");
+      writef(out, "\033[0m");
+    writef(out, "\n");
   }
 }
 
-void dump_loops_text(const std::vector<LoopGroup> &groups,
-                     my_rocperf_tool::Disassembler &disas,
-                     my_rocperf_tool::InstStatistics &stats,
-                     const LoopOutputConfig &cfg, const PerLoopMap &bubbles,
-                     const PerLoopMap &rel_issues, LoopInstCache &cache,
-                     uint64_t dispatch_id) {
+void dump_loops_text(const DumpCtx &ctx,
+                     const std::vector<LoopGroup> &groups) {
   for (const auto &g : groups) {
     if (g.is_aggregate)
-      std::printf("=== Aggregate Across Waves (DispatchID=%" PRIu64 ") ===\n",
-                  dispatch_id);
+      writef(ctx.out, "=== Aggregate Across Waves (DispatchID={}) ===\n",
+             ctx.dispatch_id);
     else
-      std::printf("=== Wave (DispatchID=%" PRIu64
-                  ", CU=%u, SIMD=%u, WaveID=%u) ===\n",
-                  dispatch_id, g.cu, g.simd, g.wave_id);
+      writef(ctx.out,
+             "=== Wave (DispatchID={}, CU={}, SIMD={}, WaveID={}) ===\n",
+             ctx.dispatch_id, g.cu, g.simd, g.wave_id);
     for (const auto &lr : g.loops) {
       const auto &e = lr.back_edge;
       const auto &s = lr.stats;
@@ -888,65 +916,45 @@ void dump_loops_text(const std::vector<LoopGroup> &groups,
       uint32_t avg_stall =
           s.iteration_count ? s.total_stall / s.iteration_count : 0;
       if (g.is_aggregate)
-        std::printf("  Loop [0x%" PRIx64 " -> 0x%" PRIx64
-                    "] code_object=%" PRIu64 ": "
-                    "%u waves, %u iterations, %" PRIu64
-                    " total cycles (avg %u/iter), stall %" PRIu64
-                    " (avg %u/iter), idle %" PRIu64 "\n",
-                    e.target_addr, e.source_addr, e.code_object_id,
-                    lr.wave_count, s.iteration_count, s.total_duration, avg_dur,
-                    s.total_stall, avg_stall, s.total_idle);
+        writef(ctx.out,
+               "  Loop [0x{:x} -> 0x{:x}] code_object={}: "
+               "{} waves, {} iterations, {} total cycles (avg {}/iter), "
+               "stall {} (avg {}/iter), idle {}\n",
+               e.target_addr, e.source_addr, e.code_object_id, lr.wave_count,
+               s.iteration_count, s.total_duration, avg_dur, s.total_stall,
+               avg_stall, s.total_idle);
       else
-        std::printf("  Loop [0x%" PRIx64 " -> 0x%" PRIx64
-                    "] code_object=%" PRIu64 ": "
-                    "%u iterations, %" PRIu64 " total cycles (avg %u/iter), "
-                    "stall %" PRIu64 " (avg %u/iter), idle %" PRIu64 "\n",
-                    e.target_addr, e.source_addr, e.code_object_id,
-                    s.iteration_count, s.total_duration, avg_dur,
-                    s.total_stall, avg_stall, s.total_idle);
-      const auto &insts =
-          get_loop_insts(cache, disas, stats, e, bubbles, rel_issues);
-      dump_loop_text_stats(s, insts, cfg);
+        writef(ctx.out,
+               "  Loop [0x{:x} -> 0x{:x}] code_object={}: "
+               "{} iterations, {} total cycles (avg {}/iter), "
+               "stall {} (avg {}/iter), idle {}\n",
+               e.target_addr, e.source_addr, e.code_object_id,
+               s.iteration_count, s.total_duration, avg_dur, s.total_stall,
+               avg_stall, s.total_idle);
+      const auto &insts = get_loop_insts(ctx.cache, ctx.disas, ctx.stats, e,
+                                         ctx.bubbles, ctx.rel_issues);
+      dump_loop_text_stats(ctx.out, s, insts, ctx.cfg);
     }
   }
 }
 
-struct MultiTraceState {
-  bool wrap_json = true;
-  bool print_csv_header = true;
-  bool *json_first_entry = nullptr;
-};
-
-void dump_loops(const std::vector<my_rocperf_tool::WaveLoopInfo> &wave_loops,
-                my_rocperf_tool::Disassembler &disas,
-                my_rocperf_tool::InstStatistics &stats,
-                const LoopOutputConfig &cfg, const PerLoopMap &bubbles,
-                const PerLoopMap &rel_issues, uint64_t dispatch_id,
-                const MultiTraceState &mts) {
-  auto groups = build_loop_groups(wave_loops, cfg);
-  LoopInstCache cache;
-  switch (cfg.format) {
-  case LoopOutputFormat::Json:
-    dump_loops_json(groups, disas, stats, cfg, bubbles, rel_issues, cache,
-                    dispatch_id, mts.wrap_json, mts.json_first_entry);
-    break;
-  case LoopOutputFormat::Csv:
-    dump_loops_csv(groups, disas, stats, cfg, bubbles, rel_issues, cache,
-                   dispatch_id, mts.print_csv_header);
-    break;
-  case LoopOutputFormat::Text:
-    dump_loops_text(groups, disas, stats, cfg, bubbles, rel_issues, cache,
-                    dispatch_id);
-    break;
+void dump_loops(
+    const DumpCtx &ctx,
+    const std::vector<my_rocperf_tool::WaveLoopInfo> &wave_loops) {
+  auto groups = build_loop_groups(wave_loops, ctx.cfg);
+  switch (ctx.cfg.format) {
+  case LoopOutputFormat::Json: dump_loops_json(ctx, groups); break;
+  case LoopOutputFormat::Csv:  dump_loops_csv(ctx, groups);  break;
+  case LoopOutputFormat::Text: dump_loops_text(ctx, groups); break;
   }
 }
 
-int run_trace(const my_rocperf_tool::AttOutputDir &out_dir,
+int run_trace(TraceBuf &out,
+              const my_rocperf_tool::AttOutputDir &out_dir,
               const my_rocperf_tool::AttPath &att_path,
               my_rocperf_tool::Disassembler &disas,
               const LoopOutputConfig &cfg,
-              std::optional<uint64_t> dispatch_id_override,
-              const MultiTraceState &mts) {
+              std::optional<uint64_t> dispatch_id_override) {
   trace_decoder_context decoder_ctx(disas);
   {
     PHASE_TIMER("trace setup + I/O");
@@ -986,10 +994,14 @@ int run_trace(const my_rocperf_tool::AttOutputDir &out_dir,
 
   {
     PHASE_TIMER("dump_loops");
-    if (decoder_ctx.detect_loops_flag)
-      dump_loops(decoder_ctx.wave_loops, decoder_ctx.disas, decoder_ctx.stats,
-                 cfg, decoder_ctx.bubble_totals, decoder_ctx.rel_issue_totals,
-                 decoder_ctx.dispatch_id, mts);
+    if (decoder_ctx.detect_loops_flag) {
+      LoopInstCache cache;
+      DumpCtx dump_ctx{out, decoder_ctx.disas, decoder_ctx.stats, cfg,
+                       decoder_ctx.bubble_totals,
+                       decoder_ctx.rel_issue_totals, cache,
+                       decoder_ctx.dispatch_id};
+      dump_loops(dump_ctx, decoder_ctx.wave_loops);
+    }
   }
   return 0;
 }
@@ -1004,39 +1016,103 @@ int run_main(const std::string &att_output_dir_path) {
   }
 
   auto object_load_bases = out_dir.read_load_bases();
-  my_rocperf_tool::Disassembler disas;
-  {
-    PHASE_TIMER("load code objects");
-    for (const auto &obj_file : out_dir.code_objects) {
-      auto load_base_it =
-          object_load_bases.find(static_cast<int>(obj_file.id));
-      assert(load_base_it != object_load_bases.end());
-      disas.addCodeObject(obj_file.id, obj_file.path, load_base_it->second);
-    }
-  }
-
   auto cfg = LoopOutputConfig::from_flags();
-  const bool multi_trace = out_dir.att_paths.size() > 1;
-  const bool multi_json = multi_trace && cfg.format == LoopOutputFormat::Json;
-  bool json_first_entry = true;
-  if (multi_json)
-    std::printf("[\n");
-
   auto dispatch_id_override =
       out_dir.att_paths.size() == 1
           ? parse_dispatch_id_from_path(att_output_dir_path)
           : std::optional<uint64_t>{};
-  for (size_t i = 0; i < out_dir.att_paths.size(); i++) {
-    MultiTraceState mts;
-    mts.print_csv_header = i == 0;
-    mts.wrap_json = !multi_json;
-    mts.json_first_entry = multi_json ? &json_first_entry : nullptr;
-    run_trace(out_dir, out_dir.att_paths[i], disas, cfg, dispatch_id_override,
-              mts);
+  const size_t n_traces = out_dir.att_paths.size();
+
+  // Past ~64 workers, contention/scheduling overhead dominates the
+  // per-trace decode (~55ms) on this workload.
+  constexpr size_t kAutoJobsCap = 64;
+  size_t jobs;
+  if (uint32_t flag = absl::GetFlag(FLAGS_jobs); flag != 0) {
+    jobs = std::min<size_t>(n_traces, flag);
+  } else {
+    auto hw = std::thread::hardware_concurrency();
+    jobs = std::min<size_t>({n_traces, hw ? hw : 1u, kAutoJobsCap});
   }
 
-  if (multi_json)
-    std::printf("\n]\n");
+  auto load_code_objects = [&](my_rocperf_tool::Disassembler &d) {
+    for (const auto &obj_file : out_dir.code_objects) {
+      auto load_base_it =
+          object_load_bases.find(static_cast<int>(obj_file.id));
+      assert(load_base_it != object_load_bases.end());
+      d.addCodeObject(obj_file.id, obj_file.path, load_base_it->second);
+    }
+  };
+
+  // Per-trace output buffers. Indexed in dispatch_id order; workers may
+  // complete out of order. fmt::memory_buffer owns its storage (RAII), so
+  // exceptions between fill and emit don't leak.
+  // Memory note: chunks hold all per-trace output until emit. For
+  // aggregate_wave_only this is small; --dump_loop_contents over thousands
+  // of traces could reach hundreds of MB.
+  std::vector<TraceBuf> chunks(n_traces);
+
+  auto process_one = [&](my_rocperf_tool::Disassembler &disas, size_t i) {
+    run_trace(chunks[i], out_dir, out_dir.att_paths[i], disas, cfg,
+              dispatch_id_override);
+  };
+
+  // Always process trace[0] serially first. Two reasons:
+  // 1. The decoder library lazy-inits a process-wide singleton trie
+  //    (Trie::root_trie in rocprof-trace-decoder/source/trie.cpp) on its
+  //    first call, guarded only by a non-atomic bool. Concurrent first
+  //    calls race on its std::unordered_map writes — UB. After the first
+  //    call returns, std::thread construction publishes those writes to
+  //    workers, which then only read.
+  // 2. The serial Disassembler then becomes the main thread's worker, so
+  //    no per-worker setup work is wasted.
+  my_rocperf_tool::Disassembler main_disas;
+  {
+    PHASE_TIMER("load code objects + warmup");
+    load_code_objects(main_disas);
+    process_one(main_disas, 0);
+  }
+
+  if (n_traces > 1) {
+    PHASE_TIMER("parallel decode");
+    std::atomic<size_t> next{1};
+    auto worker_loop = [&](my_rocperf_tool::Disassembler &disas) {
+      while (true) {
+        size_t i = next.fetch_add(1, std::memory_order_relaxed);
+        if (i >= n_traces) break;
+        process_one(disas, i);
+      }
+    };
+    std::vector<std::thread> workers;
+    workers.reserve(jobs - 1);
+    for (size_t w = 1; w < jobs; w++) {
+      workers.emplace_back([&]() {
+        my_rocperf_tool::Disassembler local_disas;
+        load_code_objects(local_disas);
+        worker_loop(local_disas);
+      });
+    }
+    worker_loop(main_disas);
+    for (auto &t : workers) t.join();
+  }
+
+  // Emit prologue + chunks (in order) + epilogue.
+  if (cfg.format == LoopOutputFormat::Json)
+    std::fputs("[\n", stdout);
+  else if (cfg.format == LoopOutputFormat::Csv) {
+    TraceBuf header;
+    dump_csv_header(header, cfg);
+    std::fwrite(header.data(), 1, header.size(), stdout);
+  }
+  bool first_nonempty = true;
+  for (const auto &c : chunks) {
+    if (c.size() == 0) continue;
+    if (cfg.format == LoopOutputFormat::Json && !first_nonempty)
+      std::fputs(",\n", stdout);
+    std::fwrite(c.data(), 1, c.size(), stdout);
+    first_nonempty = false;
+  }
+  if (cfg.format == LoopOutputFormat::Json)
+    std::fputs("\n]\n", stdout);
   return 0;
 }
 

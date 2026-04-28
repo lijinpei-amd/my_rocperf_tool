@@ -4,7 +4,7 @@ project(my_rocperf_tool)
 option(ROCPROF_TRACE_DECODER_PATH "installation path of rocprof-trace-decoder")
 
 set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_FLAGS "$CMAKE_CXX_FLAGS -fPIC -fno-rtti")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC -fno-rtti")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 find_package(rocprofiler-sdk REQUIRED)
