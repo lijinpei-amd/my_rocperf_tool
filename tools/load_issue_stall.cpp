@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <optional>
 #include <string>
 #include <thread>
@@ -139,6 +140,7 @@ struct trace_decoder_context {
   bool mfma_coexec_flag;
   std::vector<my_rocperf_tool::WaveLoopInfo> wave_loops;
   llvm::DenseMap<rocprofiler_thread_trace_decoder_pc_t, bool> mfma_cache;
+  llvm::DenseMap<rocprofiler_thread_trace_decoder_pc_t, bool> is_barrier_cache;
   PerLoopMap bubble_totals;
   PerLoopMap rel_issue_totals;
 
@@ -273,6 +275,82 @@ void compute_relative_issue(
   }
 }
 
+bool is_s_barrier_pc(trace_decoder_context &ctx,
+                     const rocprofiler_thread_trace_decoder_pc_t &pc) {
+  auto [it, inserted] = ctx.is_barrier_cache.try_emplace(pc, false);
+  if (inserted) {
+    auto &obj = ctx.disas.get_object_file_by_id(pc.code_object_id);
+    uint64_t inst_size;
+    auto mc_inst = obj.decode_at(pc.address, inst_size);
+    auto name = obj.mc_instr_info->getName(mc_inst.getOpcode());
+    // LLVM AMDGPU decorates opcode names with a lowercase subtarget tag
+    // ("S_BARRIER_vi", "S_BARRIER_gfx10", ...). The gfx12 split-barrier
+    // family is distinct: S_BARRIER_WAIT_*, S_BARRIER_SIGNAL_*, etc. — an
+    // uppercase mnemonic word follows S_BARRIER_. Match the classic
+    // s_barrier across subtargets without catching the split family.
+    constexpr llvm::StringRef kPrefix = "S_BARRIER_";
+    it->second = name == "S_BARRIER" ||
+                 (name.starts_with(kPrefix) && name.size() > kPrefix.size() &&
+                  std::islower(static_cast<unsigned char>(name[kPrefix.size()])));
+  }
+  return it->second;
+}
+
+// gfx9-style `s_barrier` is the only known instruction whose execution lands
+// in the trace as multiple tokens at the same PC: a barrier_signal (MSG)
+// entry token followed immediately by a barrier_wait (IMMED) exit token, with
+// no scheduling gap between them. Coalesce that pair into one record so
+// PC-keyed accumulation downstream counts a single execution. Any other
+// consecutive same-PC pattern is unknown territory and asserts so the wave
+// decoder's behavior is surfaced rather than silently double-counted.
+std::vector<rocprofiler_thread_trace_decoder_inst_t>
+coalesce_barrier_tokens(trace_decoder_context &ctx,
+                        const rocprofiler_thread_trace_decoder_wave_t &wave) {
+  std::vector<rocprofiler_thread_trace_decoder_inst_t> out;
+  out.reserve(wave.instructions_size);
+  constexpr uint32_t kStallMax = (1u << 24) - 1;
+  auto pc_eq = [](const auto &a, const auto &b) {
+    return a.pc.address == b.pc.address &&
+           a.pc.code_object_id == b.pc.code_object_id;
+  };
+  for (size_t i = 0; i < wave.instructions_size;) {
+    const auto &cur = wave.instructions_array[i];
+    if (i + 1 >= wave.instructions_size || my_rocperf_tool::is_null_pc(cur) ||
+        !pc_eq(cur, wave.instructions_array[i + 1])) {
+      out.push_back(cur);
+      ++i;
+      continue;
+    }
+    const auto &nxt = wave.instructions_array[i + 1];
+    assert(is_s_barrier_pc(ctx, cur.pc) &&
+           "consecutive same-PC tokens at non-s_barrier PC");
+    assert(cur.category == ROCPROFILER_THREAD_TRACE_DECODER_INST_MESSAGE &&
+           "first s_barrier token must be MESSAGE");
+    assert(nxt.category == ROCPROFILER_THREAD_TRACE_DECODER_INST_IMMED &&
+           "second s_barrier token must be IMMED");
+    assert(nxt.time == cur.time + cur.duration &&
+           "no gap allowed between s_barrier MSG and IMMED tokens");
+    assert((i + 2 >= wave.instructions_size ||
+            !pc_eq(cur, wave.instructions_array[i + 2])) &&
+           "expected exactly 2 consecutive same-PC tokens at s_barrier");
+    auto merged = cur;
+    uint64_t total_dur = static_cast<uint64_t>(cur.duration) +
+                         static_cast<uint64_t>(nxt.duration);
+    uint64_t total_stall =
+        static_cast<uint64_t>(cur.stall) + static_cast<uint64_t>(nxt.stall);
+    merged.duration =
+        total_dur > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())
+            ? std::numeric_limits<int32_t>::max()
+            : static_cast<int32_t>(total_dur);
+    merged.stall = total_stall > kStallMax
+                       ? kStallMax
+                       : static_cast<uint32_t>(total_stall);
+    out.push_back(merged);
+    i += 2;
+  }
+  return out;
+}
+
 rocprofiler_thread_trace_decoder_status_t att_decoder_trace_callback(
     rocprofiler_thread_trace_decoder_record_type_t record_type_id,
     void *trace_events, uint64_t trace_size, void *userdata) {
@@ -284,7 +362,10 @@ rocprofiler_thread_trace_decoder_status_t att_decoder_trace_callback(
     auto *wave_events =
         static_cast<rocprofiler_thread_trace_decoder_wave_t *>(trace_events);
     for (size_t wave_n = 0; wave_n < trace_size; wave_n++) {
-      const auto &wave = wave_events[wave_n];
+      auto wave = wave_events[wave_n];
+      auto coalesced = coalesce_barrier_tokens(ctx, wave);
+      wave.instructions_array = coalesced.data();
+      wave.instructions_size = coalesced.size();
 
       int64_t last_time = wave.begin_time;
       for (size_t j = 0; j < wave.instructions_size; j++) {
@@ -300,8 +381,7 @@ rocprofiler_thread_trace_decoder_status_t att_decoder_trace_callback(
                      inst.pc.address, inst.pc.code_object_id, inst.duration,
                      inst.stall);
         }
-        auto res = ctx.stats.add_inst(inst, idle);
-        assert(res);
+        ctx.stats.add_inst(inst, idle);
       }
 
       if (ctx.detect_loops_flag) {

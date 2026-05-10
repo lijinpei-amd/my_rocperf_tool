@@ -47,23 +47,9 @@ class InstStatistics {
   llvm::DenseMap<pc_t, std::vector<Inst>> insts;
 
 public:
-  bool add_inst(const rocprofiler_thread_trace_decoder_inst_t &inst,
+  void add_inst(const rocprofiler_thread_trace_decoder_inst_t &inst,
                 uint32_t idle) {
-    const auto &pc = inst.pc;
-    auto &states = insts[pc];
-    bool res = states.empty();
-    if (!res) {
-      auto old_category = states[0].category;
-      auto new_category = inst.category;
-      auto is_branch = [](auto category) {
-        return category == ROCPROFILER_THREAD_TRACE_DECODER_INST_JUMP ||
-               category == ROCPROFILER_THREAD_TRACE_DECODER_INST_NEXT;
-      };
-      res = old_category == new_category ||
-            is_branch(old_category) && is_branch(new_category);
-    }
-    states.push_back({inst, idle});
-    return res;
+    insts[inst.pc].push_back({inst, idle});
   }
   llvm::ArrayRef<Inst> get_inst_at(const pc_t &pc) const {
     auto iter = insts.find(pc);
