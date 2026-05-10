@@ -4,3 +4,8 @@
 [submodule "3rd_party/fmt"]
 	path = 3rd_party/fmt
 	url = https://github.com/fmtlib/fmt.git
+[submodule "3rd_party/rocm-systems"]
+	path = 3rd_party/rocm-systems
+	url = https://github.com/ROCm/rocm-systems.git
+	branch = develop
+	shallow = true

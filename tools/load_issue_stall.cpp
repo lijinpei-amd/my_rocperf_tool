@@ -7,11 +7,7 @@
 #include "absl/flags/flag.h"
 #include "absl/flags/parse.h"
 
-#if ROCPROF_TRACE_DECODER_NEW
 #include "trace_decoder_api.h"
-#else
-#include "rocprof_trace_decoder.h"
-#endif
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/MC/MCInst.h"

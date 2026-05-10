@@ -7,4 +7,4 @@ add_library(my_rocperf_tool SHARED
     rocperf_tool.cpp
     )
 target_link_libraries(my_rocperf_tool PUBLIC
-    rocprofiler-sdk::rocprofiler-sdk absl::log LLVM SQLite::SQLite3)
+    rocprofiler-sdk::rocprofiler-sdk absl::log LLVM SQLite::SQLite3 rocprof-trace-decoder)

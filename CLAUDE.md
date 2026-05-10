@@ -10,7 +10,7 @@ my_rocperf_tool is a C++17 performance analysis tool for AMD GPUs. It decodes Ad
 
 ```bash
 git submodule update --init --recursive
-cmake -B build -G Ninja -DROCPROF_TRACE_DECODER_PATH=/path/to/decoder
+cmake -B build -G Ninja -DCMAKE_PREFIX_PATH=/opt/rocm
 cmake --build build
 ```
 
@@ -18,11 +18,11 @@ CMake minimum 3.28, Ninja generator, C++17, compiled with `-fPIC -fno-rtti`.
 
 ### Dependencies
 
-- **rocprofiler-sdk** — AMD ROCm profiler SDK
+- **rocprofiler-sdk** — AMD ROCm profiler SDK (point `CMAKE_PREFIX_PATH` at the ROCm install)
 - **LLVM** (CONFIG mode) — MC disassembler infrastructure
-- **SQLite3** — reading profiling result databases
-- **rocprof-trace-decoder** — ATT trace decoding (path configured via `ROCPROF_TRACE_DECODER_PATH`)
-- **abseil-cpp** — git submodule at `3rd_party/abseil-cpp` (logging, flags)
+- **SQLite3** — reading profiling result databases (`libsqlite3-dev`)
+- **rocprof-trace-decoder** — git submodule at `3rd_party/rocm-systems` (built from `projects/rocprof-trace-decoder/source`)
+- **abseil-cpp**, **fmt** — git submodules under `3rd_party/`
 
 ### Build Outputs
 
