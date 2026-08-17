@@ -1,7 +1,11 @@
 #include "my_rocperf_tool/check_rocprofiler_status.h"
 
+#include "absl/base/log_severity.h"
 #include "absl/log/log_streamer.h"
+#include "rocprofiler-sdk/fwd.h"
 #include "rocprofiler-sdk/rocprofiler.h"
+
+#include <string_view>
 
 namespace my_rocperf_tool {
 void check_rocprofiler_status_impl(rocprofiler_status_t status,

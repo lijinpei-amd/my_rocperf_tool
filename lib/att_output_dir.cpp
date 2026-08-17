@@ -9,9 +9,13 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <regex>
 #include <sstream>
+#include <string>
 #include <tuple>
+#include <unordered_map>
+#include <utility>
 
 namespace my_rocperf_tool {
 

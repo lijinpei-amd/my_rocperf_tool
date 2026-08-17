@@ -8,26 +8,34 @@
 #include "absl/flags/parse.h"
 
 #include "trace_decoder_api.h"
+#include "trace_decoder_types.h"
 
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/MC/MCInst.h"
 
+#include "fmt/base.h"
 #include "fmt/format.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
-#include <iterator>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <string>
 #include <thread>
 #include <tuple>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #ifdef ENABLE_TIMERS
