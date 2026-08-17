@@ -3,6 +3,8 @@
 #include "llvm/ADT/DenseMap.h"
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
 
 namespace my_rocperf_tool {
 

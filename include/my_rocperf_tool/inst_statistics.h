@@ -7,6 +7,8 @@
 
 #include "trace_decoder_types.h"
 
+#include <cstddef>
+#include <cstdint>
 #include <iostream>
 #include <vector>
 

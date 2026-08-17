@@ -16,6 +16,8 @@
 
 #include <atomic>
 #include <cctype>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <iostream>

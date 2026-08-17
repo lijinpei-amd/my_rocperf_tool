@@ -13,6 +13,9 @@
 #include "llvm/Support/Format.h"
 #include "llvm/TargetParser/Triple.h"
 
+#include <cstddef>
+#include <cstdint>
+
 namespace {
 struct IsaInfo {
   llvm::StringRef IsaName;
