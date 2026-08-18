@@ -227,18 +227,15 @@ rocprofiler_thread_trace_decoder_status_t att_decoder_isa_callback(
   auto& obj_file = ctx.disas.get_object_file_by_id(pc.code_object_id);
   uint64_t inst_size;
   auto mc_inst = obj_file.decode_at(pc.address, inst_size);
-  obj_file.streamer->emitInstruction(mc_inst, *obj_file.sub_target);
-  llvm::StringRef inst_ref = llvm::StringRef(obj_file.inst_str).trim();
+  llvm::StringRef inst_ref = obj_file.print_inst(mc_inst);
   auto str_size = inst_ref.size();
   if (*isa_size < str_size) {
     *isa_size = str_size;
-    obj_file.inst_str.clear();
     return ROCPROFILER_THREAD_TRACE_DECODER_STATUS_ERROR_OUT_OF_RESOURCES;
   }
   memcpy(isa_instruction, inst_ref.data(), str_size);
   *isa_size = str_size;
   *isa_memory_size = inst_size;
-  obj_file.inst_str.clear();
   return ROCPROFILER_THREAD_TRACE_DECODER_STATUS_SUCCESS;
 }
 
@@ -262,8 +259,9 @@ void analyze_mfma_coexec(trace_decoder_context& ctx,
     if (inserted) {
       uint64_t inst_size;
       auto mc_inst = obj.decode_at(inst.pc.address, inst_size);
-      cache_it->second =
-          obj.mc_instr_info->getName(mc_inst.getOpcode()).starts_with("V_MFMA");
+      cache_it->second = obj.get_instr_info()
+                             .getName(mc_inst.getOpcode())
+                             .starts_with("V_MFMA");
     }
 
     if (cache_it->second) {
@@ -323,7 +321,7 @@ bool is_s_barrier_pc(trace_decoder_context& ctx,
     auto& obj = ctx.disas.get_object_file_by_id(pc.code_object_id);
     uint64_t inst_size;
     auto mc_inst = obj.decode_at(pc.address, inst_size);
-    auto name = obj.mc_instr_info->getName(mc_inst.getOpcode());
+    auto name = obj.get_instr_info().getName(mc_inst.getOpcode());
     // LLVM AMDGPU decorates opcode names with a lowercase subtarget tag
     // ("S_BARRIER_vi", "S_BARRIER_gfx10", ...). The gfx12 split-barrier
     // family is distinct: S_BARRIER_WAIT_*, S_BARRIER_SIGNAL_*, etc. — an
@@ -495,9 +493,7 @@ std::vector<LoopInstInfo> collect_loop_insts(
   while (sec_offset <= end_offset && !bytes.empty()) {
     uint64_t inst_size;
     auto mc_inst = obj.decode_at(sec_offset + obj.text_sec_address, inst_size);
-    obj.streamer->emitInstruction(mc_inst, *obj.sub_target);
-    std::string inst_str = llvm::StringRef(obj.inst_str).trim().str();
-    obj.inst_str.clear();
+    std::string inst_str = obj.print_inst(mc_inst).str();
 
     uint64_t addr = sec_offset + obj.text_sec_address;
     rocprofiler_thread_trace_decoder_pc_t pc{addr, edge.code_object_id};

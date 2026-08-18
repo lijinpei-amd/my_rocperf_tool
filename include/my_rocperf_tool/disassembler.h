@@ -6,13 +6,10 @@
 #include "llvm/ADT/DenseMapInfo.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/StringRef.h"
-#include "llvm/BinaryFormat/MsgPackDocument.h"
-#include "llvm/MC/MCAsmBackend.h"
 #include "llvm/MC/MCAsmInfo.h"
-#include "llvm/MC/MCCodeEmitter.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCDisassembler/MCDisassembler.h"
-#include "llvm/MC/MCInstPrinter.h"
+#include "llvm/MC/MCInst.h"
 #include "llvm/MC/MCInstrInfo.h"
 #include "llvm/MC/MCRegisterInfo.h"
 #include "llvm/MC/MCStreamer.h"
@@ -22,7 +19,6 @@
 #include "llvm/Object/ELFObjectFile.h"
 #include "llvm/Object/ELFTypes.h"
 #include "llvm/Object/ObjectFile.h"
-#include "llvm/Support/FormattedStream.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -34,7 +30,7 @@
 namespace my_rocperf_tool {
 
 struct SubTargetKey {
-  llvm::Target* target;
+  const llvm::Target* target;
   llvm::Triple triple;
   std::string mcpu;
   std::string features;
@@ -49,7 +45,7 @@ struct SubTargetKey {
 namespace llvm {
 template <>
 struct DenseMapInfo<my_rocperf_tool::SubTargetKey> {
-  using TargetInfoTy = DenseMapInfo<Target*>;
+  using TargetInfoTy = DenseMapInfo<const Target*>;
 
   static my_rocperf_tool::SubTargetKey getEmptyKey() {
     return my_rocperf_tool::SubTargetKey{
@@ -82,6 +78,45 @@ struct DenseMapInfo<my_rocperf_tool::SubTargetKey> {
 namespace my_rocperf_tool {
 
 class Disassembler;
+
+// The MC objects that vary with the ISA -- everything downstream of one
+// (mcpu, features) pair. Code objects sharing an ISA share one of these; the
+// owning Disassembler caches them by SubTargetKey, so the whole stack is built
+// once per gfx target rather than once per loaded executable.
+//
+// Not thread-safe: print_inst writes a shared scratch buffer and the MC
+// disassembler carries per-call state. That is fine as used, because each
+// worker thread owns a Disassembler and therefore its own contexts.
+class SubTargetContext {
+ public:
+  SubTargetContext(const Disassembler& disas, llvm::StringRef mcpu,
+                   llvm::StringRef features);
+
+  const llvm::MCSubtargetInfo& get_sub_target_info() const {
+    return *sub_target;
+  }
+  const llvm::MCDisassembler& get_mc_disassembler() const {
+    return *mc_dis_asm;
+  }
+  const llvm::MCInstrInfo& get_instr_info() const { return *mc_instr_info; }
+
+  // Renders one instruction to text, trimmed. The result points into a scratch
+  // buffer that the next call overwrites -- copy it to keep it longer.
+  llvm::StringRef print_inst(const llvm::MCInst& inst) const;
+
+ private:
+  // Declaration order is lifetime order. The streamer holds a
+  // formatted_raw_ostream over inst_stream, an inst printer and code emitter
+  // over mc_instr_info/mc_ctx, and an asm backend over sub_target, so it must
+  // be destroyed before any of them.
+  mutable std::string inst_str;
+  std::unique_ptr<llvm::raw_string_ostream> inst_stream;
+  std::unique_ptr<llvm::MCSubtargetInfo> sub_target;
+  std::unique_ptr<llvm::MCInstrInfo> mc_instr_info;
+  std::unique_ptr<llvm::MCContext> mc_ctx;
+  std::unique_ptr<llvm::MCDisassembler> mc_dis_asm;
+  std::unique_ptr<llvm::MCStreamer> streamer;
+};
 
 class SymbolIndex {
   struct SymbolInfo {
@@ -151,9 +186,6 @@ struct CachedSection {
 
 class ObjectFileInfo {
   template <class ELFT>
-  bool process_metadata_note(const typename ELFT::Note& note,
-                             llvm::msgpack::DocNode& root);
-  template <class ELFT>
   void disassemble(Disassembler& disas,
                    const llvm::object::ELFObjectFile<ELFT>& elf_obj);
   template <class ELFT>
@@ -176,6 +208,16 @@ class ObjectFileInfo {
   const llvm::MCInst& decode_at(uint64_t addr, uint64_t& inst_size) const;
   void decode_all_sections() const;
 
+  const SubTargetContext& get_sub_target_context() const {
+    return *sub_target_ctx;
+  }
+  const llvm::MCInstrInfo& get_instr_info() const {
+    return sub_target_ctx->get_instr_info();
+  }
+  llvm::StringRef print_inst(const llvm::MCInst& inst) const {
+    return sub_target_ctx->print_inst(inst);
+  }
+
   llvm::StringRef processor;
   bool sram_ecc_supported = false;
   bool xnack_supported = false;
@@ -187,28 +229,16 @@ class ObjectFileInfo {
   uint64_t text_sec_size;
   std::unique_ptr<llvm::MemoryBuffer> memory_buffer;
   std::unique_ptr<llvm::object::ObjectFile> object_file;
-  llvm::MCSubtargetInfo* sub_target = nullptr;
-  std::unique_ptr<llvm::MCContext> mc_ctx;
-  std::unique_ptr<llvm::MCDisassembler> mc_dis_asm;
-  std::unique_ptr<llvm::MCInstrInfo> mc_instr_info;
-  std::unique_ptr<llvm::MCRegisterInfo> mc_reg_info;
-  std::unique_ptr<llvm::MCCodeEmitter> mc_code_emitter;
-  std::unique_ptr<llvm::MCAsmBackend> mc_asm_backend;
-  std::unique_ptr<llvm::MCInstPrinter> inst_printer;
-  std::string inst_str;
-  std::unique_ptr<llvm::raw_string_ostream> inst_stream =
-      std::make_unique<llvm::raw_string_ostream>(inst_str);
-  std::unique_ptr<llvm::formatted_raw_ostream> fout =
-      std::make_unique<llvm::formatted_raw_ostream>(*inst_stream);
-  std::unique_ptr<llvm::MCStreamer> streamer;
+  // Owned by the Disassembler's cache, keyed on this object's ISA.
+  const SubTargetContext* sub_target_ctx = nullptr;
 
   SymbolIndex symbol_index;
 };
 
 class Disassembler {
   llvm::DenseMap<uint64_t, ObjectFileInfo> object_files;
-  llvm::DenseMap<SubTargetKey, std::unique_ptr<llvm::MCSubtargetInfo>>
-      subtargets;
+  llvm::DenseMap<SubTargetKey, std::unique_ptr<SubTargetContext>>
+      sub_target_contexts;
   llvm::Triple triple;
   const llvm::Target* target = nullptr;
   llvm::MCTargetOptions mc_options;
@@ -217,8 +247,10 @@ class Disassembler {
 
  public:
   Disassembler();
-  llvm::MCSubtargetInfo* get_sub_target(llvm::StringRef mcpu,
-                                        llvm::StringRef features);
+  // Returns the cached MC stack for this ISA, building it on first request.
+  // The reference stays valid for the lifetime of this Disassembler.
+  const SubTargetContext& get_sub_target_context(llvm::StringRef mcpu,
+                                                 llvm::StringRef features);
   bool addCodeObject(uint64_t id, const std::string& file_path) {
     return object_files.try_emplace(id, *this, file_path).second;
   }

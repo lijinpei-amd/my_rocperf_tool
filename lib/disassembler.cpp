@@ -17,6 +17,7 @@
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Compiler.h"
+#include "llvm/Support/FormattedStream.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Triple.h"
@@ -83,10 +84,41 @@ struct IsaInfo {
 
 namespace my_rocperf_tool {
 
-template <class ELFT>
-bool process_metadata_note(const typename ELFT::Note& note,
-                           llvm::msgpack::DocNode& root) {
-  return true;
+SubTargetContext::SubTargetContext(const Disassembler& disas,
+                                   llvm::StringRef mcpu,
+                                   llvm::StringRef features)
+    : inst_stream(std::make_unique<llvm::raw_string_ostream>(inst_str)) {
+  const auto* target = disas.getTarget();
+  const auto& triple = disas.getTriple();
+  const auto& asm_info = disas.getMCAsmInfo();
+  const auto& reg_info = disas.getMCRegisterInfo();
+
+  sub_target.reset(target->createMCSubtargetInfo(triple, mcpu, features));
+  assert(sub_target);
+  mc_instr_info.reset(target->createMCInstrInfo());
+  mc_ctx = std::make_unique<llvm::MCContext>(triple, &asm_info, &reg_info,
+                                             sub_target.get(), nullptr,
+                                             &disas.getMCOptions());
+  mc_dis_asm.reset(target->createMCDisassembler(*sub_target, *mc_ctx));
+
+  // The streamer takes ownership of all four; only it ever touches them.
+  auto fout = std::make_unique<llvm::formatted_raw_ostream>(*inst_stream);
+  std::unique_ptr<llvm::MCInstPrinter> printer(
+      target->createMCInstPrinter(triple, asm_info.getAssemblerDialect(),
+                                  asm_info, *mc_instr_info, reg_info));
+  std::unique_ptr<llvm::MCCodeEmitter> code_emitter(
+      target->createMCCodeEmitter(*mc_instr_info, *mc_ctx));
+  std::unique_ptr<llvm::MCAsmBackend> asm_backend(
+      target->createMCAsmBackend(*sub_target, reg_info, disas.getMCOptions()));
+  streamer.reset(target->createAsmStreamer(
+      *mc_ctx, std::move(fout), std::move(printer), std::move(code_emitter),
+      std::move(asm_backend)));
+}
+
+llvm::StringRef SubTargetContext::print_inst(const llvm::MCInst& inst) const {
+  inst_str.clear();
+  streamer->emitInstruction(inst, *sub_target);
+  return llvm::StringRef(inst_str).trim();
 }
 
 template <class ELFT>
@@ -152,10 +184,10 @@ void ObjectFileInfo::disassemble(
       while (!bytes.empty()) {
         llvm::MCInst inst;
         uint64_t inst_size;
-        auto status = mc_dis_asm->getInstruction(inst, inst_size, bytes,
-                                                 virt_addr, llvm::nulls());
+        auto status = sub_target_ctx->get_mc_disassembler().getInstruction(
+            inst, inst_size, bytes, virt_addr, llvm::nulls());
         if (status == llvm::MCDisassembler::Success) {
-          streamer->emitInstruction(inst, *sub_target);
+          sub_target_ctx->print_inst(inst);
         } else {
           assert(false);
         }
@@ -164,33 +196,13 @@ void ObjectFileInfo::disassemble(
       }
     }
   }
-  inst_str.clear();
 }
 
 void ObjectFileInfo::initialize_mc(Disassembler& disas) {
   llvm::sort(inst_cache, [](const CachedSection& a, const CachedSection& b) {
     return a.start_addr < b.start_addr;
   });
-  auto* target = disas.getTarget();
-  auto& triple = disas.getTriple();
-  sub_target = disas.get_sub_target(processor, "");
-  mc_ctx = std::make_unique<llvm::MCContext>(
-      triple, &disas.getMCAsmInfo(), &disas.getMCRegisterInfo(), sub_target,
-      nullptr, &disas.getMCOptions());
-  mc_dis_asm.reset(target->createMCDisassembler(*sub_target, *mc_ctx));
-
-  mc_instr_info.reset(target->createMCInstrInfo());
-
-  mc_code_emitter.reset(target->createMCCodeEmitter(*mc_instr_info, *mc_ctx));
-
-  mc_asm_backend.reset(target->createMCAsmBackend(
-      *sub_target, disas.getMCRegisterInfo(), disas.getMCOptions()));
-  inst_printer.reset(target->createMCInstPrinter(
-      triple, disas.getMCAsmInfo().getAssemblerDialect(), disas.getMCAsmInfo(),
-      *mc_instr_info, disas.getMCRegisterInfo()));
-  streamer.reset(target->createAsmStreamer(
-      *mc_ctx, std::move(fout), std::move(inst_printer),
-      std::move(mc_code_emitter), std::move(mc_asm_backend)));
+  sub_target_ctx = &disas.get_sub_target_context(processor, "");
 }
 
 void ObjectFileInfo::init_elf(Disassembler& disas) {
@@ -277,7 +289,7 @@ void ObjectFileInfo::ensure_section_decoded(CachedSection& sec) const {
     // has no effect on the decoded instruction. Installing one would make the
     // choice of address space observable, and vaddrs are what the rest of the
     // tool reports; runtime addresses would need the delta added back.
-    auto status = mc_dis_asm->getInstruction(
+    auto status = sub_target_ctx->get_mc_disassembler().getInstruction(
         slot.inst, inst_size, bytes, sec.start_addr + offset, llvm::nulls());
     assert(status == llvm::MCDisassembler::Success);
     (void)status;
@@ -324,12 +336,14 @@ Disassembler::Disassembler() {
   mc_asm_info.reset(target->createMCAsmInfo(*mc_reg_info, triple, mc_options));
 }
 
-llvm::MCSubtargetInfo* Disassembler::get_sub_target(llvm::StringRef mcpu,
-                                                    llvm::StringRef features) {
+const SubTargetContext& Disassembler::get_sub_target_context(
+    llvm::StringRef mcpu, llvm::StringRef features) {
   assert(target);
-  auto res = target->createMCSubtargetInfo(triple, mcpu, features);
-  assert(res);
-  return res;
+  auto [iter, inserted] = sub_target_contexts.try_emplace(
+      SubTargetKey{target, triple, mcpu.str(), features.str()});
+  if (inserted)
+    iter->second = std::make_unique<SubTargetContext>(*this, mcpu, features);
+  return *iter->second;
 }
 
 }  // namespace my_rocperf_tool
