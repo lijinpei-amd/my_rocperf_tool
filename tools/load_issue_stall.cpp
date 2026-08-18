@@ -39,32 +39,65 @@
 #include <utility>
 #include <vector>
 
+// Phase timing rides on LLVM's -ftime-trace machinery, already linked via
+// libLLVM. Printing one line per scope was fine for the serial phases but not
+// for the five inside run_trace: those run once per trace on up to 64 workers,
+// so the interesting numbers are per-phase totals, not thousands of interleaved
+// lines. TimeProfiler aggregates same-named scopes into "Total <name>" entries
+// and keeps the nesting, viewable in perfetto.dev / speedscope.
 #ifdef ENABLE_TIMERS
-#include <chrono>
-struct PhaseTimer {
-  using clock = std::chrono::steady_clock;
-  std::chrono::time_point<clock> start;
-  const char *name;
-  PhaseTimer(const char *n) : name(n), start(clock::now()) {}
-  ~PhaseTimer() {
-    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
-                  clock::now() - start)
-                  .count();
-    // Format then single fwrite so output stays line-atomic when many
-    // worker threads emit timers concurrently. glibc holds a per-FILE
-    // lock around fwrite; the line is well under PIPE_BUF/BUFSIZ.
-    fmt::basic_memory_buffer<char, 128> buf;
-    fmt::format_to(fmt::appender(buf),
-                   "[TIMER] {:<35} {}.{:03} ms\n", name, us / 1000,
-                   us % 1000);
-    std::fwrite(buf.data(), 1, buf.size(), stderr);
-  }
-};
+#include "llvm/Support/Error.h"
+#include "llvm/Support/TimeProfiler.h"
+#include "llvm/Support/raw_ostream.h"
+
+ABSL_FLAG(std::string, time_trace_file, "",
+          "path for the Chrome Trace Event JSON emitted by ENABLE_TIMERS "
+          "builds; empty writes ./load_issue_stall.time-trace");
+
+// 0 keeps every scope in the event list. Totals are accumulated before this
+// threshold is applied, so raising it only thins the flame chart.
+static constexpr unsigned kTimeTraceGranularityUs = 0;
+
 #define PHASE_TIMER_CONCAT_(a, b) a##b
 #define PHASE_TIMER_CONCAT(a, b) PHASE_TIMER_CONCAT_(a, b)
-#define PHASE_TIMER(name) PhaseTimer PHASE_TIMER_CONCAT(_timer_, __LINE__)(name)
+#define PHASE_TIMER(name)                                                      \
+  llvm::TimeTraceScope PHASE_TIMER_CONCAT(_phase_timer_, __LINE__)(name)
+
+// The profiler instance is per-thread: a worker's scopes are silently dropped
+// unless it initializes one, and they reach the output only if it hands the
+// instance back before the main thread writes. Declare this first in a thread
+// body so it outlives everything it is meant to time.
+struct WorkerPhaseTimers {
+  WorkerPhaseTimers() {
+    llvm::timeTraceProfilerInitialize(kTimeTraceGranularityUs, "worker");
+  }
+  ~WorkerPhaseTimers() { llvm::timeTraceProfilerFinishThread(); }
+};
+#define WORKER_PHASE_TIMERS() WorkerPhaseTimers _worker_phase_timers
+
+// Owns the main thread's instance. The write asserts that every scope has
+// closed, so this has to outlive run_main's TOTAL scope -- hence main(), not
+// run_main().
+struct PhaseTimerSession {
+  PhaseTimerSession() {
+    llvm::timeTraceProfilerInitialize(kTimeTraceGranularityUs,
+                                      "load_issue_stall");
+  }
+  ~PhaseTimerSession() {
+    auto path = absl::GetFlag(FLAGS_time_trace_file);
+    if (auto err = llvm::timeTraceProfilerWrite(path, "load_issue_stall"))
+      llvm::logAllUnhandledErrors(std::move(err), llvm::errs(), "[TIMER] ");
+    else
+      fmt::print(stderr, "[TIMER] wrote {}\n",
+                 path.empty() ? "load_issue_stall.time-trace" : path);
+    llvm::timeTraceProfilerCleanup();
+  }
+};
+#define PHASE_TIMER_SESSION() PhaseTimerSession _phase_timer_session
 #else
 #define PHASE_TIMER(name) ((void)0)
+#define WORKER_PHASE_TIMERS() ((void)0)
+#define PHASE_TIMER_SESSION() ((void)0)
 #endif
 
 ABSL_FLAG(std::optional<std::string>, att_output_dir, std::nullopt,
@@ -1213,6 +1246,7 @@ int run_main(const std::string &att_output_dir_path) {
     workers.reserve(jobs - 1);
     for (size_t w = 1; w < jobs; w++) {
       workers.emplace_back([&]() {
+        WORKER_PHASE_TIMERS();
         my_rocperf_tool::Disassembler local_disas;
         load_code_objects(local_disas);
         worker_loop(local_disas);
@@ -1306,8 +1340,8 @@ int run_main(const std::string &att_output_dir_path) {
                    "[summary] {} of {} dispatch(es) contained no loop "
                    "(no back-edge was taken)\n",
                    loop_free.size(), by_dispatch.size());
-        // Buffer then one write, per the PhaseTimer convention above: the
-        // list is unbounded and stderr is unbuffered.
+        // Buffer then one write: the list is unbounded and stderr is
+        // unbuffered, so per-id writes would be a syscall apiece.
         if (loop_free.size() < by_dispatch.size()) {
           TraceBuf ids;
           writef(ids, "[summary] loop-free dispatch ids:");
@@ -1333,5 +1367,7 @@ int main(int argc, char *argv[]) {
   int LLVMArgc = 1;
   const char **LLVMArgv = const_cast<const char **>(argv);
   my_rocperf_tool::InitLLVM X(LLVMArgc, LLVMArgv);
+  // Outlives run_main so its TOTAL scope has closed by the time we write.
+  PHASE_TIMER_SESSION();
   return run_main(*att_output_dir);
 }
