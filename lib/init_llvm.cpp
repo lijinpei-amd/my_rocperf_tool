@@ -7,7 +7,7 @@
 
 namespace my_rocperf_tool {
 
-InitLLVM::InitLLVM(int &Argc, const char **&Argv) : llvm::InitLLVM(Argc, Argv) {
+InitLLVM::InitLLVM(int& Argc, const char**& Argv) : llvm::InitLLVM(Argc, Argv) {
   // Initialize targets and assembly printers/parsers.
   llvm::InitializeAllTargetInfos();
   llvm::InitializeAllTargetMCs();
@@ -21,4 +21,4 @@ InitLLVM::InitLLVM(int &Argc, const char **&Argv) : llvm::InitLLVM(Argc, Argv) {
   llvm::cl::ParseCommandLineOptions(Argc, Argv, "my rocperf tool\n");
 }
 
-} // namespace my_rocperf_tool
+}  // namespace my_rocperf_tool

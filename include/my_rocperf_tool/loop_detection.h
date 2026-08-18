@@ -1,24 +1,22 @@
 #pragma once
 
-#include "llvm/ADT/DenseMapInfo.h"
-#include "llvm/ADT/Hashing.h"
-
-#include "trace_decoder_types.h"
-
 #include <cstdint>
 #include <vector>
+
+#include "llvm/ADT/DenseMapInfo.h"
+#include "llvm/ADT/Hashing.h"
+#include "trace_decoder_types.h"
 
 namespace my_rocperf_tool {
 
 struct BackEdge {
   uint64_t code_object_id;
-  uint64_t source_addr; // branch PC (end of loop body)
-  uint64_t target_addr; // loop header PC (start of loop)
+  uint64_t source_addr;  // branch PC (end of loop body)
+  uint64_t target_addr;  // loop header PC (start of loop)
 
-  bool operator==(const BackEdge &other) const {
+  bool operator==(const BackEdge& other) const {
     return code_object_id == other.code_object_id &&
-           source_addr == other.source_addr &&
-           target_addr == other.target_addr;
+           source_addr == other.source_addr && target_addr == other.target_addr;
   }
 };
 
@@ -44,27 +42,27 @@ struct WaveLoopInfo {
 
 /// Compute idle time for an instruction given the previous instruction's
 /// end time. Returns the idle value and updates last_time.
-inline uint32_t compute_idle(const rocprofiler_thread_trace_decoder_inst_t &inst,
-                             int64_t &last_time) {
+inline uint32_t compute_idle(
+    const rocprofiler_thread_trace_decoder_inst_t& inst, int64_t& last_time) {
   uint32_t idle = 0;
-  if (inst.time >= last_time)
-    idle = inst.time - last_time;
+  if (inst.time >= last_time) idle = inst.time - last_time;
   last_time = inst.time + inst.duration;
   return idle;
 }
 
 /// Returns true if this instruction should be skipped (null PC).
-inline bool is_null_pc(const rocprofiler_thread_trace_decoder_inst_t &inst) {
+inline bool is_null_pc(const rocprofiler_thread_trace_decoder_inst_t& inst) {
   return inst.pc.code_object_id == 0 && inst.pc.address == 0;
 }
 
 /// Detect loops in a wave's instruction trace via back-edge analysis.
-WaveLoopInfo detect_loops(const rocprofiler_thread_trace_decoder_wave_t &wave);
+WaveLoopInfo detect_loops(const rocprofiler_thread_trace_decoder_wave_t& wave);
 
-} // namespace my_rocperf_tool
+}  // namespace my_rocperf_tool
 
 namespace llvm {
-template <> struct DenseMapInfo<my_rocperf_tool::BackEdge> {
+template <>
+struct DenseMapInfo<my_rocperf_tool::BackEdge> {
   using UInt64Info = DenseMapInfo<uint64_t>;
 
   static my_rocperf_tool::BackEdge getEmptyKey() {
@@ -77,15 +75,15 @@ template <> struct DenseMapInfo<my_rocperf_tool::BackEdge> {
             UInt64Info::getTombstoneKey()};
   }
 
-  static unsigned getHashValue(const my_rocperf_tool::BackEdge &val) {
+  static unsigned getHashValue(const my_rocperf_tool::BackEdge& val) {
     return hash_combine(UInt64Info::getHashValue(val.code_object_id),
                         UInt64Info::getHashValue(val.source_addr),
                         UInt64Info::getHashValue(val.target_addr));
   }
 
-  static bool isEqual(const my_rocperf_tool::BackEdge &lhs,
-                      const my_rocperf_tool::BackEdge &rhs) {
+  static bool isEqual(const my_rocperf_tool::BackEdge& lhs,
+                      const my_rocperf_tool::BackEdge& rhs) {
     return lhs == rhs;
   }
 };
-} // namespace llvm
+}  // namespace llvm

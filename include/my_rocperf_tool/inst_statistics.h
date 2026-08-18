@@ -1,19 +1,19 @@
 #pragma once
 
-#include "llvm/ADT/ArrayRef.h"
-#include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/DenseMapInfo.h"
-#include "llvm/ADT/Hashing.h"
-
-#include "trace_decoder_types.h"
-
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
 #include <vector>
 
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseMapInfo.h"
+#include "llvm/ADT/Hashing.h"
+#include "trace_decoder_types.h"
+
 namespace llvm {
-template <> struct DenseMapInfo<rocprofiler_thread_trace_decoder_pc_t> {
+template <>
+struct DenseMapInfo<rocprofiler_thread_trace_decoder_pc_t> {
   using UInt64Info = DenseMapInfo<uint64_t>;
   static constexpr rocprofiler_thread_trace_decoder_pc_t getEmptyKey() {
     return {UInt64Info::getEmptyKey(), UInt64Info::getEmptyKey()};
@@ -23,19 +23,19 @@ template <> struct DenseMapInfo<rocprofiler_thread_trace_decoder_pc_t> {
     return {UInt64Info::getTombstoneKey(), UInt64Info::getTombstoneKey()};
   }
 
-  static unsigned
-  getHashValue(const rocprofiler_thread_trace_decoder_pc_t &val) {
+  static unsigned getHashValue(
+      const rocprofiler_thread_trace_decoder_pc_t& val) {
     return hash_combine(UInt64Info::getHashValue(val.address),
                         UInt64Info::getHashValue(val.code_object_id));
   }
 
-  static bool isEqual(const rocprofiler_thread_trace_decoder_pc_t &lhs,
-                      const rocprofiler_thread_trace_decoder_pc_t &rhs) {
+  static bool isEqual(const rocprofiler_thread_trace_decoder_pc_t& lhs,
+                      const rocprofiler_thread_trace_decoder_pc_t& rhs) {
     return lhs.address == rhs.address &&
            lhs.code_object_id == rhs.code_object_id;
   }
 };
-} // namespace llvm
+}  // namespace llvm
 
 namespace my_rocperf_tool {
 class InstStatistics {
@@ -48,12 +48,12 @@ class InstStatistics {
   };
   llvm::DenseMap<pc_t, std::vector<Inst>> insts;
 
-public:
-  void add_inst(const rocprofiler_thread_trace_decoder_inst_t &inst,
+ public:
+  void add_inst(const rocprofiler_thread_trace_decoder_inst_t& inst,
                 uint32_t idle) {
     insts[inst.pc].push_back({inst, idle});
   }
-  llvm::ArrayRef<Inst> get_inst_at(const pc_t &pc) const {
+  llvm::ArrayRef<Inst> get_inst_at(const pc_t& pc) const {
     auto iter = insts.find(pc);
     if (iter == insts.end()) {
       return {};
@@ -61,8 +61,8 @@ public:
     return iter->second;
   }
   size_t size() const { return insts.size(); }
-  const llvm::DenseMap<pc_t, std::vector<Inst>> &getInsts() const {
+  const llvm::DenseMap<pc_t, std::vector<Inst>>& getInsts() const {
     return insts;
   }
 };
-} // namespace my_rocperf_tool
+}  // namespace my_rocperf_tool

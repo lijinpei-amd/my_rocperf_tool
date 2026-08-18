@@ -31,16 +31,16 @@ struct DBPath {
 };
 
 class AttOutputDir {
-public:
-  explicit AttOutputDir(const std::string &path);
+ public:
+  explicit AttOutputDir(const std::string& path);
 
   std::unordered_map<int, uint64_t> read_load_bases() const;
-  std::pair<std::unique_ptr<char[]>, size_t>
-  read_att_data(const AttPath &path) const;
+  std::pair<std::unique_ptr<char[]>, size_t> read_att_data(
+      const AttPath& path) const;
 
   std::vector<CodeObjectPath> code_objects;
   std::vector<AttPath> att_paths;
   DBPath db_path;
 };
 
-} // namespace my_rocperf_tool
+}  // namespace my_rocperf_tool

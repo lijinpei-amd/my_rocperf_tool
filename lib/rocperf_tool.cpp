@@ -1,29 +1,28 @@
 #include "my_rocperf_tool/rocperf_tool.h"
-#include "my_rocperf_tool/check_rocprofiler_status.h"
-#include "my_rocperf_tool/disassembler.h"
-#include "my_rocperf_tool/init_llvm.h"
-
-#include "rocprofiler-sdk/callback_tracing.h"
-#include "rocprofiler-sdk/context.h"
-#include "rocprofiler-sdk/fwd.h"
-#include "rocprofiler-sdk/registration.h"
 
 #include <memory>
 #include <optional>
 #include <utility>
+
+#include "my_rocperf_tool/check_rocprofiler_status.h"
+#include "my_rocperf_tool/disassembler.h"
+#include "my_rocperf_tool/init_llvm.h"
+#include "rocprofiler-sdk/callback_tracing.h"
+#include "rocprofiler-sdk/context.h"
+#include "rocprofiler-sdk/fwd.h"
+#include "rocprofiler-sdk/registration.h"
 
 namespace my_rocperf_tool {
 
 namespace {
 void tool_code_object_tracing_callback(
     rocprofiler_callback_tracing_record_t record,
-    rocprofiler_user_data_t *user_data, void *callback_data) {
-
-  auto *perf_tool = static_cast<my_rocperf_tool::RocPerfTool *>(callback_data);
+    rocprofiler_user_data_t* user_data, void* callback_data) {
+  auto* perf_tool = static_cast<my_rocperf_tool::RocPerfTool*>(callback_data);
   return perf_tool->code_object_tracing_callback(record, user_data);
 }
 
-} // namespace
+}  // namespace
 
 void RocPerfTool::init() {
   CHECK_ROCPERF_STAT(rocprofiler_create_context, &client_ctx);
@@ -38,48 +37,46 @@ void RocPerfTool::finish() { disassembler.reset(); }
 
 void RocPerfTool::code_object_tracing_callback(
     rocprofiler_callback_tracing_record_t record,
-    rocprofiler_user_data_t *user_data) {
-  if (record.kind != ROCPROFILER_CALLBACK_TRACING_CODE_OBJECT)
-    return;
-  if (record.phase != ROCPROFILER_CALLBACK_PHASE_LOAD)
-    return;
+    rocprofiler_user_data_t* user_data) {
+  if (record.kind != ROCPROFILER_CALLBACK_TRACING_CODE_OBJECT) return;
+  if (record.phase != ROCPROFILER_CALLBACK_PHASE_LOAD) return;
   if (record.operation == ROCPROFILER_CODE_OBJECT_LOAD) {
-    auto *data =
-        static_cast<rocprofiler_callback_tracing_code_object_load_data_t *>(
+    auto* data =
+        static_cast<rocprofiler_callback_tracing_code_object_load_data_t*>(
             record.payload);
     disassembler->addCodeObject(*data);
   } else if (record.operation ==
              ROCPROFILER_CODE_OBJECT_DEVICE_KERNEL_SYMBOL_REGISTER) {
-    auto *data = static_cast<
-        rocprofiler_callback_tracing_code_object_kernel_symbol_register_data_t
-            *>(record.payload);
+    auto* data = static_cast<
+        rocprofiler_callback_tracing_code_object_kernel_symbol_register_data_t*>(
+        record.payload);
     disassembler->registerSymbol(*data);
   }
 }
-} // namespace my_rocperf_tool
+}  // namespace my_rocperf_tool
 
 namespace {
 
 static int LLVMArgc = 1;
-static const char *LLVMArgv[] = {"my-rocperf-tool"};
-static const char **LLVMArgvPtr = LLVMArgv;
+static const char* LLVMArgv[] = {"my-rocperf-tool"};
+static const char** LLVMArgvPtr = LLVMArgv;
 static std::optional<my_rocperf_tool::InitLLVM> LLVMInit;
 
 int init_perftool(rocprofiler_client_finalize_t finalize_func,
-                  void *tool_data) {
+                  void* tool_data) {
   LLVMInit.emplace(LLVMArgc, LLVMArgvPtr);
-  auto *perf_tool = static_cast<my_rocperf_tool::RocPerfTool *>(tool_data);
+  auto* perf_tool = static_cast<my_rocperf_tool::RocPerfTool*>(tool_data);
   perf_tool->init();
   return ROCPROFILER_STATUS_SUCCESS;
 }
 
-void fini_perftool(void *tool_data) {
-  auto *perf_tool = static_cast<my_rocperf_tool::RocPerfTool *>(tool_data);
+void fini_perftool(void* tool_data) {
+  auto* perf_tool = static_cast<my_rocperf_tool::RocPerfTool*>(tool_data);
   perf_tool->finish();
   LLVMInit.reset();
 }
 
-} // namespace
+}  // namespace
 
 // extern "C" __attribute__((visibility("default")))
 // rocprofiler_tool_configure_result_t *
