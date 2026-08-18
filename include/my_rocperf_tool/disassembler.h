@@ -1,9 +1,6 @@
 #pragma once
 
-#include <cstdint>
-#include <memory>
-#include <string>
-#include <vector>
+#include "rocprofiler-sdk/callback_tracing.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseMapInfo.h"
@@ -28,7 +25,11 @@
 #include "llvm/Support/FormattedStream.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
-#include "rocprofiler-sdk/callback_tracing.h"
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
 
 namespace my_rocperf_tool {
 

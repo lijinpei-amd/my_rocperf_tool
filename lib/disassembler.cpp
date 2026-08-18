@@ -1,13 +1,5 @@
 #include "my_rocperf_tool/disassembler.h"
 
-#include <cassert>
-#include <cstddef>
-#include <cstdint>
-#include <iterator>
-#include <memory>
-#include <string>
-#include <utility>
-
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/BinaryFormat/MsgPackDocument.h"
@@ -29,6 +21,14 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Triple.h"
 #include "rocprofiler-sdk/callback_tracing.h"
+
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <iterator>
+#include <memory>
+#include <string>
+#include <utility>
 
 namespace {
 struct IsaInfo {

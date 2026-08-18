@@ -1,16 +1,16 @@
 #include "my_rocperf_tool/rocperf_tool.h"
-
-#include <memory>
-#include <optional>
-#include <utility>
-
 #include "my_rocperf_tool/check_rocprofiler_status.h"
 #include "my_rocperf_tool/disassembler.h"
 #include "my_rocperf_tool/init_llvm.h"
+
 #include "rocprofiler-sdk/callback_tracing.h"
 #include "rocprofiler-sdk/context.h"
 #include "rocprofiler-sdk/fwd.h"
 #include "rocprofiler-sdk/registration.h"
+
+#include <memory>
+#include <optional>
+#include <utility>
 
 namespace my_rocperf_tool {
 

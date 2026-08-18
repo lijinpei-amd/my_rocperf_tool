@@ -1,15 +1,16 @@
 #pragma once
 
-#include <cstddef>
-#include <cstdint>
-#include <iostream>
-#include <vector>
-
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseMapInfo.h"
 #include "llvm/ADT/Hashing.h"
+
 #include "trace_decoder_types.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <iostream>
+#include <vector>
 
 namespace llvm {
 template <>

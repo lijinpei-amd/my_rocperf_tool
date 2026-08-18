@@ -1,12 +1,12 @@
 #include "my_rocperf_tool/loop_detection.h"
 
+#include "llvm/ADT/DenseMap.h"
+#include "trace_decoder_types.h"
+
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
-
-#include "llvm/ADT/DenseMap.h"
-#include "trace_decoder_types.h"
 
 namespace my_rocperf_tool {
 

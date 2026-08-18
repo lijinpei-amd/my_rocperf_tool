@@ -1,5 +1,7 @@
 #include "my_rocperf_tool/att_output_dir.h"
 
+#include "sqlite3.h"
+
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
@@ -14,8 +16,6 @@
 #include <tuple>
 #include <unordered_map>
 #include <utility>
-
-#include "sqlite3.h"
 
 namespace my_rocperf_tool {
 

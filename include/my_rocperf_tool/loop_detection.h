@@ -1,11 +1,12 @@
 #pragma once
 
-#include <cstdint>
-#include <vector>
-
 #include "llvm/ADT/DenseMapInfo.h"
 #include "llvm/ADT/Hashing.h"
+
 #include "trace_decoder_types.h"
+
+#include <cstdint>
+#include <vector>
 
 namespace my_rocperf_tool {
 

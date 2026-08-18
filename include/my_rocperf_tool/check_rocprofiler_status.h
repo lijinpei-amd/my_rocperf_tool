@@ -1,9 +1,9 @@
 #pragma once
 
-#include <string_view>
-
 #include "absl/base/log_severity.h"
 #include "rocprofiler-sdk/fwd.h"
+
+#include <string_view>
 
 #define CHECK_ROCPERF_STAT(_API_FUNC, ...)                             \
   ::my_rocperf_tool::check_rocprofiler_status_impl(                    \

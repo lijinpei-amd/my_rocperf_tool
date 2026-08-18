@@ -1,2 +1,5 @@
 ---
 BasedOnStyle: Google
+# Keep the hand-written include grouping (project / third-party / system);
+# clang-format only sorts within each blank-line-separated block.
+IncludeBlocks: Preserve

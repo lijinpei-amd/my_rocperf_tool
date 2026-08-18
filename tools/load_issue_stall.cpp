@@ -1,3 +1,23 @@
+#include "my_rocperf_tool/att_output_dir.h"
+#include "my_rocperf_tool/disassembler.h"
+#include "my_rocperf_tool/init_llvm.h"
+#include "my_rocperf_tool/inst_statistics.h"
+#include "my_rocperf_tool/loop_detection.h"
+
+#include "absl/flags/flag.h"
+#include "absl/flags/parse.h"
+
+#include "trace_decoder_api.h"
+#include "trace_decoder_types.h"
+
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/MC/MCInst.h"
+
+#include "fmt/base.h"
+#include "fmt/format.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -18,22 +38,6 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
-
-#include "absl/flags/flag.h"
-#include "absl/flags/parse.h"
-#include "fmt/base.h"
-#include "fmt/format.h"
-#include "llvm/ADT/ArrayRef.h"
-#include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/StringRef.h"
-#include "llvm/MC/MCInst.h"
-#include "my_rocperf_tool/att_output_dir.h"
-#include "my_rocperf_tool/disassembler.h"
-#include "my_rocperf_tool/init_llvm.h"
-#include "my_rocperf_tool/inst_statistics.h"
-#include "my_rocperf_tool/loop_detection.h"
-#include "trace_decoder_api.h"
-#include "trace_decoder_types.h"
 
 // Phase timing rides on LLVM's -ftime-trace machinery, already linked via
 // libLLVM. Printing one line per scope was fine for the serial phases but not
