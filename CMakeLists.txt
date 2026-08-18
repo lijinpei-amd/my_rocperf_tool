@@ -7,7 +7,6 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 find_package(rocprofiler-sdk REQUIRED)
 find_package(LLVM REQUIRED CONFIG)
-find_package(SQLite3)
 
 add_subdirectory(3rd_party)
 

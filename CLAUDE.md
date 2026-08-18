@@ -20,7 +20,6 @@ CMake minimum 3.28, Ninja generator, C++17, compiled with `-fPIC -fno-rtti`.
 
 - **rocprofiler-sdk** — AMD ROCm profiler SDK (point `CMAKE_PREFIX_PATH` at the ROCm install)
 - **LLVM** (CONFIG mode) — MC disassembler infrastructure
-- **SQLite3** — reading profiling result databases (`libsqlite3-dev`)
 - **rocprof-trace-decoder** — git submodule at `3rd_party/rocm-systems` (built from `projects/rocprof-trace-decoder/source`)
 - **abseil-cpp**, **fmt** — git submodules under `3rd_party/`
 
@@ -44,7 +43,9 @@ Pre-commit hooks enforce clang-format and other checks. Set up with `pre-commit 
 
 **CLI Tool (`tools/load_issue_stall.cpp`):**
 
-Reads an ATT output directory containing code object files (`*_code_object_id_*.out`), ATT trace files (`*.att`), and SQLite result databases (`*_results.db`). Decodes traces via `rocprof_trace_decoder_parse_data` with SE-data, ISA, and trace callbacks, then dumps annotated disassembly with per-instruction timing stats. Uses `absl::flags` for CLI argument parsing.
+Reads an ATT output directory containing code object files (`*_code_object_id_*.out`) and ATT trace files (`*.att`). Decodes traces via `rocprof_trace_decoder_parse_data` with SE-data, ISA, and trace callbacks, then dumps annotated disassembly with per-instruction timing stats. Uses `absl::flags` for CLI argument parsing.
+
+The `*_results.db` SQLite databases rocprofv3 writes alongside these files are not read. Code object load addresses are not needed: the trace decoder resolves each hardware PC to a `{code_object_id, ELF vaddr}` pair before the tool sees it, and every address downstream stays in ELF vaddr space.
 
 ## Namespace
 

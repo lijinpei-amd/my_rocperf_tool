@@ -1,20 +1,15 @@
 #include "my_rocperf_tool/att_output_dir.h"
 
-#include "sqlite3.h"
-
 #include <algorithm>
-#include <cassert>
 #include <cstdint>
-#include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <iostream>
+#include <ios>
 #include <memory>
 #include <regex>
 #include <sstream>
 #include <string>
 #include <tuple>
-#include <unordered_map>
 #include <utility>
 
 namespace my_rocperf_tool {
@@ -25,7 +20,6 @@ static std::regex code_object_re =
     std::regex("(\\d+)_(.+)_code_object_id_(\\d+)\\.out");
 static std::regex att_re =
     std::regex("(\\d+)_(\\d+)_shader_engine_(\\d+)_(\\d+)\\.att");
-static std::regex db_re = std::regex("(\\d+)_results\\.db");
 
 template <typename T>
 T parse_string(const std::string& str) {
@@ -68,72 +62,12 @@ AttOutputDir::AttOutputDir(const std::string& path) {
         continue;
       }
     }
-    {
-      std::smatch mat;
-      if (std::regex_match(filename, mat, db_re)) {
-        auto proc_id = parse_string<uint64_t>(mat[1]);
-        db_path = DBPath{ent_path.string(), proc_id};
-        continue;
-      }
-    }
   }
   std::sort(att_paths.begin(), att_paths.end(),
             [](const AttPath& a, const AttPath& b) {
               return std::tie(a.dispatch_id, a.se_id, a.path) <
                      std::tie(b.dispatch_id, b.se_id, b.path);
             });
-}
-
-std::unordered_map<int, uint64_t> AttOutputDir::read_load_bases() const {
-  sqlite3* db;
-  if (sqlite3_open(db_path.path.c_str(), &db)) {
-    std::cerr << "open db failed: " << sqlite3_errmsg(db) << std::endl;
-  }
-  std::unordered_map<int, uint64_t> object_load_bases;
-  const char* sql = "SELECT * FROM 'code_objects';";
-  sqlite3_stmt* stmt;
-  int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
-  if (rc != SQLITE_OK) {
-    std::cerr << "error occurred: " << sqlite3_errmsg(db) << std::endl;
-    sqlite3_close(db);
-    return object_load_bases;
-  }
-  int NoOfCols = sqlite3_column_count(stmt);
-  while (true) {
-    switch (sqlite3_step(stmt)) {
-      case SQLITE_ROW: {
-        int obj_id;
-        int64_t load_base;
-        bool has_obj_id = false, has_load_base = false;
-        for (int i = 0; i < NoOfCols; i++) {
-          const char* col_name = sqlite3_column_name(stmt, i);
-          if (!strcmp(col_name, "load_base")) {
-            load_base = sqlite3_column_int64(stmt, i);
-            assert(!has_load_base);
-            has_load_base = true;
-            continue;
-          }
-          if (!strcmp(col_name, "id")) {
-            obj_id = sqlite3_column_int(stmt, i);
-            assert(!has_obj_id);
-            has_obj_id = true;
-            continue;
-          }
-        }
-        assert(has_obj_id && has_load_base);
-        (void)has_obj_id;
-        (void)has_load_base;
-        object_load_bases[obj_id] = uint64_t(load_base);
-        continue;
-      }
-      case SQLITE_DONE:
-        sqlite3_finalize(stmt);
-        break;
-    }
-    break;
-  }
-  sqlite3_close(db);
-  return object_load_bases;
 }
 
 std::pair<std::unique_ptr<char[]>, size_t> AttOutputDir::read_att_data(

@@ -171,8 +171,7 @@ class ObjectFileInfo {
   ObjectFileInfo(
       Disassembler& disas,
       const rocprofiler_callback_tracing_code_object_load_data_t& load_data);
-  ObjectFileInfo(Disassembler& disas, const std::string& file_path,
-                 uint64_t load_base);
+  ObjectFileInfo(Disassembler& disas, const std::string& file_path);
   void init_elf(Disassembler& disas);
   const llvm::MCInst& decode_at(uint64_t addr, uint64_t& inst_size) const;
   void decode_all_sections() const;
@@ -180,7 +179,9 @@ class ObjectFileInfo {
   llvm::StringRef processor;
   bool sram_ecc_supported = false;
   bool xnack_supported = false;
-  uint64_t load_base;
+  // Addresses here are ELF vaddrs throughout: the trace decoder resolves a
+  // hardware PC to {code object, vaddr} before the tool sees it, so nothing
+  // downstream needs the object's runtime load address.
   uint64_t text_sec_offset;
   uint64_t text_sec_address;
   uint64_t text_sec_size;
@@ -218,9 +219,8 @@ class Disassembler {
   Disassembler();
   llvm::MCSubtargetInfo* get_sub_target(llvm::StringRef mcpu,
                                         llvm::StringRef features);
-  bool addCodeObject(uint64_t id, const std::string& file_path,
-                     uint64_t load_base) {
-    return object_files.try_emplace(id, *this, file_path, load_base).second;
+  bool addCodeObject(uint64_t id, const std::string& file_path) {
+    return object_files.try_emplace(id, *this, file_path).second;
   }
   bool addCodeObject(
       const rocprofiler_callback_tracing_code_object_load_data_t& load_data) {

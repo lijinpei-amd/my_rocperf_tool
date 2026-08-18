@@ -148,7 +148,7 @@ void ObjectFileInfo::disassemble(
           buffer.drop_front(section.sh_offset).take_front(section.sh_size);
       llvm::ArrayRef<unsigned char> bytes{section_buffer.bytes_begin(),
                                           section_buffer.size()};
-      uint64_t virt_addr = load_base;
+      uint64_t virt_addr = section.sh_addr;
       while (!bytes.empty()) {
         llvm::MCInst inst;
         uint64_t inst_size;
@@ -225,8 +225,7 @@ void ObjectFileInfo::init_elf(Disassembler& disas) {
 
 ObjectFileInfo::ObjectFileInfo(
     Disassembler& disas,
-    const rocprofiler_callback_tracing_code_object_load_data_t& load_data)
-    : load_base(load_data.load_base) {
+    const rocprofiler_callback_tracing_code_object_load_data_t& load_data) {
   switch (load_data.storage_type) {
     case ROCPROFILER_CODE_OBJECT_STORAGE_TYPE_FILE: {
       auto open_file =
@@ -249,8 +248,7 @@ ObjectFileInfo::ObjectFileInfo(
 }
 
 ObjectFileInfo::ObjectFileInfo(Disassembler& disas,
-                               const std::string& file_path, uint64_t load_base)
-    : load_base(load_base) {
+                               const std::string& file_path) {
   auto file_or_err =
       llvm::MemoryBuffer::getFileOrSTDIN(file_path, false, false);
   assert(file_or_err);
@@ -272,9 +270,15 @@ void ObjectFileInfo::ensure_section_decoded(CachedSection& sec) const {
     uint64_t inst_size;
     llvm::ArrayRef<unsigned char> bytes{base + offset, remaining - offset};
     auto& slot = sec.slots[offset / 4];
+    // Decode at the ELF vaddr, which is also the space every address handed
+    // to decode_at lives in -- the trace decoder subtracts the code object's
+    // load delta before reporting a PC. MC only consults this address to
+    // symbolize operands, and no MCSymbolizer is installed, so it currently
+    // has no effect on the decoded instruction. Installing one would make the
+    // choice of address space observable, and vaddrs are what the rest of the
+    // tool reports; runtime addresses would need the delta added back.
     auto status = mc_dis_asm->getInstruction(
-        slot.inst, inst_size, bytes, sec.start_addr + offset + load_base,
-        llvm::nulls());
+        slot.inst, inst_size, bytes, sec.start_addr + offset, llvm::nulls());
     assert(status == llvm::MCDisassembler::Success);
     (void)status;
     slot.inst_size = static_cast<uint32_t>(inst_size);

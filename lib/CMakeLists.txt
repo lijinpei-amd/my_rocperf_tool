@@ -16,7 +16,7 @@ add_library(my_rocperf_tool SHARED
 target_link_libraries(my_rocperf_tool PUBLIC
     rocprofiler-sdk::rocprofiler-sdk-headers
     rocprofiler-sdk::rocprofiler-sdk-external-nolink
-    absl::log LLVM SQLite::SQLite3 rocprof-trace-decoder)
+    absl::log LLVM rocprof-trace-decoder)
 
 # Live tracing library: registers rocprofiler-sdk callbacks to trace code-object
 # loads inside a running GPU process. This is the only piece that needs the

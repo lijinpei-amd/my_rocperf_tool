@@ -490,7 +490,6 @@ std::vector<LoopInstInfo> collect_loop_insts(
   llvm::ArrayRef<unsigned char> bytes{block_buffer.bytes_begin(),
                                       block_buffer.size()};
 
-  uint64_t virt_addr = obj.load_base + start_offset;
   uint64_t sec_offset = start_offset;
 
   while (sec_offset <= end_offset && !bytes.empty()) {
@@ -523,7 +522,6 @@ std::vector<LoopInstInfo> collect_loop_insts(
     result.push_back(std::move(info));
 
     sec_offset += inst_size;
-    virt_addr += inst_size;
     bytes = bytes.drop_front(inst_size);
   }
   return result;
@@ -1151,7 +1149,6 @@ int run_main(const std::string& att_output_dir_path) {
     return 2;
   }
 
-  auto object_load_bases = out_dir.read_load_bases();
   auto cfg = LoopOutputConfig::from_flags();
   auto dispatch_id_override =
       out_dir.att_paths.size() == 1
@@ -1172,9 +1169,7 @@ int run_main(const std::string& att_output_dir_path) {
 
   auto load_code_objects = [&](my_rocperf_tool::Disassembler& d) {
     for (const auto& obj_file : out_dir.code_objects) {
-      auto load_base_it = object_load_bases.find(static_cast<int>(obj_file.id));
-      assert(load_base_it != object_load_bases.end());
-      d.addCodeObject(obj_file.id, obj_file.path, load_base_it->second);
+      d.addCodeObject(obj_file.id, obj_file.path);
     }
   };
 
