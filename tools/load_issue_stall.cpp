@@ -29,6 +29,7 @@
 #include <filesystem>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -148,6 +149,10 @@ struct trace_decoder_context {
   bool detect_loops_flag;
   bool verify_duration;
   bool mfma_coexec_flag;
+  // Decode counters, reported in the run summary so a trace that yields no
+  // loops is distinguishable from one that failed to decode.
+  uint64_t waves_seen = 0;
+  uint64_t insts_seen = 0;
   std::vector<my_rocperf_tool::WaveLoopInfo> wave_loops;
   llvm::DenseMap<rocprofiler_thread_trace_decoder_pc_t, bool> mfma_cache;
   llvm::DenseMap<rocprofiler_thread_trace_decoder_pc_t, bool> is_barrier_cache;
@@ -376,12 +381,14 @@ rocprofiler_thread_trace_decoder_status_t att_decoder_trace_callback(
       auto coalesced = coalesce_barrier_tokens(ctx, wave);
       wave.instructions_array = coalesced.data();
       wave.instructions_size = coalesced.size();
+      ctx.waves_seen++;
 
       int64_t last_time = wave.begin_time;
       for (size_t j = 0; j < wave.instructions_size; j++) {
         const auto &inst = wave.instructions_array[j];
         if (my_rocperf_tool::is_null_pc(inst))
           continue;
+        ctx.insts_seen++;
         assert(inst.pc.code_object_id != 0);
         uint32_t idle = my_rocperf_tool::compute_idle(inst, last_time);
         if (ctx.verify_duration && inst.duration < static_cast<int32_t>(inst.stall)) {
@@ -1035,11 +1042,21 @@ void dump_loops(
   }
 }
 
-int run_trace(TraceBuf &out,
+// What one trace decoded, for the end-of-run summary on stderr. Written by
+// run_trace, aggregated by run_main.
+struct TraceSummary {
+  uint64_t dispatch_id = 0;
+  uint64_t se_id = 0; // one .att per shader engine per dispatch
+  uint64_t waves = 0;
+  uint64_t insts = 0;
+  uint64_t loop_waves = 0; // waves with at least one detected loop
+  uint64_t loops = 0;      // detected loops summed over those waves
+};
+
+int run_trace(TraceBuf &out, TraceSummary &summary,
               const my_rocperf_tool::AttOutputDir &out_dir,
               const my_rocperf_tool::AttPath &att_path,
-              my_rocperf_tool::Disassembler &disas,
-              const LoopOutputConfig &cfg,
+              my_rocperf_tool::Disassembler &disas, const LoopOutputConfig &cfg,
               std::optional<uint64_t> dispatch_id_override) {
   trace_decoder_context decoder_ctx(disas);
   {
@@ -1078,6 +1095,16 @@ int run_trace(TraceBuf &out,
               });
   }
 
+  summary.dispatch_id = decoder_ctx.dispatch_id;
+  summary.se_id = att_path.se_id;
+  summary.waves = decoder_ctx.waves_seen;
+  summary.insts = decoder_ctx.insts_seen;
+  summary.loop_waves = decoder_ctx.wave_loops.size();
+  uint64_t loops = 0;
+  for (const auto &wl : decoder_ctx.wave_loops)
+    loops += wl.loops.size();
+  summary.loops = loops;
+
   {
     PHASE_TIMER("dump_loops");
     if (decoder_ctx.detect_loops_flag) {
@@ -1086,7 +1113,19 @@ int run_trace(TraceBuf &out,
                        decoder_ctx.bubble_totals,
                        decoder_ctx.rel_issue_totals, cache,
                        decoder_ctx.dispatch_id};
+      // Test what dump_loops actually emitted rather than whether loops were
+      // found: --aggregate_wave writes an (empty) aggregate header even with
+      // no loops, and a second "no loops" banner would contradict it.
+      size_t before = out.size();
       dump_loops(dump_ctx, decoder_ctx.wave_loops);
+      // A trace that emitted nothing would otherwise be indistinguishable
+      // from a failed run. Text output only -- csv/json stay parseable.
+      if (out.size() == before && cfg.format == LoopOutputFormat::Text)
+        writef(out,
+               "=== DispatchID={}, SE={}: no loops detected "
+               "({} waves, {} instructions) ===\n",
+               decoder_ctx.dispatch_id, att_path.se_id, decoder_ctx.waves_seen,
+               decoder_ctx.insts_seen);
     }
   }
   return 0;
@@ -1136,10 +1175,12 @@ int run_main(const std::string &att_output_dir_path) {
   // aggregate_wave_only this is small; --dump_loop_contents over thousands
   // of traces could reach hundreds of MB.
   std::vector<TraceBuf> chunks(n_traces);
+  // Same indexing as chunks; each worker writes only its own slot.
+  std::vector<TraceSummary> summaries(n_traces);
 
   auto process_one = [&](my_rocperf_tool::Disassembler &disas, size_t i) {
-    run_trace(chunks[i], out_dir, out_dir.att_paths[i], disas, cfg,
-              dispatch_id_override);
+    run_trace(chunks[i], summaries[i], out_dir, out_dir.att_paths[i], disas,
+              cfg, dispatch_id_override);
   };
 
   // Always process trace[0] serially first. Two reasons:
@@ -1199,6 +1240,85 @@ int run_main(const std::string &att_output_dir_path) {
   }
   if (cfg.format == LoopOutputFormat::Json)
     std::fputs("\n]\n", stdout);
+
+  // Run summary on stderr. stdout is fully buffered when redirected, so flush
+  // it first: otherwise, under `2>&1`, the unbuffered stderr text lands ahead
+  // of (or inside) the csv/json payload it is meant to sit after.
+  std::fflush(stdout);
+
+  // Reports what was decoded, not just what was found, so an empty result set
+  // is visibly a loop-free capture rather than a silent decode failure. Note
+  // a trace here is one .att file = one shader engine of one dispatch.
+  {
+    uint64_t tot_waves = 0, tot_insts = 0, tot_loop_waves = 0, tot_loops = 0;
+    uint64_t no_wave_traces = 0;
+    // A dispatch is loop-free only if some SE decoded waves and none found a
+    // loop; per-SE slots would otherwise report the same dispatch repeatedly,
+    // including dispatches whose loops all landed in another SE's trace.
+    struct DispatchAgg {
+      uint64_t waves = 0;
+      uint64_t loops = 0;
+    };
+    std::map<uint64_t, DispatchAgg> by_dispatch;
+    for (const auto &s : summaries) {
+      tot_waves += s.waves;
+      tot_insts += s.insts;
+      tot_loop_waves += s.loop_waves;
+      tot_loops += s.loops;
+      if (s.waves == 0)
+        no_wave_traces++;
+      auto &d = by_dispatch[s.dispatch_id];
+      d.waves += s.waves;
+      d.loops += s.loops;
+    }
+
+    const bool detect = absl::GetFlag(FLAGS_detect_loops);
+    if (detect)
+      fmt::print(stderr,
+                 "[summary] {} trace(s), {} waves, {} instructions decoded; "
+                 "{} loop instance(s) in {} wave(s)\n",
+                 n_traces, tot_waves, tot_insts, tot_loops, tot_loop_waves);
+    else
+      fmt::print(stderr,
+                 "[summary] {} trace(s), {} waves, {} instructions decoded; "
+                 "loop detection disabled\n",
+                 n_traces, tot_waves, tot_insts);
+
+    // Decoding nothing is a different fact from finding no loop -- keep the
+    // two apart, or the loop-free report makes a claim about a capture whose
+    // instruction stream was never read.
+    if (no_wave_traces)
+      fmt::print(stderr,
+                 "[summary] {} of {} trace(s) decoded no waves "
+                 "(empty, truncated, or wrong-agent capture)\n",
+                 no_wave_traces, n_traces);
+
+    if (detect) {
+      // detect_loops keeps a loop at iteration_count >= 2, and one taken
+      // back-edge already yields 2 (the flush at the edge plus the trailing
+      // partial iteration) -- so the criterion is "taken", not "taken twice".
+      std::vector<uint64_t> loop_free;
+      for (const auto &[id, d] : by_dispatch)
+        if (d.waves > 0 && d.loops == 0)
+          loop_free.push_back(id);
+      if (!loop_free.empty()) {
+        fmt::print(stderr,
+                   "[summary] {} of {} dispatch(es) contained no loop "
+                   "(no back-edge was taken)\n",
+                   loop_free.size(), by_dispatch.size());
+        // Buffer then one write, per the PhaseTimer convention above: the
+        // list is unbounded and stderr is unbuffered.
+        if (loop_free.size() < by_dispatch.size()) {
+          TraceBuf ids;
+          writef(ids, "[summary] loop-free dispatch ids:");
+          for (uint64_t id : loop_free)
+            writef(ids, " {}", id);
+          writef(ids, "\n");
+          std::fwrite(ids.data(), 1, ids.size(), stderr);
+        }
+      }
+    }
+  }
   return 0;
 }
 

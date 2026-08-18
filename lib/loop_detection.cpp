@@ -4,6 +4,7 @@
 #include "trace_decoder_types.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 
@@ -24,6 +25,13 @@ detect_loops(const rocprofiler_thread_trace_decoder_wave_t &wave) {
       continue;
     if (inst.category == ROCPROFILER_THREAD_TRACE_DECODER_INST_JUMP) {
       const auto &next = wave.instructions_array[i + 1];
+      // The successor record is the branch target. An unattributed successor
+      // (code_object_id 0) compares unequal below and drops the back-edge
+      // silently, so trip on it rather than under-report. This covers both
+      // fully-null records and the decoder's {addr != 0, code_object_id == 0}
+      // form, which is_null_pc alone would let through.
+      assert(next.pc.code_object_id != 0 &&
+             "JUMP successor must have an attributed PC");
       if (next.pc.code_object_id == inst.pc.code_object_id &&
           next.pc.address <= inst.pc.address) {
         BackEdge edge{inst.pc.code_object_id, inst.pc.address,
