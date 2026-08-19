@@ -240,9 +240,14 @@ ObjectFileInfo::ObjectFileInfo(
     const rocprofiler_callback_tracing_code_object_load_data_t& load_data) {
   switch (load_data.storage_type) {
     case ROCPROFILER_CODE_OBJECT_STORAGE_TYPE_FILE: {
-      auto open_file =
-          llvm::MemoryBuffer::getOpenFile(load_data.storage_file, load_data.uri,
-                                          load_data.load_size, false, true);
+      // -1 is LLVM's "stat the descriptor" sentinel for the file size.
+      // load_size measures the loaded image in vaddr space and bears no
+      // relation to the file's length, which also carries the non-alloc
+      // sections and the section header table. It usually falls short, which
+      // truncates the buffer past the section headers and fails the ELF parse.
+      auto open_file = llvm::MemoryBuffer::getOpenFile(
+          load_data.storage_file, load_data.uri, -1, false, true);
+      assert(open_file);
       memory_buffer = std::move(*open_file);
       break;
     }
