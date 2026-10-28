@@ -32,6 +32,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -163,6 +164,10 @@ struct LoopOutputConfig {
   bool color_mfma_bubble = false;
   bool aggregate_wave = false;
   bool aggregate_wave_only = false;
+  // Set when the directory holds more than one run (output-file prefix):
+  // dispatch ids repeat across runs, so every record also names its prefix.
+  // Off for a single run, which keeps that output unchanged.
+  bool show_prefix = false;
 
   static LoopOutputConfig from_flags() {
     LoopOutputConfig cfg;
@@ -802,6 +807,7 @@ void dump_loop_json(TraceBuf& out, const my_rocperf_tool::BackEdge& e,
 
 void dump_csv_header(TraceBuf& out, const LoopOutputConfig& cfg) {
   if (cfg.aggregate_wave) writef(out, "record_type,");
+  if (cfg.show_prefix) writef(out, "prefix,");
   writef(out, "dispatch_id,cu,simd,wave_id,");
   if (cfg.aggregate_wave) writef(out, "wave_count,");
   writef(out,
@@ -826,24 +832,22 @@ void dump_csv_header(TraceBuf& out, const LoopOutputConfig& cfg) {
 }
 
 void dump_csv_row_prefix(TraceBuf& out, const LoopOutputConfig& cfg,
-                         uint64_t dispatch_id, const LoopGroup& g,
-                         uint32_t wave_count) {
-  if (cfg.aggregate_wave) {
-    const char* record_type = g.is_aggregate ? "aggregate" : "wave";
-    writef(out, "{},{},", record_type, dispatch_id);
-    if (g.is_aggregate)
-      writef(out, ",,,");
-    else
-      writef(out, "{},{},{},", g.cu, g.simd, g.wave_id);
-    writef(out, "{},", wave_count);
-  } else {
-    writef(out, "{},{},{},{},", dispatch_id, g.cu, g.simd, g.wave_id);
-  }
+                         const std::string& prefix, uint64_t dispatch_id,
+                         const LoopGroup& g, uint32_t wave_count) {
+  if (cfg.aggregate_wave)
+    writef(out, "{},", g.is_aggregate ? "aggregate" : "wave");
+  if (cfg.show_prefix) writef(out, "\"{}\",", csv_escape(prefix));
+  writef(out, "{},", dispatch_id);
+  if (cfg.aggregate_wave && g.is_aggregate)
+    writef(out, ",,,");
+  else
+    writef(out, "{},{},{},", g.cu, g.simd, g.wave_id);
+  if (cfg.aggregate_wave) writef(out, "{},", wave_count);
 }
 
 void dump_csv_loop_rows(TraceBuf& out, const LoopOutputConfig& cfg,
-                        uint64_t dispatch_id, const LoopGroup& g,
-                        const LoopRecord& lr,
+                        const std::string& prefix, uint64_t dispatch_id,
+                        const LoopGroup& g, const LoopRecord& lr,
                         const std::vector<LoopInstInfo>& insts) {
   const auto& e = lr.back_edge;
   const auto& s = lr.stats;
@@ -858,14 +862,14 @@ void dump_csv_loop_rows(TraceBuf& out, const LoopOutputConfig& cfg,
   };
 
   if (!cfg.show_contents) {
-    dump_csv_row_prefix(out, cfg, dispatch_id, g, lr.wave_count);
+    dump_csv_row_prefix(out, cfg, prefix, dispatch_id, g, lr.wave_count);
     print_loop_fields();
     writef(out, "\n");
     return;
   }
 
   for (const auto& ii : insts) {
-    dump_csv_row_prefix(out, cfg, dispatch_id, g, lr.wave_count);
+    dump_csv_row_prefix(out, cfg, prefix, dispatch_id, g, lr.wave_count);
     print_loop_fields();
     writef(out, ",0x{:x},\"{}\",{},", ii.addr, csv_escape(ii.inst_str), ii.n);
     if (cfg.show_avg) {
@@ -905,8 +909,16 @@ struct DumpCtx {
   const PerLoopMap& bubbles;
   const PerLoopMap& rel_issues;
   LoopInstCache& cache;
+  const std::string& prefix;
   uint64_t dispatch_id;
 };
+
+// "DispatchID=N", qualified by the run when the output spans several.
+void write_dispatch_label(TraceBuf& out, const LoopOutputConfig& cfg,
+                          const std::string& prefix, uint64_t dispatch_id) {
+  if (cfg.show_prefix) writef(out, "Prefix={}, ", prefix);
+  writef(out, "DispatchID={}", dispatch_id);
+}
 
 // Emits per-trace dispatch entries separated by ",\n" with no leading or
 // trailing comma. Caller is responsible for the surrounding "[\n" / "\n]\n"
@@ -916,12 +928,15 @@ void dump_loops_json(const DumpCtx& ctx, const std::vector<LoopGroup>& groups) {
   for (const auto& g : groups) {
     if (!first_entry) writef(ctx.out, ",\n");
     first_entry = false;
+    writef(ctx.out, "  {{");
+    if (ctx.cfg.show_prefix)
+      writef(ctx.out, "\"prefix\":\"{}\",", json_escape(ctx.prefix));
     if (g.is_aggregate)
-      writef(ctx.out, "  {{\"dispatch_id\":{},\"aggregate\":true,\"loops\":[\n",
+      writef(ctx.out, "\"dispatch_id\":{},\"aggregate\":true,\"loops\":[\n",
              ctx.dispatch_id);
     else
       writef(ctx.out,
-             "  {{\"dispatch_id\":{},\"cu\":{},\"simd\":{},\"wave_id\":{},"
+             "\"dispatch_id\":{},\"cu\":{},\"simd\":{},\"wave_id\":{},"
              "\"loops\":[\n",
              ctx.dispatch_id, g.cu, g.simd, g.wave_id);
     bool first_loop = true;
@@ -946,7 +961,8 @@ void dump_loops_csv(const DumpCtx& ctx, const std::vector<LoopGroup>& groups) {
       const auto& insts =
           get_loop_insts(ctx.cache, ctx.disas, ctx.stats, lr.back_edge,
                          ctx.bubbles, ctx.rel_issues);
-      dump_csv_loop_rows(ctx.out, ctx.cfg, ctx.dispatch_id, g, lr, insts);
+      dump_csv_loop_rows(ctx.out, ctx.cfg, ctx.prefix, ctx.dispatch_id, g, lr,
+                         insts);
     }
   }
 }
@@ -1023,13 +1039,14 @@ void dump_loop_text_stats(TraceBuf& out, const my_rocperf_tool::LoopStats& s,
 
 void dump_loops_text(const DumpCtx& ctx, const std::vector<LoopGroup>& groups) {
   for (const auto& g : groups) {
+    writef(ctx.out,
+           g.is_aggregate ? "=== Aggregate Across Waves (" : "=== Wave (");
+    write_dispatch_label(ctx.out, ctx.cfg, ctx.prefix, ctx.dispatch_id);
     if (g.is_aggregate)
-      writef(ctx.out, "=== Aggregate Across Waves (DispatchID={}) ===\n",
-             ctx.dispatch_id);
+      writef(ctx.out, ") ===\n");
     else
-      writef(ctx.out,
-             "=== Wave (DispatchID={}, CU={}, SIMD={}, WaveID={}) ===\n",
-             ctx.dispatch_id, g.cu, g.simd, g.wave_id);
+      writef(ctx.out, ", CU={}, SIMD={}, WaveID={}) ===\n", g.cu, g.simd,
+             g.wave_id);
     for (const auto& lr : g.loops) {
       const auto& e = lr.back_edge;
       const auto& s = lr.stats;
@@ -1079,6 +1096,7 @@ void dump_loops(const DumpCtx& ctx,
 // What one trace decoded, for the end-of-run summary on stderr. Written by
 // run_trace, aggregated by run_main.
 struct TraceSummary {
+  std::string prefix;
   uint64_t dispatch_id = 0;
   uint64_t se_id = 0;  // one .att per shader engine per dispatch
   uint64_t waves = 0;
@@ -1132,6 +1150,7 @@ int run_trace(TraceBuf& out, TraceSummary& summary,
               });
   }
 
+  summary.prefix = att_path.prefix;
   summary.dispatch_id = decoder_ctx.dispatch_id;
   summary.se_id = att_path.se_id;
   summary.waves = decoder_ctx.waves_seen;
@@ -1149,7 +1168,7 @@ int run_trace(TraceBuf& out, TraceSummary& summary,
       DumpCtx dump_ctx{
           out,   decoder_ctx.disas,         decoder_ctx.stats,
           cfg,   decoder_ctx.bubble_totals, decoder_ctx.rel_issue_totals,
-          cache, decoder_ctx.dispatch_id};
+          cache, att_path.prefix,           decoder_ctx.dispatch_id};
       // Test what dump_loops actually emitted rather than whether loops were
       // found: --aggregate_wave writes an (empty) aggregate header even with
       // no loops, and a second "no loops" banner would contradict it.
@@ -1158,11 +1177,11 @@ int run_trace(TraceBuf& out, TraceSummary& summary,
       // A trace that emitted nothing would otherwise be indistinguishable
       // from a failed run. Text output only -- csv/json stay parseable.
       if (out.size() == before && cfg.format == LoopOutputFormat::Text) {
-        writef(out,
-               "=== DispatchID={}, SE={}: no loops detected "
-               "({} waves, {} instructions",
-               decoder_ctx.dispatch_id, att_path.se_id, decoder_ctx.waves_seen,
-               decoder_ctx.insts_seen);
+        writef(out, "=== ");
+        write_dispatch_label(out, cfg, att_path.prefix,
+                             decoder_ctx.dispatch_id);
+        writef(out, ", SE={}: no loops detected ({} waves, {} instructions",
+               att_path.se_id, decoder_ctx.waves_seen, decoder_ctx.insts_seen);
         if (decoder_ctx.simd_filter >= 0)
           writef(out, "; {} waves on other SIMDs skipped by --simd={}",
                  decoder_ctx.waves_filtered, decoder_ctx.simd_filter);
@@ -1182,7 +1201,24 @@ int run_main(const std::string& att_output_dir_path) {
     return 2;
   }
 
+  // Code object ids restart in every run, so a trace can only be decoded
+  // against code objects carrying its own prefix.
+  std::set<std::string> code_object_prefixes;
+  for (const auto& obj_file : out_dir.code_objects)
+    code_object_prefixes.insert(obj_file.prefix);
+  std::set<std::string> trace_prefixes;
+  for (const auto& att_path : out_dir.att_paths)
+    trace_prefixes.insert(att_path.prefix);
+  for (const auto& prefix : trace_prefixes) {
+    if (!code_object_prefixes.count(prefix)) {
+      std::cerr << "no code objects found for ATT traces with prefix '"
+                << prefix << "' in " << att_output_dir_path << "\n";
+      return 2;
+    }
+  }
+
   auto cfg = LoopOutputConfig::from_flags();
+  cfg.show_prefix = trace_prefixes.size() > 1;
   auto dispatch_id_override =
       out_dir.att_paths.size() == 1
           ? parse_dispatch_id_from_path(att_output_dir_path)
@@ -1200,14 +1236,23 @@ int run_main(const std::string& att_output_dir_path) {
     jobs = std::min<size_t>({n_traces, hw ? hw : 1u, kAutoJobsCap});
   }
 
-  auto load_code_objects = [&](my_rocperf_tool::Disassembler& d) {
-    for (const auto& obj_file : out_dir.code_objects) {
-      d.addCodeObject(obj_file.id, obj_file.path);
+  // One Disassembler per run, built on a worker's first trace from that run
+  // and holding only that run's code objects. std::map never relocates its
+  // values, which matters: ObjectFileInfo keeps a reference to its owner.
+  using DisasByPrefix = std::map<std::string, my_rocperf_tool::Disassembler>;
+  auto disas_for = [&](DisasByPrefix& by_prefix,
+                       const std::string& prefix) -> auto& {
+    auto [it, inserted] = by_prefix.try_emplace(prefix);
+    if (inserted) {
+      for (const auto& obj_file : out_dir.code_objects)
+        if (obj_file.prefix == prefix)
+          it->second.addCodeObject(obj_file.id, obj_file.path);
     }
+    return it->second;
   };
 
-  // Per-trace output buffers. Indexed in dispatch_id order; workers may
-  // complete out of order. fmt::memory_buffer owns its storage (RAII), so
+  // Per-trace output buffers. Indexed in (prefix, dispatch_id) order; workers
+  // may complete out of order. fmt::memory_buffer owns its storage (RAII), so
   // exceptions between fill and emit don't leak.
   // Memory note: chunks hold all per-trace output until emit. For
   // aggregate_wave_only this is small; --dump_loop_contents over thousands
@@ -1216,9 +1261,10 @@ int run_main(const std::string& att_output_dir_path) {
   // Same indexing as chunks; each worker writes only its own slot.
   std::vector<TraceSummary> summaries(n_traces);
 
-  auto process_one = [&](my_rocperf_tool::Disassembler& disas, size_t i) {
-    run_trace(chunks[i], summaries[i], out_dir, out_dir.att_paths[i], disas,
-              cfg, dispatch_id_override);
+  auto process_one = [&](DisasByPrefix& by_prefix, size_t i) {
+    const auto& att_path = out_dir.att_paths[i];
+    run_trace(chunks[i], summaries[i], out_dir, att_path,
+              disas_for(by_prefix, att_path.prefix), cfg, dispatch_id_override);
   };
 
   // Always process trace[0] serially first. Two reasons:
@@ -1230,21 +1276,20 @@ int run_main(const std::string& att_output_dir_path) {
   //    workers, which then only read.
   // 2. The serial Disassembler then becomes the main thread's worker, so
   //    no per-worker setup work is wasted.
-  my_rocperf_tool::Disassembler main_disas;
+  DisasByPrefix main_disas;
   {
     PHASE_TIMER("load code objects + warmup");
-    load_code_objects(main_disas);
     process_one(main_disas, 0);
   }
 
   if (n_traces > 1) {
     PHASE_TIMER("parallel decode");
     std::atomic<size_t> next{1};
-    auto worker_loop = [&](my_rocperf_tool::Disassembler& disas) {
+    auto worker_loop = [&](DisasByPrefix& by_prefix) {
       while (true) {
         size_t i = next.fetch_add(1, std::memory_order_relaxed);
         if (i >= n_traces) break;
-        process_one(disas, i);
+        process_one(by_prefix, i);
       }
     };
     std::vector<std::thread> workers;
@@ -1252,8 +1297,7 @@ int run_main(const std::string& att_output_dir_path) {
     for (size_t w = 1; w < jobs; w++) {
       workers.emplace_back([&]() {
         WORKER_PHASE_TIMERS();
-        my_rocperf_tool::Disassembler local_disas;
-        load_code_objects(local_disas);
+        DisasByPrefix local_disas;
         worker_loop(local_disas);
       });
     }
@@ -1298,7 +1342,8 @@ int run_main(const std::string& att_output_dir_path) {
       uint64_t waves = 0;
       uint64_t loops = 0;
     };
-    std::map<uint64_t, DispatchAgg> by_dispatch;
+    // Keyed by run too: the same dispatch id in two runs is two dispatches.
+    std::map<std::pair<std::string, uint64_t>, DispatchAgg> by_dispatch;
     for (const auto& s : summaries) {
       tot_waves += s.waves;
       tot_insts += s.insts;
@@ -1311,7 +1356,7 @@ int run_main(const std::string& att_output_dir_path) {
         else
           no_wave_traces++;
       }
-      auto& d = by_dispatch[s.dispatch_id];
+      auto& d = by_dispatch[{s.prefix, s.dispatch_id}];
       d.waves += s.waves;
       d.loops += s.loops;
     }
@@ -1352,9 +1397,9 @@ int run_main(const std::string& att_output_dir_path) {
       // detect_loops keeps a loop at iteration_count >= 2, and one taken
       // back-edge already yields 2 (the flush at the edge plus the trailing
       // partial iteration) -- so the criterion is "taken", not "taken twice".
-      std::vector<uint64_t> loop_free;
-      for (const auto& [id, d] : by_dispatch)
-        if (d.waves > 0 && d.loops == 0) loop_free.push_back(id);
+      std::vector<std::pair<std::string, uint64_t>> loop_free;
+      for (const auto& [key, d] : by_dispatch)
+        if (d.waves > 0 && d.loops == 0) loop_free.push_back(key);
       if (!loop_free.empty()) {
         fmt::print(stderr,
                    "[summary] {} of {} dispatch(es) contained no loop "
@@ -1365,7 +1410,12 @@ int run_main(const std::string& att_output_dir_path) {
         if (loop_free.size() < by_dispatch.size()) {
           TraceBuf ids;
           writef(ids, "[summary] loop-free dispatch ids:");
-          for (uint64_t id : loop_free) writef(ids, " {}", id);
+          for (const auto& [prefix, id] : loop_free) {
+            if (cfg.show_prefix)
+              writef(ids, " {}:{}", prefix, id);
+            else
+              writef(ids, " {}", id);
+          }
           writef(ids, "\n");
           std::fwrite(ids.data(), 1, ids.size(), stderr);
         }
