@@ -129,6 +129,11 @@ ABSL_FLAG(bool, decode_all_insts, false,
 ABSL_FLAG(uint32_t, jobs, 0,
           "number of parallel decode workers; 0 = auto (min of trace count, "
           "hardware concurrency, and 64)");
+// Dropping the waves at the source rather than filtering the reports keeps
+// every downstream accumulator -- per-PC stats, bubble and relative-issue
+// totals, loop aggregation -- consistently scoped to the selected SIMD.
+ABSL_FLAG(int32_t, simd, -1,
+          "analyze only waves on this SIMD ([0,3]); -1 analyzes all SIMDs");
 
 using PerPCMap =
     llvm::DenseMap<rocprofiler_thread_trace_decoder_pc_t, uint64_t>;
@@ -191,10 +196,15 @@ struct trace_decoder_context {
   bool detect_loops_flag;
   bool verify_duration;
   bool mfma_coexec_flag;
+  // -1 keeps every wave; otherwise only waves on this SIMD are decoded.
+  int32_t simd_filter = -1;
   // Decode counters, reported in the run summary so a trace that yields no
   // loops is distinguishable from one that failed to decode.
   uint64_t waves_seen = 0;
   uint64_t insts_seen = 0;
+  // Waves dropped by simd_filter. Kept apart from waves_seen so a trace
+  // whose waves all ran on other SIMDs is not reported as an empty capture.
+  uint64_t waves_filtered = 0;
   std::vector<my_rocperf_tool::WaveLoopInfo> wave_loops;
   llvm::DenseMap<rocprofiler_thread_trace_decoder_pc_t, bool> mfma_cache;
   llvm::DenseMap<rocprofiler_thread_trace_decoder_pc_t, bool> is_barrier_cache;
@@ -417,6 +427,10 @@ rocprofiler_thread_trace_decoder_status_t att_decoder_trace_callback(
           static_cast<rocprofiler_thread_trace_decoder_wave_t*>(trace_events);
       for (size_t wave_n = 0; wave_n < trace_size; wave_n++) {
         auto wave = wave_events[wave_n];
+        if (ctx.simd_filter >= 0 && wave.simd != ctx.simd_filter) {
+          ctx.waves_filtered++;
+          continue;
+        }
         auto coalesced = coalesce_barrier_tokens(ctx, wave);
         wave.instructions_array = coalesced.data();
         wave.instructions_size = coalesced.size();
@@ -1069,8 +1083,9 @@ struct TraceSummary {
   uint64_t se_id = 0;  // one .att per shader engine per dispatch
   uint64_t waves = 0;
   uint64_t insts = 0;
-  uint64_t loop_waves = 0;  // waves with at least one detected loop
-  uint64_t loops = 0;       // detected loops summed over those waves
+  uint64_t waves_filtered = 0;  // dropped by --simd, not counted in waves
+  uint64_t loop_waves = 0;      // waves with at least one detected loop
+  uint64_t loops = 0;           // detected loops summed over those waves
 };
 
 int run_trace(TraceBuf& out, TraceSummary& summary,
@@ -1090,6 +1105,7 @@ int run_trace(TraceBuf& out, TraceSummary& summary,
     decoder_ctx.detect_loops_flag = absl::GetFlag(FLAGS_detect_loops);
     decoder_ctx.verify_duration = absl::GetFlag(FLAGS_verify_trace_duration);
     decoder_ctx.mfma_coexec_flag = absl::GetFlag(FLAGS_mfma_coexec);
+    decoder_ctx.simd_filter = absl::GetFlag(FLAGS_simd);
   }
 
   {
@@ -1120,6 +1136,7 @@ int run_trace(TraceBuf& out, TraceSummary& summary,
   summary.se_id = att_path.se_id;
   summary.waves = decoder_ctx.waves_seen;
   summary.insts = decoder_ctx.insts_seen;
+  summary.waves_filtered = decoder_ctx.waves_filtered;
   summary.loop_waves = decoder_ctx.wave_loops.size();
   uint64_t loops = 0;
   for (const auto& wl : decoder_ctx.wave_loops) loops += wl.loops.size();
@@ -1140,12 +1157,17 @@ int run_trace(TraceBuf& out, TraceSummary& summary,
       dump_loops(dump_ctx, decoder_ctx.wave_loops);
       // A trace that emitted nothing would otherwise be indistinguishable
       // from a failed run. Text output only -- csv/json stay parseable.
-      if (out.size() == before && cfg.format == LoopOutputFormat::Text)
+      if (out.size() == before && cfg.format == LoopOutputFormat::Text) {
         writef(out,
                "=== DispatchID={}, SE={}: no loops detected "
-               "({} waves, {} instructions) ===\n",
+               "({} waves, {} instructions",
                decoder_ctx.dispatch_id, att_path.se_id, decoder_ctx.waves_seen,
                decoder_ctx.insts_seen);
+        if (decoder_ctx.simd_filter >= 0)
+          writef(out, "; {} waves on other SIMDs skipped by --simd={}",
+                 decoder_ctx.waves_filtered, decoder_ctx.simd_filter);
+        writef(out, ") ===\n");
+      }
     }
   }
   return 0;
@@ -1267,7 +1289,8 @@ int run_main(const std::string& att_output_dir_path) {
   // a trace here is one .att file = one shader engine of one dispatch.
   {
     uint64_t tot_waves = 0, tot_insts = 0, tot_loop_waves = 0, tot_loops = 0;
-    uint64_t no_wave_traces = 0;
+    uint64_t tot_filtered = 0;
+    uint64_t no_wave_traces = 0, filtered_only_traces = 0;
     // A dispatch is loop-free only if some SE decoded waves and none found a
     // loop; per-SE slots would otherwise report the same dispatch repeatedly,
     // including dispatches whose loops all landed in another SE's trace.
@@ -1281,7 +1304,13 @@ int run_main(const std::string& att_output_dir_path) {
       tot_insts += s.insts;
       tot_loop_waves += s.loop_waves;
       tot_loops += s.loops;
-      if (s.waves == 0) no_wave_traces++;
+      tot_filtered += s.waves_filtered;
+      if (s.waves == 0) {
+        if (s.waves_filtered > 0)
+          filtered_only_traces++;
+        else
+          no_wave_traces++;
+      }
       auto& d = by_dispatch[s.dispatch_id];
       d.waves += s.waves;
       d.loops += s.loops;
@@ -1307,6 +1336,17 @@ int run_main(const std::string& att_output_dir_path) {
                  "[summary] {} of {} trace(s) decoded no waves "
                  "(empty, truncated, or wrong-agent capture)\n",
                  no_wave_traces, n_traces);
+    const int32_t simd = absl::GetFlag(FLAGS_simd);
+    if (simd >= 0) {
+      fmt::print(stderr,
+                 "[summary] --simd={}: {} wave(s) on other SIMDs skipped\n",
+                 simd, tot_filtered);
+      if (filtered_only_traces)
+        fmt::print(stderr,
+                   "[summary] {} of {} trace(s) had waves only on other "
+                   "SIMDs\n",
+                   filtered_only_traces, n_traces);
+    }
 
     if (detect) {
       // detect_loops keeps a loop at iteration_count >= 2, and one taken
@@ -1341,6 +1381,11 @@ int main(int argc, char* argv[]) {
       absl::GetFlag(FLAGS_att_output_dir);
   if (!att_output_dir.has_value()) {
     std::cerr << "--att_output_dir not specified\n";
+    return 2;
+  }
+  if (int32_t simd = absl::GetFlag(FLAGS_simd); simd < -1 || simd > 3) {
+    std::cerr << "--simd must be in [0,3], or -1 for all SIMDs; got " << simd
+              << "\n";
     return 2;
   }
   int LLVMArgc = 1;
