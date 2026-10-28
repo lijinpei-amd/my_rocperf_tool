@@ -136,6 +136,16 @@ using PerLoopMap = llvm::DenseMap<my_rocperf_tool::BackEdge, PerPCMap>;
 
 static const PerPCMap empty_pc_map;
 
+// Cycles an MFMA is assumed to keep the MAI pipe busy, during which a
+// co-issued non-MFMA instruction executes for free.
+static constexpr int64_t kMfmaShadowCycles = 16;
+
+// ATT hardware timestamps land on a 4-cycle grid, and the decoder splits the
+// cycles between two timestamp packets across the instructions it saw in
+// between. A single instruction's duration can therefore be off by one
+// granule.
+static constexpr int64_t kAttTimestampGranule = 4;
+
 enum class LoopOutputFormat { Text, Csv, Json };
 
 struct LoopOutputConfig {
@@ -243,8 +253,7 @@ void analyze_mfma_coexec(trace_decoder_context& ctx,
                          const rocprofiler_thread_trace_decoder_wave_t& wave,
                          const my_rocperf_tool::BackEdge& edge) {
   auto& obj = ctx.disas.get_object_file_by_id(edge.code_object_id);
-  int64_t good_interval = 0;
-  int64_t last_mfma_coexec_end = 0;
+  int64_t mfma_shadow_end = 0;
 
   for (size_t i = 0; i < wave.instructions_size; i++) {
     const auto& inst = wave.instructions_array[i];
@@ -267,22 +276,28 @@ void analyze_mfma_coexec(trace_decoder_context& ctx,
     if (cache_it->second) {
       // MFMA is productive work — update shadow, don't count as bubble.
       int64_t issue_point = inst.time + inst.stall;
-      // Verify no two MFMAs issue within each other's shadow.
-      if (last_mfma_coexec_end > 0 && issue_point < last_mfma_coexec_end) {
+      // Verify no two MFMAs issue within each other's shadow. An overlap of
+      // up to one timestamp granule is decoder slop, not a pipe violation --
+      // only a larger one means kMfmaShadowCycles is wrong for this ISA.
+      if (mfma_shadow_end > 0 &&
+          issue_point < mfma_shadow_end - kAttTimestampGranule) {
         fmt::print(stderr,
                    "WARNING: MFMA shadow overlap at PC 0x{:x} code_object={}: "
                    "issues at {}, previous shadow ends at {} "
                    "(overlap={} cycles)\n",
                    inst.pc.address, inst.pc.code_object_id, issue_point,
-                   last_mfma_coexec_end, last_mfma_coexec_end - issue_point);
+                   mfma_shadow_end, mfma_shadow_end - issue_point);
       }
-      good_interval = issue_point + 16;
-      last_mfma_coexec_end = good_interval;
+      // Never rewind: a slop-induced overlap must not un-cover cycles the
+      // previous MFMA already accounted for, which would attribute a bubble
+      // to whatever follows.
+      mfma_shadow_end =
+          std::max(mfma_shadow_end, issue_point + kMfmaShadowCycles);
     } else {
       // Non-MFMA: compute bubble (portion not covered by co-exec shadow).
       int64_t end_time = inst.time + inst.duration;
-      if (end_time > good_interval) {
-        int64_t uncovered = end_time - good_interval;
+      if (end_time > mfma_shadow_end) {
+        int64_t uncovered = end_time - mfma_shadow_end;
         int64_t bubble =
             std::min(static_cast<int64_t>(inst.duration), uncovered);
         if (bubble > 0)
@@ -591,7 +606,7 @@ struct LoopSummary {
   double avg_dur, avg_stall, avg_idle, avg_bubble;
   double mfma_util;  // mfma_time / avg_dur
   uint32_t mfma_count;
-  uint32_t mfma_time;  // mfma_count * 16
+  uint32_t mfma_time;  // mfma_count * kMfmaShadowCycles
 };
 
 LoopSummary compute_loop_summary(const my_rocperf_tool::LoopStats& s,
@@ -612,7 +627,7 @@ LoopSummary compute_loop_summary(const my_rocperf_tool::LoopStats& s,
     sum.avg_idle = static_cast<double>(s.total_idle) / s.iteration_count;
   }
   if (total_n > 0) sum.avg_bubble = static_cast<double>(total_bubble) / total_n;
-  sum.mfma_time = sum.mfma_count * 16;
+  sum.mfma_time = sum.mfma_count * kMfmaShadowCycles;
   if (sum.avg_dur > 0)
     sum.mfma_util = static_cast<double>(sum.mfma_time) / sum.avg_dur;
   return sum;
@@ -929,8 +944,8 @@ void dump_loop_text_stats(TraceBuf& out, const my_rocperf_tool::LoopStats& s,
   writef(out, "    avg/iter: dur={:.2f} stall={:.2f} idle={:.2f}", sum.avg_dur,
          sum.avg_stall, sum.avg_idle);
   if (cfg.show_mfma_coexec) writef(out, " bubble={:.2f}", sum.avg_bubble);
-  writef(out, " mfma_time={} ({} mfma * 16) mfma_util={:.1f}%\n", sum.mfma_time,
-         sum.mfma_count, sum.mfma_util * 100.0);
+  writef(out, " mfma_time={} ({} mfma * {}) mfma_util={:.1f}%\n", sum.mfma_time,
+         sum.mfma_count, kMfmaShadowCycles, sum.mfma_util * 100.0);
   if (!cfg.show_contents) return;
 
   writef(out, "    ");
