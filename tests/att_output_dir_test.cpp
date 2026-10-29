@@ -165,10 +165,11 @@ TEST_F(AttOutputDirTest, SortsCodeObjectsByPrefixIdThenPath) {
   // Ids compare as numbers, not strings, and the three tied on prefix and id
   // fall back to path order, so neither path nor directory order gives this.
   const std::vector<std::string> sorted = {
-      "a_gfx942_code_object_id_2.out",      // prefix a
-      "run_gfx90a_code_object_id_1.out",    // prefix run, id 1, path
-      "run_gfx942_code_object_id_1.out",    // prefix run, id 1, path
-      "run_gfx950_code_object_id_1.out",    // prefix run, id 1, path
+      "a_gfx942_code_object_id_2.out",  // prefix a
+      // prefix run, id 1, then by path
+      "run_gfx90a_code_object_id_1.out",
+      "run_gfx942_code_object_id_1.out",
+      "run_gfx950_code_object_id_1.out",
       "run_gfx942_code_object_id_2.out",    // prefix run, id 2
       "run_gfx942_code_object_id_10.out",   // prefix run, id 10
       "run_x_gfx942_code_object_id_1.out",  // prefix run_x

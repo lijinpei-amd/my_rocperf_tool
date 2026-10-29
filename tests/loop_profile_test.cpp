@@ -362,5 +362,59 @@ TEST(LoopProfileTest, OuterLoopsBubbleIsPerOuterIteration) {
   }
 }
 
+// Two loops one after the other in a wave, the second entered at its bottom
+// test while the first's last MFMA shadow is still open. Each loop's walk
+// keeps its own shadow and its own header: no MFMA of the second loop covers
+// any of its cycles, and its records before its first header issue relative
+// to no header.
+TEST(LoopProfileTest, SideBySideLoopsKeepTheirOwnShadowAndHeader) {
+  constexpr uint64_t kMfma = kLoopHeader + 8;
+  constexpr uint64_t kOtherHeader = 0x200;
+  constexpr uint64_t kOtherBranch = 0x20c;
+  constexpr BackEdge kOther{kCodeObject, kOtherBranch, kOtherHeader};
+  KindTable table{{{kMfma, InstKind::Mfma}}};
+  // Back-to-back records of 4 cycles, none stalled.
+  WaveBuilder builder;
+  for (int pass = 0; pass < 2; pass++) {
+    const int64_t start = 16 * pass;
+    builder.at(kLoopHeader, kValu, start, /*duration=*/4)
+        .at(kLoopHeader + 4, kValu, start + 4, /*duration=*/4)
+        .at(kMfma, kValu, start + 8, /*duration=*/4)
+        .at(kLoopBranch, pass == 0 ? kJump : kNext, start + 12,
+            /*duration=*/4);
+  }
+  // The MFMA issued at 24 casts its shadow to 40.
+  builder.at(kOtherBranch, kJump, /*time=*/32, /*duration=*/4)
+      .at(kOtherHeader, kValu, /*time=*/36, /*duration=*/4)
+      .at(kOtherHeader + 4, kValu, /*time=*/40, /*duration=*/4)
+      .at(kOtherHeader + 8, kValu, /*time=*/44, /*duration=*/4)
+      .at(kOtherBranch, kNext, /*time=*/48, /*duration=*/4);
+  LoopProfile profile(/*mfma_coexec=*/true);
+
+  auto loops = add_wave(profile, builder, table);
+
+  ASSERT_EQ(loops.loops.size(), 2u);
+  for (const auto& loop : loops.loops) {
+    LoopRecord record{loop.back_edge, loop.stats, 1, loops.wave_index};
+    auto body = list_body(loop.back_edge, table.kinds);
+    auto metrics = profile.metrics(record, body);
+    if (loop.back_edge == kLoop) {
+      // Only the first pass's records before the first MFMA are uncovered.
+      EXPECT_EQ(row_at(metrics, kLoopHeader).bubble, 4u);
+      EXPECT_EQ(row_at(metrics, kLoopHeader + 4).bubble, 4u);
+      EXPECT_EQ(row_at(metrics, kLoopBranch).bubble, 0u);
+      EXPECT_EQ(row_at(metrics, kLoopBranch).rel_issue, 2 * 12u);
+      continue;
+    }
+    ASSERT_EQ(loop.back_edge, kOther);
+    for (const auto& row : metrics.rows) EXPECT_EQ(row.bubble, row.dur);
+    // Both executions count, but only the one after the header issues
+    // relative to it, 12 cycles in.
+    auto branch = row_at(metrics, kOtherBranch);
+    EXPECT_EQ(branch.n, 2u);
+    EXPECT_EQ(branch.rel_issue, 12u);
+  }
+}
+
 }  // namespace
 }  // namespace my_rocperf_tool

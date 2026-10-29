@@ -191,8 +191,9 @@ TEST(LoopReportTest, CsvRowsHaveTheHeadersColumns) {
       SCOPED_TRACE(rows[i]);
       const auto fields = split_csv(rows[i]);
       ASSERT_EQ(fields.size(), header.size());
-      if (cfg.show_prefix)
+      if (cfg.show_prefix) {
         EXPECT_EQ(fields[column(header, "prefix")], R"(run "1",a)");
+      }
       if (!cfg.show_contents) continue;
       const auto& inst = body[(i - 1) % rows_per_record];
       EXPECT_EQ(fields[column(header, "instruction")], inst.text);
@@ -248,6 +249,34 @@ TEST(LoopReportTest, JsonDocumentParses) {
     ASSERT_NE(no_entries->getAsArray(), nullptr);
     EXPECT_TRUE(no_entries->getAsArray()->empty());
   }
+}
+
+// Empty chunks first, last and between: a separator placed by chunk index
+// rather than by the entries already written breaks on the first.
+TEST(LoopReportTest, JsonDocumentSkipsEmptyChunksAnywhere) {
+  auto body = list_loop();
+  LoopOutputConfig cfg;
+  cfg.format = LoopOutputFormat::Json;
+  auto one_entry = [&](uint64_t dispatch_id) {
+    auto report = trace_report(body, /*aggregate=*/false, dispatch_id);
+    report.groups.resize(1);
+    return render(cfg, report);
+  };
+  std::vector<LoopReportChunk> chunks;
+  chunks.push_back(render(cfg, TraceLoopReport{}));
+  chunks.push_back(one_entry(7));
+  chunks.push_back(render(cfg, TraceLoopReport{}));
+  chunks.push_back(one_entry(8));
+  chunks.push_back(render(cfg, TraceLoopReport{}));
+
+  auto doc = document(cfg, chunks);
+
+  auto parsed = llvm::json::parse(doc);
+  ASSERT_TRUE(static_cast<bool>(parsed))
+      << llvm::toString(parsed.takeError()) << "\n"
+      << doc;
+  ASSERT_NE(parsed->getAsArray(), nullptr);
+  EXPECT_EQ(parsed->getAsArray()->size(), 2u);
 }
 
 TEST(LoopReportTest, TextHasAHeadingPerGroup) {
@@ -309,7 +338,7 @@ TEST(LoopReportTest, TextBannersATraceWithoutGroups) {
             "instructions) ===\n");
 
   cfg.show_prefix = true;
-  report.simd = 1;
+  report.simd_filter = 1;
   EXPECT_EQ(to_string(render(cfg, report)),
             "=== Prefix=run_a, DispatchID=7, SE=2: no loops detected (5 "
             "waves, 120 instructions; 3 waves on other SIMDs skipped by "

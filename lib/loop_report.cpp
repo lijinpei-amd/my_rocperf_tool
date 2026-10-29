@@ -488,9 +488,9 @@ void render_text(LoopReportChunk& out, const LoopOutputConfig& cfg,
   write_dispatch_label(out, cfg, report);
   writef(out, ", SE={}: no loops detected ({} waves, {} instructions",
          report.se_id, report.counts.waves, report.counts.insts);
-  if (report.simd >= 0)
+  if (report.simd_filter >= 0)
     writef(out, "; {} waves on other SIMDs skipped by --simd={}",
-           report.counts.waves_filtered, report.simd);
+           report.counts.waves_filtered, report.simd_filter);
   writef(out, ") ===\n");
 }
 

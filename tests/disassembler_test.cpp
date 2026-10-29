@@ -41,6 +41,12 @@ std::string code_object_path(const std::string& gfx) {
   return std::string(TEST_CODE_OBJECT_DIR) + "/" + gfx + ".o";
 }
 
+// The bytes of a code object built from tests/code_objects.
+std::vector<char> code_object_bytes(const std::string& gfx) {
+  std::ifstream in(code_object_path(gfx), std::ios::binary);
+  return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
 // Loads the gfx942 object and prints its s_endpgm. Building the MC stack for
 // that touches every registered piece of the target: target info, the MC
 // layer (printer, code emitter, asm backend, streamer) and the disassembler.
@@ -76,6 +82,77 @@ TEST(DisassemblerTest, ConstructsConcurrently) {
   second.join();
   EXPECT_EQ(printed[0], "s_endpgm");
   EXPECT_EQ(printed[1], "s_endpgm");
+}
+
+// Nothing outside tells a section decoded up front from one decoded on its
+// first query, so this checks that decode_all gets through every section of
+// every object, and that the answers are still those of the on-demand
+// decode.
+TEST(DisassemblerTest, DecodeAllDecodesEveryTextSection) {
+  Disassembler disas;
+  for (auto [id, gfx] :
+       {std::pair{1, "gfx942_two_texts"}, std::pair{2, "gfx1200"}}) {
+    auto err = disas.add_code_object(id, code_object_path(gfx));
+    ASSERT_FALSE(static_cast<bool>(err)) << llvm::toString(std::move(err));
+  }
+
+  disas.decode_all();
+
+  const auto* two_texts = disas.find_code_object(1);
+  EXPECT_EQ(two_texts->text_at(0x1000), "s_nop 0");
+  EXPECT_EQ(two_texts->kind_at(0x2000), InstKind::Mfma);
+  EXPECT_EQ(two_texts->inst_vaddrs(0x2000, 0x200c),
+            (std::vector<uint64_t>{0x2000, 0x2008, 0x200c}));
+  EXPECT_EQ(disas.find_code_object(2)->text_at(0x0), "s_barrier_signal -1");
+}
+
+// A live load record, as rocprofiler-sdk reports a code object the loader
+// holds in memory.
+rocprofiler_callback_tracing_code_object_load_data_t memory_load_record(
+    uint64_t id, const std::vector<char>& bytes) {
+  rocprofiler_callback_tracing_code_object_load_data_t load_data{};
+  load_data.size = sizeof(load_data);
+  load_data.code_object_id = id;
+  load_data.uri = "memory://1234#offset=0x1000";
+  load_data.storage_type = ROCPROFILER_CODE_OBJECT_STORAGE_TYPE_MEMORY;
+  load_data.memory_base = reinterpret_cast<uint64_t>(bytes.data());
+  load_data.memory_size = bytes.size();
+  return load_data;
+}
+
+TEST(DisassemblerTest, LoadsALiveRecordOfACodeObjectInMemory) {
+  const auto bytes = code_object_bytes("gfx942");
+  ASSERT_FALSE(bytes.empty());
+  Disassembler disas;
+
+  auto err = disas.add_code_object(memory_load_record(7, bytes));
+
+  ASSERT_FALSE(static_cast<bool>(err)) << llvm::toString(std::move(err));
+  const auto* obj = disas.find_code_object(7);
+  ASSERT_NE(obj, nullptr);
+  EXPECT_EQ(obj->text_at(0x18), "s_endpgm");
+  EXPECT_EQ(obj->kind_at(0x04), InstKind::Mfma);
+}
+
+// Neither a file nor memory: there is nothing to read the code object from.
+TEST(DisassemblerTest, LiveRecordOfAnotherStorageTypeFails) {
+  const auto bytes = code_object_bytes("gfx942");
+  for (auto storage_type : {ROCPROFILER_CODE_OBJECT_STORAGE_TYPE_NONE,
+                            ROCPROFILER_CODE_OBJECT_STORAGE_TYPE_LAST}) {
+    SCOPED_TRACE(storage_type);
+    auto load_data = memory_load_record(7, bytes);
+    load_data.storage_type = storage_type;
+    Disassembler disas;
+
+    auto err = disas.add_code_object(load_data);
+
+    ASSERT_TRUE(static_cast<bool>(err));
+    EXPECT_EQ(llvm::toString(std::move(err)),
+              std::string(load_data.uri) +
+                  ": unsupported code object storage type " +
+                  std::to_string(storage_type));
+    EXPECT_EQ(disas.find_code_object(7), nullptr);
+  }
 }
 
 // Both objects in one Disassembler, as a run with two ISAs would load them.
@@ -256,9 +333,7 @@ class CodeObjectLoadTest : public ::testing::Test {
 };
 
 TEST_F(CodeObjectLoadTest, UnknownIsaFailsAtLoad) {
-  std::ifstream in(code_object_path("gfx942"), std::ios::binary);
-  std::vector<char> bytes{std::istreambuf_iterator<char>(in),
-                          std::istreambuf_iterator<char>()};
+  auto bytes = code_object_bytes("gfx942");
   ASSERT_GT(bytes.size(), sizeof(llvm::ELF::Elf64_Ehdr));
   // Little-endian, so the low byte of e_flags holds EF_AMDGPU_MACH; NONE (0)
   // names no ISA.

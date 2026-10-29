@@ -54,7 +54,8 @@ struct LoopRecord {
   BackEdge back_edge;
   // detect_loops' totals over the record's passes.
   LoopStats stats;
-  // 1 for a per-wave record.
+  // The waves the record covers, 1 for a per-wave record. Only the report
+  // prints it: LoopProfile::metrics does not read it.
   uint32_t wave_count;
   // A per-wave record's wave, by WaveLoopInfo::wave_index; nullopt for the
   // aggregate.
@@ -89,7 +90,8 @@ struct LoopSummary {
 };
 
 // What the profile answers for one loop record: a row per body instruction,
-// in body order, and the summary.
+// in body order, and the summary. A wave's record has no rows when the
+// profile was built without wave_rows.
 struct LoopRecordMetrics {
   std::vector<LoopInstRow> rows;
   LoopSummary summary;
@@ -126,9 +128,12 @@ class LoopProfile {
 
   // Adds a wave's records, with each s_barrier's MSG+IMMED token pair
   // coalesced, and `loops`, what detect_loops found in them; a loop's records
-  // are filed under loops.wave_index. kind_at is asked only under
-  // mfma_coexec, at most once per PC of each loop body. Returns the MFMA
-  // shadow overlaps the wave's loops show, in the order found.
+  // are filed under loops.wave_index, which must differ from every earlier
+  // wave's. Only an assert checks that: under NDEBUG a repeated index would
+  // re-zero that wave's rows while its record's bubble kept adding. kind_at
+  // is asked only under mfma_coexec, at most once per PC of each loop body.
+  // Returns the MFMA shadow overlaps the wave's loops show, in the order
+  // found.
   std::vector<MfmaShadowOverlap> add_wave(const wave_t& wave,
                                           const WaveLoopInfo& loops,
                                           KindLookup kind_at);

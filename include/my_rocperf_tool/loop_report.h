@@ -32,7 +32,9 @@ struct LoopOutputConfig {
   // The report's groups are built to match: a group per wave unless
   // aggregate_wave_only, which implies aggregate_wave, then the aggregate
   // under aggregate_wave. Rendering reads only aggregate_wave, which adds
-  // CSV's record_type and wave_count columns.
+  // CSV's record_type and wave_count columns. aggregate_wave_only is read by
+  // the CLI alone: build_loop_groups, and WaveAnalysisOptions::wave_loop_rows,
+  // since no wave's rows print under it.
   bool aggregate_wave = false;
   bool aggregate_wave_only = false;
   // Set when the directory holds more than one run (output-file prefix):
@@ -68,10 +70,10 @@ struct TraceLoopReport {
   uint64_t dispatch_id = 0;
   uint64_t se_id = 0;
   // What the decode found and the SIMD filter it ran under
-  // (WaveAnalysisOptions::simd), for the text banner of a trace that prints
-  // no group.
+  // (WaveAnalysisOptions::simd, -1 for every SIMD), for the text banner of a
+  // trace that prints no group.
   WaveCounts counts;
-  int32_t simd = -1;
+  int32_t simd_filter = -1;
   // In print order.
   std::vector<LoopGroup> groups;
 };

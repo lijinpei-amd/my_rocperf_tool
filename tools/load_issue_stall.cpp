@@ -373,7 +373,9 @@ struct TraceSummary {
   my_rocperf_tool::WaveCounts counts;
   // The trace's stderr text, which run_main prints in trace order. Most
   // traces have none, and an empty string, unlike a LoopReportChunk,
-  // reserves nothing.
+  // reserves nothing. Printed only once every worker has joined: an abort in
+  // a later trace loses the lines buffered so far, and under
+  // --verify_trace_duration=warn every warning stays in memory until the end.
   std::string diagnostics;
 };
 
@@ -505,7 +507,7 @@ void run_trace(my_rocperf_tool::LoopReportChunk& out, TraceSummary& summary,
       report.dispatch_id = summary.dispatch_id;
       report.se_id = att_path.se_id;
       report.counts = result.counts;
-      report.simd = options.simd;
+      report.simd_filter = options.simd;
       report.groups =
           build_loop_groups(result.wave_loops, result.profile, bodies, cfg);
       my_rocperf_tool::render_loop_report(out, cfg, report);
@@ -513,7 +515,9 @@ void run_trace(my_rocperf_tool::LoopReportChunk& out, TraceSummary& summary,
   }
 }
 
+// `cfg` lacks only show_prefix, which run_main sets from the directory.
 int run_main(const std::string& att_output_dir_path,
+             my_rocperf_tool::LoopOutputConfig cfg,
              const my_rocperf_tool::WaveAnalysisOptions& options) {
   PHASE_TIMER("TOTAL");
 
@@ -544,7 +548,6 @@ int run_main(const std::string& att_output_dir_path,
     }
   }
 
-  auto cfg = loop_output_config_from_flags();
   cfg.show_prefix = trace_prefixes.size() > 1;
   auto dispatch_id_override =
       out_dir.att_paths.size() == 1
@@ -854,13 +857,14 @@ int main(int argc, char* argv[]) {
               << duration_check_text << "'\n";
     return 2;
   }
+  const auto cfg = loop_output_config_from_flags();
   my_rocperf_tool::WaveAnalysisOptions options;
   options.simd = absl::GetFlag(FLAGS_simd);
   options.detect_loops = absl::GetFlag(FLAGS_detect_loops);
   options.mfma_coexec = absl::GetFlag(FLAGS_mfma_coexec);
-  // Only the loop contents of per-wave records print a wave's rows.
-  options.wave_loop_rows = absl::GetFlag(FLAGS_dump_loop_contents) &&
-                           !absl::GetFlag(FLAGS_aggregate_wave_only);
+  // Only the loop contents of per-wave records print a wave's rows. Taken
+  // from the report's options, so the analysis keeps what they print.
+  options.wave_loop_rows = cfg.show_contents && !cfg.aggregate_wave_only;
   options.duration_check = *duration_check;
   // For crash handlers and stack traces; a Disassembler registers its target
   // itself. After absl is done with argv: on some platforms InitLLVM rewrites
@@ -868,5 +872,5 @@ int main(int argc, char* argv[]) {
   llvm::InitLLVM init_llvm(argc, argv);
   // Outlives run_main so its TOTAL scope has closed by the time we write.
   PHASE_TIMER_SESSION();
-  return run_main(*att_output_dir, options);
+  return run_main(*att_output_dir, cfg, options);
 }

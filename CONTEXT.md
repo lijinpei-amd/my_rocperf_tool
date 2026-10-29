@@ -8,11 +8,11 @@ Per-loop timing analysis of AMD GPU thread traces (ATT): for each loop a wave ra
 The files one rocprofv3 run wrote, named by the output-file prefix that leads each file name (the profiled process' pid unless `--output-file` set it), qualified by the file's subdirectory under the scanned directory. Code object ids and dispatch ids are unique only within a run.
 
 **Dispatch**:
-One traced kernel dispatch, named by the dispatch id in its trace files' names and unique only within its run. It has a trace per shader engine, so the summary's loop-free verdict is per dispatch, over all its traces.
+One traced kernel dispatch, named by the dispatch id in its trace files' names and unique only within its run. It has a trace per shader engine, so the summary's loop-free verdict is per dispatch, over all its traces. When the directory holds a single trace, a `_dispatch_<n>` in the last component of the `--att_output_dir` path overrides the dispatch id in that trace's name.
 
 **Trace** (shader engine trace, `.att`):
 The thread trace of one shader engine (SE) during one dispatch: one `<prefix>_<agent>_shader_engine_<se>_<dispatch>.att` file. The CLI decodes, analyzes and reports each trace separately, and a trace that fails costs only its own report.
-_Avoid_: capture, which is the whole directory of traces and code objects.
+_Avoid_: capture, which the code uses both for one trace and for the whole directory of traces and code objects.
 
 **Code object**:
 An AMDGPU ELF a run loaded, saved as `<prefix>_<arch>_code_object_id_<id>.out`. Its `code_object_id` names it within the run (ids restart every run); 0 marks a PC the decoder could not attribute.
@@ -76,7 +76,10 @@ Whether each record's duration is at least its stall, as the decoder's definitio
 A matrix fused multiply-add: any `v_mfma_*` instruction, but not the sparse `v_smfmac_*` family.
 
 **MFMA shadow** (`kMfmaShadowCycles`):
-The 16 cycles from an MFMA's issue point during which it is assumed to keep the MAI pipe busy, so a co-issued non-MFMA executes for free. Under `--mfma_coexec`, each wave's walk over a loop's body records tracks the shadow end, which only moves forward; an MFMA that issues more than a timestamp granule inside the previous shadow is reported as an MFMA shadow overlap, a sign that the constant is wrong for the ISA.
+The 16 cycles from an MFMA's issue point during which it is assumed to keep the MAI pipe busy, so a co-issued non-MFMA executes for free. Under `--mfma_coexec`, each wave's walk over a loop's body records tracks the shadow end, which only moves forward.
+
+**MFMA shadow overlap** (`MfmaShadowOverlap`):
+An MFMA that issues more than a timestamp granule inside the previous shadow, reported on stderr as a warning: a sign that `kMfmaShadowCycles` is wrong for the ISA.
 
 **MFMA utilization** (`mfma_time`, `mfma_util`):
 Reported for every loop record, with or without `--mfma_coexec`: the number of MFMAs in a loop's body times `kMfmaShadowCycles` (`mfma_time`), and that over the loop record's average iteration duration (`mfma_util`).

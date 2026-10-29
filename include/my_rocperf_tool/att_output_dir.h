@@ -41,7 +41,10 @@ class AttOutputDir {
   llvm::Expected<std::unique_ptr<llvm::MemoryBuffer>> read_att_data(
       const AttPath& path) const;
 
-  // Sorted by prefix, id, then path.
+  // Sorted by prefix, id, then path. Two code objects of one run that share
+  // an id differ only in path, and the CLI decodes the run's traces against
+  // the first: Disassembler::add_code_object keeps the code object an id
+  // already has. Should the first fail to load, every trace of the run fails.
   std::vector<CodeObjectPath> code_objects;
   // Sorted by prefix, dispatch id, SE, then path.
   std::vector<AttPath> att_paths;
