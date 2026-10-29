@@ -10,6 +10,7 @@ add_library(my_rocperf_tool SHARED
     disassembler.cpp
     loop_detection.cpp
     loop_profile.cpp
+    loop_report.cpp
     wave_analysis.cpp
     )
 # -external-nolink is an INTERFACE target that carries the HIP/HSA/comgr include
@@ -19,7 +20,7 @@ add_library(my_rocperf_tool SHARED
 target_link_libraries(my_rocperf_tool PUBLIC
     rocprofiler-sdk::rocprofiler-sdk-headers
     rocprofiler-sdk::rocprofiler-sdk-external-nolink
-    absl::log LLVM rocprof-trace-decoder)
+    absl::log fmt::fmt LLVM rocprof-trace-decoder)
 
 # Live tracing library: registers rocprofiler-sdk callbacks to trace code-object
 # loads inside a running GPU process. This is the only piece that needs the

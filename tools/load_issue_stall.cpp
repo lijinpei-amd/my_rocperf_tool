@@ -3,6 +3,7 @@
 #include "my_rocperf_tool/init_llvm.h"
 #include "my_rocperf_tool/loop_detection.h"
 #include "my_rocperf_tool/loop_profile.h"
+#include "my_rocperf_tool/loop_report.h"
 #include "my_rocperf_tool/wave_analysis.h"
 
 #include "absl/flags/flag.h"
@@ -138,8 +139,6 @@ ABSL_FLAG(uint32_t, jobs, 0,
 ABSL_FLAG(int32_t, simd, -1,
           "analyze only waves on this SIMD ([0,3]); -1 analyzes all SIMDs");
 
-enum class LoopOutputFormat { Text, Csv, Json };
-
 // true and false were the values of the boolean flag this replaced; they stay
 // accepted so existing invocations keep working.
 std::optional<my_rocperf_tool::DurationCheck> parse_duration_check(
@@ -151,42 +150,28 @@ std::optional<my_rocperf_tool::DurationCheck> parse_duration_check(
   return std::nullopt;
 }
 
-struct LoopOutputConfig {
-  LoopOutputFormat format = LoopOutputFormat::Text;
-  bool show_contents = false;
-  bool show_stats = true;
-  bool show_addr = true;
-  bool show_avg = false;
-  bool show_mfma_coexec = false;
-  bool color_mfma_bubble = false;
-  bool aggregate_wave = false;
-  bool aggregate_wave_only = false;
-  // Set when the directory holds more than one run (output-file prefix):
-  // dispatch ids repeat across runs, so every record also names its prefix.
-  // Off for a single run, which keeps that output unchanged.
-  bool show_prefix = false;
-
-  static LoopOutputConfig from_flags() {
-    LoopOutputConfig cfg;
-    cfg.show_contents = absl::GetFlag(FLAGS_dump_loop_contents);
-    cfg.show_stats = absl::GetFlag(FLAGS_loop_inst_stats);
-    cfg.show_addr = absl::GetFlag(FLAGS_loop_inst_addr);
-    cfg.show_avg = absl::GetFlag(FLAGS_loop_inst_avg);
-    cfg.show_mfma_coexec = absl::GetFlag(FLAGS_mfma_coexec);
-    cfg.color_mfma_bubble = absl::GetFlag(FLAGS_color_mfma_bubble);
-    cfg.aggregate_wave = absl::GetFlag(FLAGS_aggregate_wave);
-    cfg.aggregate_wave_only = absl::GetFlag(FLAGS_aggregate_wave_only);
-    if (cfg.aggregate_wave_only) cfg.aggregate_wave = true;
-    auto fmt = absl::GetFlag(FLAGS_loop_output_format);
-    if (fmt == "json")
-      cfg.format = LoopOutputFormat::Json;
-    else if (fmt == "csv")
-      cfg.format = LoopOutputFormat::Csv;
-    else
-      cfg.format = LoopOutputFormat::Text;
-    return cfg;
-  }
-};
+// The loop report's options, but for show_prefix, which depends on the
+// directory.
+my_rocperf_tool::LoopOutputConfig loop_output_config_from_flags() {
+  my_rocperf_tool::LoopOutputConfig cfg;
+  cfg.show_contents = absl::GetFlag(FLAGS_dump_loop_contents);
+  cfg.show_stats = absl::GetFlag(FLAGS_loop_inst_stats);
+  cfg.show_addr = absl::GetFlag(FLAGS_loop_inst_addr);
+  cfg.show_avg = absl::GetFlag(FLAGS_loop_inst_avg);
+  cfg.show_mfma_coexec = absl::GetFlag(FLAGS_mfma_coexec);
+  cfg.color_mfma_bubble = absl::GetFlag(FLAGS_color_mfma_bubble);
+  cfg.aggregate_wave = absl::GetFlag(FLAGS_aggregate_wave);
+  cfg.aggregate_wave_only = absl::GetFlag(FLAGS_aggregate_wave_only);
+  if (cfg.aggregate_wave_only) cfg.aggregate_wave = true;
+  auto fmt = absl::GetFlag(FLAGS_loop_output_format);
+  if (fmt == "json")
+    cfg.format = my_rocperf_tool::LoopOutputFormat::Json;
+  else if (fmt == "csv")
+    cfg.format = my_rocperf_tool::LoopOutputFormat::Csv;
+  else
+    cfg.format = my_rocperf_tool::LoopOutputFormat::Text;
+  return cfg;
+}
 
 // What the decoder's callbacks share through their void* userdata while one
 // trace decodes: the trace, handed over on the first se_data call; the run's
@@ -276,7 +261,9 @@ rocprofiler_thread_trace_decoder_status_t att_decoder_trace_callback(
 
 // A trace's loop bodies, each listed once: listing prints every instruction,
 // and every record of a loop -- one per wave that has it, and the aggregate --
-// needs the loop's body.
+// needs the loop's body. The report's rows view the bodies' text until it is
+// rendered. Listing a body may grow the map, which moves the other bodies, but
+// moving a vector leaves its elements, and so their text, where they are.
 class LoopBodies {
  public:
   explicit LoopBodies(const my_rocperf_tool::Disassembler& disas)
@@ -297,71 +284,6 @@ class LoopBodies {
   const my_rocperf_tool::Disassembler& disas;
   llvm::DenseMap<my_rocperf_tool::BackEdge, my_rocperf_tool::LoopBody> listed;
 };
-
-// Escape a string for CSV output (RFC 4180: double embedded quotes)
-std::string csv_escape(std::string_view s) {
-  std::string out;
-  out.reserve(s.size());
-  for (char c : s) {
-    if (c == '"')
-      out += "\"\"";
-    else
-      out += c;
-  }
-  return out;
-}
-
-// Escape a string for JSON output (handles all JSON-required escapes)
-std::string json_escape(std::string_view s) {
-  std::string out;
-  out.reserve(s.size() + 2);
-  for (unsigned char c : s) {
-    switch (c) {
-      case '"':
-        out += "\\\"";
-        break;
-      case '\\':
-        out += "\\\\";
-        break;
-      case '\b':
-        out += "\\b";
-        break;
-      case '\f':
-        out += "\\f";
-        break;
-      case '\n':
-        out += "\\n";
-        break;
-      case '\r':
-        out += "\\r";
-        break;
-      case '\t':
-        out += "\\t";
-        break;
-      default:
-        if (c < 0x20) {
-          char buf[8];
-          std::snprintf(buf, sizeof(buf), "\\u%04x", c);
-          out += buf;
-        } else {
-          out += static_cast<char>(c);
-        }
-    }
-  }
-  return out;
-}
-
-// ANSI color for bubble severity, relative to max bubble in the loop.
-// Green (0%) -> Yellow (1-25%) -> Red (25-75%) -> Bright Red (75-100%)
-const char* bubble_color(const my_rocperf_tool::LoopInstRow& ii,
-                         uint64_t max_bubble) {
-  if (!ii.has_stats || ii.n == 0 || ii.bubble == 0 || max_bubble == 0)
-    return "\033[32m";  // green: fully covered
-  double ratio = static_cast<double>(ii.bubble) / max_bubble;
-  if (ratio <= 0.25) return "\033[33m";  // yellow: low
-  if (ratio <= 0.75) return "\033[31m";  // red: medium
-  return "\033[1;31m";                   // bright red: high
-}
 
 std::vector<my_rocperf_tool::LoopRecord> aggregate_loops_by_back_edge(
     const std::vector<my_rocperf_tool::WaveLoopInfo>& wave_loops) {
@@ -393,397 +315,42 @@ std::vector<my_rocperf_tool::LoopRecord> aggregate_loops_by_back_edge(
   return result;
 }
 
-struct LoopGroup {
-  bool is_aggregate;
-  uint8_t cu = 0;        // valid only when !is_aggregate
-  uint8_t simd = 0;      // valid only when !is_aggregate
-  uint32_t wave_id = 0;  // valid only when !is_aggregate
-  std::vector<my_rocperf_tool::LoopRecord> loops;
-};
-
-std::vector<LoopGroup> build_loop_groups(
+// The report's groups, in print order: a group per wave with loops unless
+// --aggregate_wave_only, then the aggregate under --aggregate_wave. Each
+// record is resolved here, against the profile and its loop's body, so
+// rendering reads plain data.
+std::vector<my_rocperf_tool::LoopGroup> build_loop_groups(
     const std::vector<my_rocperf_tool::WaveLoopInfo>& wave_loops,
-    const LoopOutputConfig& cfg) {
-  std::vector<LoopGroup> groups;
+    const my_rocperf_tool::LoopProfile& profile, LoopBodies& bodies,
+    const my_rocperf_tool::LoopOutputConfig& cfg) {
+  auto resolve = [&](const my_rocperf_tool::LoopRecord& record) {
+    return my_rocperf_tool::ReportedLoop{
+        record, profile.metrics(record, bodies.of(record.back_edge))};
+  };
+  std::vector<my_rocperf_tool::LoopGroup> groups;
   if (!cfg.aggregate_wave_only) {
     for (const auto& wl : wave_loops) {
-      LoopGroup g{false, wl.cu, wl.simd, wl.wave_id, {}};
+      my_rocperf_tool::LoopGroup g{false, wl.cu, wl.simd, wl.wave_id, {}};
       g.loops.reserve(wl.loops.size());
       for (const auto& dl : wl.loops)
-        g.loops.push_back({dl.back_edge, dl.stats, 1, wl.wave_index});
+        g.loops.push_back(resolve({dl.back_edge, dl.stats, 1, wl.wave_index}));
       groups.push_back(std::move(g));
     }
   }
   if (cfg.aggregate_wave) {
-    LoopGroup g{true, 0, 0, 0, aggregate_loops_by_back_edge(wave_loops)};
+    my_rocperf_tool::LoopGroup g{true, 0, 0, 0, {}};
+    for (const auto& record : aggregate_loops_by_back_edge(wave_loops))
+      g.loops.push_back(resolve(record));
     groups.push_back(std::move(g));
   }
   return groups;
 }
 
-// Per-trace output buffer type. Lower SBO than fmt::memory_buffer's default
-// (500): aggregate_wave_only output fits in <256 B; reduces the upfront
-// allocation of std::vector<TraceBuf>(n_traces) by ~half.
-using TraceBuf = fmt::basic_memory_buffer<char, 256>;
-
-// Small wrapper around fmt::format_to so call sites stay terse.
-// fmt::format_string gives compile-time format-string checks; fmt::appender
-// is fmt's canonical writer for memory_buffer (tighter codegen than
-// std::back_inserter).
-template <typename... T>
-inline void writef(TraceBuf& out, fmt::format_string<T...> f, T&&... args) {
-  fmt::format_to(fmt::appender(out), f, std::forward<T>(args)...);
-}
-
-// For stderr text, which is rare enough that how it is appended does not
-// matter.
+// fmt::format_to for the stderr text, which is rare enough that how it is
+// appended does not matter.
 template <typename... T>
 inline void writef(std::string& out, fmt::format_string<T...> f, T&&... args) {
   fmt::format_to(std::back_inserter(out), f, std::forward<T>(args)...);
-}
-
-void dump_loop_json(TraceBuf& out, const my_rocperf_tool::BackEdge& e,
-                    const my_rocperf_tool::LoopStats& s,
-                    const my_rocperf_tool::LoopRecordMetrics& metrics,
-                    const LoopOutputConfig& cfg,
-                    std::optional<uint32_t> wave_count = std::nullopt) {
-  const auto& sum = metrics.summary;
-  writef(out,
-         "    {{\"target_addr\":\"0x{:x}\",\"source_addr\":\"0x{:x}\","
-         "\"code_object\":{}",
-         e.target_addr, e.source_addr, e.code_object_id);
-  if (wave_count.has_value()) writef(out, ",\"wave_count\":{}", *wave_count);
-  writef(out,
-         ",\"iterations\":{},\"total_duration\":{},"
-         "\"total_stall\":{},\"total_idle\":{}",
-         s.iteration_count, s.total_duration, s.total_stall, s.total_idle);
-  writef(out, ",\"avg_dur\":{:.2f},\"avg_stall\":{:.2f},\"avg_idle\":{:.2f}",
-         sum.avg_dur, sum.avg_stall, sum.avg_idle);
-  if (cfg.show_mfma_coexec)
-    writef(out, ",\"avg_bubble\":{:.2f}", sum.avg_bubble);
-  writef(out, ",\"mfma_count\":{},\"mfma_time\":{},\"mfma_util\":{:.4f}",
-         sum.mfma_count, sum.mfma_time, sum.mfma_util);
-  if (cfg.show_contents) {
-    writef(out, ",\"instructions\":[\n");
-    bool first_inst = true;
-    for (const auto& ii : metrics.rows) {
-      if (!first_inst) writef(out, ",\n");
-      first_inst = false;
-      writef(out, "      {{\"addr\":\"0x{:x}\",\"inst\":\"{}\"", ii.vaddr,
-             json_escape(ii.text));
-      if (cfg.show_stats && ii.has_stats) {
-        writef(out, ",\"n\":{}", ii.n);
-        if (cfg.show_avg) {
-          writef(out,
-                 ",\"avg_dur\":{:.2f},\"avg_stall\":{:.2f},"
-                 "\"avg_idle\":{:.2f},\"avg_issue\":{:.2f}",
-                 static_cast<double>(ii.dur) / ii.n,
-                 static_cast<double>(ii.stall) / ii.n,
-                 static_cast<double>(ii.idle) / ii.n,
-                 static_cast<double>(ii.issue) / ii.n);
-          if (cfg.show_mfma_coexec)
-            writef(out, ",\"avg_bubble\":{:.2f}",
-                   static_cast<double>(ii.bubble) / ii.n);
-          writef(out, ",\"avg_cycle\":{:.2f}",
-                 static_cast<double>(ii.rel_issue) / ii.n);
-        } else {
-          writef(out, ",\"dur\":{},\"stall\":{},\"idle\":{},\"issue\":{}",
-                 ii.dur, ii.stall, ii.idle, ii.issue);
-          if (cfg.show_mfma_coexec) writef(out, ",\"bubble\":{}", ii.bubble);
-          writef(out, ",\"rel_issue\":{}", ii.rel_issue);
-        }
-      }
-      writef(out, "}}");
-    }
-    writef(out, "\n    ]");
-  }
-  writef(out, "}}");
-}
-
-void dump_csv_header(TraceBuf& out, const LoopOutputConfig& cfg) {
-  if (cfg.aggregate_wave) writef(out, "record_type,");
-  if (cfg.show_prefix) writef(out, "prefix,");
-  writef(out, "dispatch_id,cu,simd,wave_id,");
-  if (cfg.aggregate_wave) writef(out, "wave_count,");
-  writef(out,
-         "target_addr,source_addr,code_object,"
-         "iterations,total_duration,total_stall,total_idle,"
-         "loop_avg_dur,loop_avg_stall,loop_avg_idle,");
-  if (cfg.show_mfma_coexec) writef(out, "loop_avg_bubble,");
-  writef(out, "mfma_count,mfma_time,mfma_util");
-  if (cfg.show_contents) {
-    writef(out, ",inst_addr,instruction,n,");
-    if (cfg.show_avg) {
-      writef(out, "avg_dur,avg_stall,avg_idle,avg_issue");
-      if (cfg.show_mfma_coexec) writef(out, ",avg_bubble");
-      writef(out, ",avg_cycle");
-    } else {
-      writef(out, "dur,stall,idle,issue");
-      if (cfg.show_mfma_coexec) writef(out, ",bubble");
-      writef(out, ",rel_issue");
-    }
-  }
-  writef(out, "\n");
-}
-
-void dump_csv_row_prefix(TraceBuf& out, const LoopOutputConfig& cfg,
-                         const std::string& prefix, uint64_t dispatch_id,
-                         const LoopGroup& g, uint32_t wave_count) {
-  if (cfg.aggregate_wave)
-    writef(out, "{},", g.is_aggregate ? "aggregate" : "wave");
-  if (cfg.show_prefix) writef(out, "\"{}\",", csv_escape(prefix));
-  writef(out, "{},", dispatch_id);
-  if (cfg.aggregate_wave && g.is_aggregate)
-    writef(out, ",,,");
-  else
-    writef(out, "{},{},{},", g.cu, g.simd, g.wave_id);
-  if (cfg.aggregate_wave) writef(out, "{},", wave_count);
-}
-
-void dump_csv_loop_rows(TraceBuf& out, const LoopOutputConfig& cfg,
-                        const std::string& prefix, uint64_t dispatch_id,
-                        const LoopGroup& g,
-                        const my_rocperf_tool::LoopRecord& lr,
-                        const my_rocperf_tool::LoopRecordMetrics& metrics) {
-  const auto& e = lr.back_edge;
-  const auto& s = lr.stats;
-  const auto& sum = metrics.summary;
-  auto print_loop_fields = [&]() {
-    writef(out, "0x{:x},0x{:x},{},{},{},{},{},{:.2f},{:.2f},{:.2f},",
-           e.target_addr, e.source_addr, e.code_object_id, s.iteration_count,
-           s.total_duration, s.total_stall, s.total_idle, sum.avg_dur,
-           sum.avg_stall, sum.avg_idle);
-    if (cfg.show_mfma_coexec) writef(out, "{:.2f},", sum.avg_bubble);
-    writef(out, "{},{},{:.4f}", sum.mfma_count, sum.mfma_time, sum.mfma_util);
-  };
-
-  if (!cfg.show_contents) {
-    dump_csv_row_prefix(out, cfg, prefix, dispatch_id, g, lr.wave_count);
-    print_loop_fields();
-    writef(out, "\n");
-    return;
-  }
-
-  for (const auto& ii : metrics.rows) {
-    dump_csv_row_prefix(out, cfg, prefix, dispatch_id, g, lr.wave_count);
-    print_loop_fields();
-    writef(out, ",0x{:x},\"{}\",{},", ii.vaddr, csv_escape(ii.text), ii.n);
-    if (cfg.show_avg) {
-      if (ii.n > 0) {
-        writef(out, "{:.2f},{:.2f},{:.2f},{:.2f}",
-               static_cast<double>(ii.dur) / ii.n,
-               static_cast<double>(ii.stall) / ii.n,
-               static_cast<double>(ii.idle) / ii.n,
-               static_cast<double>(ii.issue) / ii.n);
-        if (cfg.show_mfma_coexec)
-          writef(out, ",{:.2f}", static_cast<double>(ii.bubble) / ii.n);
-        writef(out, ",{:.2f}", static_cast<double>(ii.rel_issue) / ii.n);
-      } else {
-        // Same shape as the branch above with every field empty, so the row
-        // keeps the header's column count.
-        writef(out, ",,,");
-        if (cfg.show_mfma_coexec) writef(out, ",");
-        writef(out, ",");
-      }
-      writef(out, "\n");
-    } else {
-      writef(out, "{},{},{},{}", ii.dur, ii.stall, ii.idle, ii.issue);
-      if (cfg.show_mfma_coexec) writef(out, ",{}", ii.bubble);
-      writef(out, ",{}\n", ii.rel_issue);
-    }
-  }
-}
-
-// Emits per-trace dispatch entries separated by ",\n" with no leading or
-// trailing comma. Caller is responsible for the surrounding "[\n" / "\n]\n"
-// and for inserting ",\n" between non-empty per-trace bodies.
-// Per-trace dump state, threaded through dump_loops*.  Holds references —
-// owned by run_trace and its analysis result.
-struct DumpCtx {
-  TraceBuf& out;
-  const my_rocperf_tool::LoopProfile& profile;
-  LoopBodies& bodies;
-  const LoopOutputConfig& cfg;
-  const std::string& prefix;
-  uint64_t dispatch_id;
-
-  my_rocperf_tool::LoopRecordMetrics metrics(
-      const my_rocperf_tool::LoopRecord& lr) const {
-    return profile.metrics(lr, bodies.of(lr.back_edge));
-  }
-};
-
-// "DispatchID=N", qualified by the run when the output spans several.
-void write_dispatch_label(TraceBuf& out, const LoopOutputConfig& cfg,
-                          const std::string& prefix, uint64_t dispatch_id) {
-  if (cfg.show_prefix) writef(out, "Prefix={}, ", prefix);
-  writef(out, "DispatchID={}", dispatch_id);
-}
-
-// Emits per-trace dispatch entries separated by ",\n" with no leading or
-// trailing comma. Caller is responsible for the surrounding "[\n" / "\n]\n"
-// and for inserting ",\n" between non-empty per-trace bodies.
-void dump_loops_json(const DumpCtx& ctx, const std::vector<LoopGroup>& groups) {
-  bool first_entry = true;
-  for (const auto& g : groups) {
-    if (!first_entry) writef(ctx.out, ",\n");
-    first_entry = false;
-    writef(ctx.out, "  {{");
-    if (ctx.cfg.show_prefix)
-      writef(ctx.out, "\"prefix\":\"{}\",", json_escape(ctx.prefix));
-    if (g.is_aggregate)
-      writef(ctx.out, "\"dispatch_id\":{},\"aggregate\":true,\"loops\":[\n",
-             ctx.dispatch_id);
-    else
-      writef(ctx.out,
-             "\"dispatch_id\":{},\"cu\":{},\"simd\":{},\"wave_id\":{},"
-             "\"loops\":[\n",
-             ctx.dispatch_id, g.cu, g.simd, g.wave_id);
-    bool first_loop = true;
-    for (const auto& lr : g.loops) {
-      if (!first_loop) writef(ctx.out, ",\n");
-      first_loop = false;
-      auto wave_count = g.is_aggregate ? std::optional<uint32_t>(lr.wave_count)
-                                       : std::nullopt;
-      dump_loop_json(ctx.out, lr.back_edge, lr.stats, ctx.metrics(lr), ctx.cfg,
-                     wave_count);
-    }
-    writef(ctx.out, "\n  ]}}");
-  }
-}
-
-void dump_loops_csv(const DumpCtx& ctx, const std::vector<LoopGroup>& groups) {
-  for (const auto& g : groups) {
-    for (const auto& lr : g.loops) {
-      dump_csv_loop_rows(ctx.out, ctx.cfg, ctx.prefix, ctx.dispatch_id, g, lr,
-                         ctx.metrics(lr));
-    }
-  }
-}
-
-void dump_loop_text_stats(TraceBuf& out,
-                          const my_rocperf_tool::LoopRecordMetrics& metrics,
-                          const LoopOutputConfig& cfg) {
-  const auto& sum = metrics.summary;
-  writef(out, "    avg/iter: dur={:.2f} stall={:.2f} idle={:.2f}", sum.avg_dur,
-         sum.avg_stall, sum.avg_idle);
-  if (cfg.show_mfma_coexec) writef(out, " bubble={:.2f}", sum.avg_bubble);
-  writef(out, " mfma_time={} ({} mfma * {}) mfma_util={:.1f}%\n", sum.mfma_time,
-         sum.mfma_count, my_rocperf_tool::kMfmaShadowCycles,
-         sum.mfma_util * 100.0);
-  if (!cfg.show_contents) return;
-
-  writef(out, "    ");
-  if (cfg.show_stats) {
-    writef(out, "{:<6} ", "n");
-    if (cfg.show_avg)
-      writef(out, "{:<10} {:<10} {:<10} {:<10} ", "avg_dur", "avg_stall",
-             "avg_idle", "avg_issue");
-    else
-      writef(out, "{:<10} {:<10} {:<10} {:<8} ", "dur", "stall", "idle",
-             "issue");
-    if (cfg.show_mfma_coexec)
-      writef(out, "{:<10} ", cfg.show_avg ? "avg_bbl" : "bubble");
-    writef(out, "{:<10} ", "avg_cycle");
-  }
-  if (cfg.show_addr) writef(out, "{:<14} ", "addr");
-  writef(out, "instruction\n");
-
-  uint64_t max_bubble = 0;
-  if (cfg.color_mfma_bubble) {
-    for (const auto& ii : metrics.rows)
-      if (ii.bubble > max_bubble) max_bubble = ii.bubble;
-  }
-  for (const auto& ii : metrics.rows) {
-    if (cfg.color_mfma_bubble && ii.has_stats)
-      writef(out, "{}", bubble_color(ii, max_bubble));
-    writef(out, "    ");
-    if (cfg.show_stats && ii.has_stats) {
-      writef(out, "{:<6} ", ii.n);
-      if (cfg.show_avg) {
-        writef(out, "{:<10.2f} {:<10.2f} {:<10.2f} {:<10.2f} ",
-               static_cast<double>(ii.dur) / ii.n,
-               static_cast<double>(ii.stall) / ii.n,
-               static_cast<double>(ii.idle) / ii.n,
-               static_cast<double>(ii.issue) / ii.n);
-      } else {
-        writef(out, "{:<10} {:<10} {:<10} {:<8} ", ii.dur, ii.stall, ii.idle,
-               ii.issue);
-      }
-      if (cfg.show_mfma_coexec) {
-        if (cfg.show_avg)
-          writef(out, "{:<10.2f} ", static_cast<double>(ii.bubble) / ii.n);
-        else
-          writef(out, "{:<10} ", ii.bubble);
-      }
-      writef(out, "{:<10.2f} ", static_cast<double>(ii.rel_issue) / ii.n);
-    } else if (cfg.show_stats) {
-      if (cfg.show_avg)
-        writef(out, "{:<6} {:<10} {:<10} {:<10} {:<10} ", "", "", "", "", "");
-      else
-        writef(out, "{:<6} {:<10} {:<10} {:<10} {:<8} ", "", "", "", "", "");
-      if (cfg.show_mfma_coexec) writef(out, "{:<10} ", "");
-      writef(out, "{:<10} ", "");
-    }
-    if (cfg.show_addr) writef(out, "0x{:x}:  ", ii.vaddr);
-    writef(out, "{}", ii.text);
-    if (cfg.color_mfma_bubble && ii.has_stats) writef(out, "\033[0m");
-    writef(out, "\n");
-  }
-}
-
-void dump_loops_text(const DumpCtx& ctx, const std::vector<LoopGroup>& groups) {
-  for (const auto& g : groups) {
-    writef(ctx.out,
-           g.is_aggregate ? "=== Aggregate Across Waves (" : "=== Wave (");
-    write_dispatch_label(ctx.out, ctx.cfg, ctx.prefix, ctx.dispatch_id);
-    if (g.is_aggregate)
-      writef(ctx.out, ") ===\n");
-    else
-      writef(ctx.out, ", CU={}, SIMD={}, WaveID={}) ===\n", g.cu, g.simd,
-             g.wave_id);
-    for (const auto& lr : g.loops) {
-      const auto& e = lr.back_edge;
-      const auto& s = lr.stats;
-      uint32_t avg_dur =
-          s.iteration_count ? s.total_duration / s.iteration_count : 0;
-      uint32_t avg_stall =
-          s.iteration_count ? s.total_stall / s.iteration_count : 0;
-      if (g.is_aggregate)
-        writef(ctx.out,
-               "  Loop [0x{:x} -> 0x{:x}] code_object={}: "
-               "{} waves, {} iterations, {} total cycles (avg {}/iter), "
-               "stall {} (avg {}/iter), idle {}\n",
-               e.target_addr, e.source_addr, e.code_object_id, lr.wave_count,
-               s.iteration_count, s.total_duration, avg_dur, s.total_stall,
-               avg_stall, s.total_idle);
-      else
-        writef(ctx.out,
-               "  Loop [0x{:x} -> 0x{:x}] code_object={}: "
-               "{} iterations, {} total cycles (avg {}/iter), "
-               "stall {} (avg {}/iter), idle {}\n",
-               e.target_addr, e.source_addr, e.code_object_id,
-               s.iteration_count, s.total_duration, avg_dur, s.total_stall,
-               avg_stall, s.total_idle);
-      dump_loop_text_stats(ctx.out, ctx.metrics(lr), ctx.cfg);
-    }
-  }
-}
-
-void dump_loops(const DumpCtx& ctx,
-                const std::vector<my_rocperf_tool::WaveLoopInfo>& wave_loops) {
-  auto groups = build_loop_groups(wave_loops, ctx.cfg);
-  switch (ctx.cfg.format) {
-    case LoopOutputFormat::Json:
-      dump_loops_json(ctx, groups);
-      break;
-    case LoopOutputFormat::Csv:
-      dump_loops_csv(ctx, groups);
-      break;
-    case LoopOutputFormat::Text:
-      dump_loops_text(ctx, groups);
-      break;
-  }
 }
 
 // What one trace decoded, for the end-of-run summary on stderr. Written by
@@ -805,8 +372,8 @@ struct TraceSummary {
   uint64_t se_id = 0;  // one .att per shader engine per dispatch
   my_rocperf_tool::WaveCounts counts;
   // The trace's stderr text, which run_main prints in trace order. Most
-  // traces have none, and an empty string, unlike a TraceBuf, reserves
-  // nothing.
+  // traces have none, and an empty string, unlike a LoopReportChunk,
+  // reserves nothing.
   std::string diagnostics;
 };
 
@@ -830,11 +397,11 @@ struct DiagnosticWriter {
 };
 
 // `disas` is null when a code object of the trace's run failed to load.
-void run_trace(TraceBuf& out, TraceSummary& summary,
+void run_trace(my_rocperf_tool::LoopReportChunk& out, TraceSummary& summary,
                const my_rocperf_tool::AttOutputDir& out_dir,
                const my_rocperf_tool::AttPath& att_path,
                my_rocperf_tool::Disassembler* disas,
-               const LoopOutputConfig& cfg,
+               const my_rocperf_tool::LoopOutputConfig& cfg,
                const my_rocperf_tool::WaveAnalysisOptions& options,
                std::optional<uint64_t> dispatch_id_override) {
   // Keyed before the read, so an unreadable trace still names the dispatch
@@ -929,28 +496,18 @@ void run_trace(TraceBuf& out, TraceSummary& summary,
   summary.counts = result.counts;
 
   {
-    PHASE_TIMER("dump_loops");
+    PHASE_TIMER("loop report");
     if (options.detect_loops) {
       LoopBodies bodies(*disas);
-      DumpCtx dump_ctx{out, result.profile,  bodies,
-                       cfg, att_path.prefix, summary.dispatch_id};
-      // Test what dump_loops actually emitted rather than whether loops were
-      // found: --aggregate_wave writes an (empty) aggregate header even with
-      // no loops, and a second "no loops" banner would contradict it.
-      size_t before = out.size();
-      dump_loops(dump_ctx, result.wave_loops);
-      // A trace that emitted nothing would otherwise be indistinguishable
-      // from a failed run. Text output only -- csv/json stay parseable.
-      if (out.size() == before && cfg.format == LoopOutputFormat::Text) {
-        writef(out, "=== ");
-        write_dispatch_label(out, cfg, att_path.prefix, summary.dispatch_id);
-        writef(out, ", SE={}: no loops detected ({} waves, {} instructions",
-               att_path.se_id, result.counts.waves, result.counts.insts);
-        if (options.simd >= 0)
-          writef(out, "; {} waves on other SIMDs skipped by --simd={}",
-                 result.counts.waves_filtered, options.simd);
-        writef(out, ") ===\n");
-      }
+      my_rocperf_tool::TraceLoopReport report;
+      report.prefix = att_path.prefix;
+      report.dispatch_id = summary.dispatch_id;
+      report.se_id = att_path.se_id;
+      report.counts = result.counts;
+      report.simd = options.simd;
+      report.groups =
+          build_loop_groups(result.wave_loops, result.profile, bodies, cfg);
+      my_rocperf_tool::render_loop_report(out, cfg, report);
     }
   }
 }
@@ -986,7 +543,7 @@ int run_main(const std::string& att_output_dir_path,
     }
   }
 
-  auto cfg = LoopOutputConfig::from_flags();
+  auto cfg = loop_output_config_from_flags();
   cfg.show_prefix = trace_prefixes.size() > 1;
   auto dispatch_id_override =
       out_dir.att_paths.size() == 1
@@ -1038,7 +595,7 @@ int run_main(const std::string& att_output_dir_path,
   // Memory note: chunks hold all per-trace output until emit. For
   // aggregate_wave_only this is small; --dump_loop_contents over thousands
   // of traces could reach hundreds of MB.
-  std::vector<TraceBuf> chunks(n_traces);
+  std::vector<my_rocperf_tool::LoopReportChunk> chunks(n_traces);
   // Same indexing as chunks; each worker writes only its own slot.
   std::vector<TraceSummary> summaries(n_traces);
 
@@ -1112,23 +669,10 @@ int run_main(const std::string& att_output_dir_path,
   for (const auto& s : summaries)
     std::fwrite(s.diagnostics.data(), 1, s.diagnostics.size(), stderr);
 
-  // Emit prologue + chunks (in order) + epilogue.
-  if (cfg.format == LoopOutputFormat::Json)
-    std::fputs("[\n", stdout);
-  else if (cfg.format == LoopOutputFormat::Csv) {
-    TraceBuf header;
-    dump_csv_header(header, cfg);
-    std::fwrite(header.data(), 1, header.size(), stdout);
-  }
-  bool first_nonempty = true;
-  for (const auto& c : chunks) {
-    if (c.size() == 0) continue;
-    if (cfg.format == LoopOutputFormat::Json && !first_nonempty)
-      std::fputs(",\n", stdout);
-    std::fwrite(c.data(), 1, c.size(), stdout);
-    first_nonempty = false;
-  }
-  if (cfg.format == LoopOutputFormat::Json) std::fputs("\n]\n", stdout);
+  my_rocperf_tool::write_loop_report_document(
+      cfg, chunks, [](std::string_view piece) {
+        std::fwrite(piece.data(), 1, piece.size(), stdout);
+      });
 
   // Run summary on stderr. stdout is fully buffered when redirected, so flush
   // it first: otherwise, under `2>&1`, the unbuffered stderr text lands ahead
@@ -1256,7 +800,7 @@ int run_main(const std::string& att_output_dir_path,
         // Buffer then one write: the list is unbounded and stderr is
         // unbuffered, so per-id writes would be a syscall apiece.
         if (loop_free.size() < by_dispatch.size()) {
-          TraceBuf ids;
+          std::string ids;
           writef(ids, "[summary] loop-free dispatch ids:");
           for (const auto& [prefix, id] : loop_free) {
             if (cfg.show_prefix)

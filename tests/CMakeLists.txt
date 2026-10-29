@@ -47,6 +47,7 @@ add_executable(my_rocperf_tool_tests
     disassembler_test.cpp
     loop_detection_test.cpp
     loop_profile_test.cpp
+    loop_report_test.cpp
     wave_analysis_test.cpp
     )
 add_dependencies(my_rocperf_tool_tests test_code_objects)
