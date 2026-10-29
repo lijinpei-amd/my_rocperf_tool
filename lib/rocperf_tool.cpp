@@ -1,7 +1,6 @@
 #include "my_rocperf_tool/rocperf_tool.h"
 #include "my_rocperf_tool/check_rocprofiler_status.h"
 #include "my_rocperf_tool/disassembler.h"
-#include "my_rocperf_tool/init_llvm.h"
 
 #include "rocprofiler-sdk/callback_tracing.h"
 #include "rocprofiler-sdk/context.h"
@@ -9,6 +8,7 @@
 #include "rocprofiler-sdk/registration.h"
 
 #include "llvm/Support/Error.h"
+#include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <memory>
@@ -58,10 +58,15 @@ void RocPerfTool::code_object_tracing_callback(
 
 namespace {
 
+// llvm::InitLLVM's crash handlers and stack traces while the tool is active,
+// and llvm_shutdown at finalization. A Disassembler registers the target it
+// needs itself. InitLLVM parses no LLVM command-line options, so argv only
+// describes the process in crash reports, and a library, which has no argv of
+// its own, can pass this one.
 static int LLVMArgc = 1;
 static const char* LLVMArgv[] = {"my-rocperf-tool"};
 static const char** LLVMArgvPtr = LLVMArgv;
-static std::optional<my_rocperf_tool::InitLLVM> LLVMInit;
+static std::optional<llvm::InitLLVM> LLVMInit;
 
 int init_perftool(rocprofiler_client_finalize_t finalize_func,
                   void* tool_data) {

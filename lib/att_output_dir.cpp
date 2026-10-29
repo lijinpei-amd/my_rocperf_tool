@@ -102,6 +102,13 @@ llvm::Expected<AttOutputDir> AttOutputDir::scan(const std::string& path) {
               return std::tie(a.prefix, a.dispatch_id, a.se_id, a.path) <
                      std::tie(b.prefix, b.dispatch_id, b.se_id, b.path);
             });
+  // Directory order varies by filesystem, and a run loads its code objects in
+  // this order, so its load errors would too.
+  std::sort(out_dir.code_objects.begin(), out_dir.code_objects.end(),
+            [](const CodeObjectPath& a, const CodeObjectPath& b) {
+              return std::tie(a.prefix, a.id, a.path) <
+                     std::tie(b.prefix, b.id, b.path);
+            });
   return out_dir;
 }
 

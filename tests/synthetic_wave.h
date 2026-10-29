@@ -69,6 +69,19 @@ class WaveBuilder {
     return at(addr, category, next_time_, kDuration, kStall);
   }
 
+  // A record the decoder could not attribute to a code object. It overlaps
+  // the next record's start and stalls longer than it lasts, so counting,
+  // timing or checking it would show.
+  WaveBuilder& null_pc() {
+    rocprofiler_thread_trace_decoder_inst_t inst{};
+    inst.category = kValu;
+    inst.duration = 1000;
+    inst.stall = 2000;
+    inst.time = next_time_ - kSpacing / 2;
+    insts_.push_back(inst);
+    return *this;
+  }
+
   WaveBuilder& wait(int64_t cycles) {
     next_time_ += cycles;
     return *this;

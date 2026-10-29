@@ -5,7 +5,6 @@
 #include "llvm/Support/Error.h"
 #include "llvm/Support/MemoryBuffer.h"
 
-#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -27,12 +26,10 @@ using CodeObjectFields =
 using AttFields =
     std::tuple<std::string, std::string, uint64_t, uint64_t, uint64_t>;
 
-// Code objects come in directory order, so they are compared sorted by path.
-std::vector<CodeObjectFields> sorted_code_objects(const AttOutputDir& dir) {
+std::vector<CodeObjectFields> code_object_fields(const AttOutputDir& dir) {
   std::vector<CodeObjectFields> fields;
   for (const auto& co : dir.code_objects)
     fields.emplace_back(co.path, co.prefix, co.arch, co.id);
-  std::sort(fields.begin(), fields.end());
   return fields;
 }
 
@@ -89,7 +86,7 @@ TEST_F(AttOutputDirTest, ParsesPrefixesContainingUnderscores) {
   auto dir = AttOutputDir::scan(root_.string());
   ASSERT_TRUE(static_cast<bool>(dir)) << llvm::toString(dir.takeError());
 
-  EXPECT_EQ(sorted_code_objects(*dir),
+  EXPECT_EQ(code_object_fields(*dir),
             (std::vector<CodeObjectFields>{
                 {path("1234_gfx942_code_object_id_1.out"), "1234", "gfx942", 1},
                 {path("my_run_v2_gfx950_code_object_id_2.out"), "my_run_v2",
@@ -112,7 +109,7 @@ TEST_F(AttOutputDirTest, SameNameInTwoSubdirectoriesIsTwoRuns) {
   auto dir = AttOutputDir::scan(root_.string());
   ASSERT_TRUE(static_cast<bool>(dir)) << llvm::toString(dir.takeError());
 
-  EXPECT_EQ(sorted_code_objects(*dir),
+  EXPECT_EQ(code_object_fields(*dir),
             (std::vector<CodeObjectFields>{
                 {path("host1/1234_gfx942_code_object_id_1.out"), "host1/1234",
                  "gfx942", 1},
@@ -133,15 +130,16 @@ TEST_F(AttOutputDirTest, SortsTracesByPrefixDispatchSeThenPath) {
   // (run_10_ sorts before run_1_); with eight ties, directory order matching
   // path order by chance is negligible.
   const std::vector<std::string> sorted = {
-      "a_1_shader_engine_3_20.att",    // prefix a
-      "run_10_shader_engine_0_9.att",  // prefix run, dispatch 9, SE 0, path
-      "run_1_shader_engine_0_9.att",   // prefix run, dispatch 9, SE 0, path
-      "run_2_shader_engine_0_9.att",   // prefix run, dispatch 9, SE 0, path
-      "run_3_shader_engine_0_9.att",   // prefix run, dispatch 9, SE 0, path
-      "run_4_shader_engine_0_9.att",   // prefix run, dispatch 9, SE 0, path
-      "run_5_shader_engine_0_9.att",   // prefix run, dispatch 9, SE 0, path
-      "run_6_shader_engine_0_9.att",   // prefix run, dispatch 9, SE 0, path
-      "run_7_shader_engine_0_9.att",   // prefix run, dispatch 9, SE 0, path
+      "a_1_shader_engine_3_20.att",  // prefix a
+      // The eight tied on prefix run, dispatch 9 and SE 0, by path.
+      "run_10_shader_engine_0_9.att",
+      "run_1_shader_engine_0_9.att",
+      "run_2_shader_engine_0_9.att",
+      "run_3_shader_engine_0_9.att",
+      "run_4_shader_engine_0_9.att",
+      "run_5_shader_engine_0_9.att",
+      "run_6_shader_engine_0_9.att",
+      "run_7_shader_engine_0_9.att",
       "run_1_shader_engine_2_9.att",   // prefix run, dispatch 9, SE 2
       "run_1_shader_engine_10_9.att",  // prefix run, dispatch 9, SE 10
       "run_1_shader_engine_0_10.att",  // prefix run, dispatch 10
@@ -156,6 +154,35 @@ TEST_F(AttOutputDirTest, SortsTracesByPrefixDispatchSeThenPath) {
 
   std::vector<std::string> paths;
   for (const auto& att : dir->att_paths) paths.push_back(att.path);
+  std::vector<std::string> expected;
+  for (const auto& name : sorted) expected.push_back(path(name));
+  EXPECT_EQ(paths, expected);
+}
+
+// A run loads its code objects in this order, so its load errors come out in
+// it too.
+TEST_F(AttOutputDirTest, SortsCodeObjectsByPrefixIdThenPath) {
+  // Ids compare as numbers, not strings, and the three tied on prefix and id
+  // fall back to path order, so neither path nor directory order gives this.
+  const std::vector<std::string> sorted = {
+      "a_gfx942_code_object_id_2.out",      // prefix a
+      "run_gfx90a_code_object_id_1.out",    // prefix run, id 1, path
+      "run_gfx942_code_object_id_1.out",    // prefix run, id 1, path
+      "run_gfx950_code_object_id_1.out",    // prefix run, id 1, path
+      "run_gfx942_code_object_id_2.out",    // prefix run, id 2
+      "run_gfx942_code_object_id_10.out",   // prefix run, id 10
+      "run_x_gfx942_code_object_id_1.out",  // prefix run_x
+  };
+  // Neither creation order nor its reverse: stride 3 visits each of the 7
+  // once.
+  for (size_t i = 0; i < sorted.size(); ++i)
+    touch(sorted[i * 3 % sorted.size()]);
+
+  auto dir = AttOutputDir::scan(root_.string());
+  ASSERT_TRUE(static_cast<bool>(dir)) << llvm::toString(dir.takeError());
+
+  std::vector<std::string> paths;
+  for (const auto& co : dir->code_objects) paths.push_back(co.path);
   std::vector<std::string> expected;
   for (const auto& name : sorted) expected.push_back(path(name));
   EXPECT_EQ(paths, expected);
@@ -190,7 +217,7 @@ TEST_F(AttOutputDirTest, KeepsMissingCodeObject) {
 
   auto dir = AttOutputDir::scan(root_.string());
   ASSERT_TRUE(static_cast<bool>(dir)) << llvm::toString(dir.takeError());
-  EXPECT_EQ(sorted_code_objects(*dir),
+  EXPECT_EQ(code_object_fields(*dir),
             (std::vector<CodeObjectFields>{
                 {path("run_gfx942_code_object_id_1.out"), "run", "gfx942", 1},
                 {path("run_gfx942_code_object_id_2.out"), "run", "gfx942", 2},

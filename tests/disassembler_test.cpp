@@ -28,8 +28,8 @@ namespace {
 
 namespace fs = std::filesystem;
 
-// Every SubTargetContext's MCContext points at its owner's MC options, so a
-// relocated Disassembler would leave them dangling.
+// MC objects keep the address of their owner's MC options, so a relocated
+// Disassembler would leave them dangling.
 static_assert(!std::is_copy_constructible_v<Disassembler>);
 static_assert(!std::is_copy_assignable_v<Disassembler>);
 static_assert(!std::is_move_constructible_v<Disassembler>);
@@ -50,14 +50,17 @@ std::string load_and_print_s_endpgm(Disassembler& disas) {
   return disas.find_code_object(1)->text_at(0x18);
 }
 
-// gtest's main sets up no InitLLVM, so this is a Disassembler on its own.
+// gtest's main sets up no llvm::InitLLVM, so this is a Disassembler on its
+// own.
 TEST(DisassemblerTest, WorksWithoutProcessSetup) {
   Disassembler disas;
   EXPECT_EQ(load_and_print_s_endpgm(disas), "s_endpgm");
 }
 
-// CTest runs each case in a fresh process, so these two constructions are the
-// process's first and race to register the target.
+// Under CTest each case runs in its own process, so these two constructions,
+// started together, are the process's first. This checks only that both
+// succeed: whether they overlap in the target registration is up to the
+// scheduler, and an unsynchronized registration could still pass.
 TEST(DisassemblerTest, ConstructsConcurrently) {
   std::atomic<bool> go{false};
   auto construct_and_print = [&](std::string& printed) {
@@ -112,6 +115,9 @@ TEST_F(ObjectFileInfoTest, AnswersSizeKindAndTextAtEachVaddr) {
       {0x0c, 4, InstKind::ClassicBarrier, "s_barrier"},
       {0x10, 8, InstKind::Other, "s_mov_b32 s0, 0x12345678"},
       {0x18, 4, InstKind::Other, "s_endpgm"},
+      // InstKind::Mfma leaves out the sparse v_smfmac_* family.
+      {0x1c, 8, InstKind::Other,
+       "v_smfmac_f32_16x16x32_f16 a[0:3], v[0:1], v[2:5], v6"},
   };
   for (const auto& e : expected) {
     SCOPED_TRACE(e.text);
@@ -154,9 +160,9 @@ TEST_F(ObjectFileInfoTest, WalksARangeByInstructionNotByDword) {
 }
 
 TEST_F(ObjectFileInfoTest, WalksNothingOutsideTheTextSection) {
-  // .text is 0x1c bytes long.
-  EXPECT_EQ(gfx942_->inst_vaddrs(0x20, 0x40), (std::vector<uint64_t>{}));
-  EXPECT_EQ(gfx942_->inst_vaddrs(0x10, 0x1c), (std::vector<uint64_t>{}));
+  // .text is 0x24 bytes long.
+  EXPECT_EQ(gfx942_->inst_vaddrs(0x28, 0x40), (std::vector<uint64_t>{}));
+  EXPECT_EQ(gfx942_->inst_vaddrs(0x10, 0x24), (std::vector<uint64_t>{}));
 }
 
 TEST_F(ObjectFileInfoTest, UnknownIdFindsNothing) {

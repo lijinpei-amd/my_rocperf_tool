@@ -50,8 +50,8 @@ struct WaveAnalysisOptions {
 using InstClassifier =
     std::function<InstKind(const rocprofiler_thread_trace_decoder_pc_t&)>;
 
-// Decode counters, reported in the run summary so a trace that yields no
-// loops is distinguishable from one that failed to decode.
+// How many waves and records of a trace were analyzed, which tells a trace
+// whose waves hold no loop apart from one that decoded no waves.
 struct WaveCounts {
   // Waves analyzed, which excludes those the SIMD filter dropped.
   uint64_t waves = 0;

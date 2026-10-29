@@ -1,6 +1,5 @@
 #include "my_rocperf_tool/att_output_dir.h"
 #include "my_rocperf_tool/disassembler.h"
-#include "my_rocperf_tool/init_llvm.h"
 #include "my_rocperf_tool/loop_detection.h"
 #include "my_rocperf_tool/loop_profile.h"
 #include "my_rocperf_tool/loop_report.h"
@@ -15,6 +14,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/MemoryBuffer.h"
 
 #include "fmt/base.h"
@@ -439,7 +439,8 @@ void run_trace(my_rocperf_tool::LoopReportChunk& out, TraceSummary& summary,
     decoder_ctx.att_data = std::move(*att_data);
   }
 
-  rocprofiler_thread_trace_decoder_status_t parse_res;
+  // Read only by an assert.
+  [[maybe_unused]] rocprofiler_thread_trace_decoder_status_t parse_res;
   {
     PHASE_TIMER("trace decode");
     parse_res = rocprof_trace_decoder_parse_data(
@@ -563,8 +564,8 @@ int run_main(const std::string& att_output_dir_path,
   }
 
   // One Disassembler per run, built on a worker's first trace from that run
-  // and holding only that run's code objects. A Disassembler cannot move (each
-  // of its MCContexts points at its MC options), so it is built in place by
+  // and holding only that run's code objects. A Disassembler cannot move (its
+  // MC objects keep the address of its MC options), so it is built in place by
   // try_emplace in a node-based map, which never relocates its values.
   struct RunDisassembler {
     my_rocperf_tool::Disassembler disas;
@@ -620,15 +621,17 @@ int run_main(const std::string& att_output_dir_path,
   // 1. The decoder library lazily fills a process-wide singleton trie
   //    (Trie::root_trie in rocprof-trace-decoder/source/trie.cpp), guarded
   //    only by a non-atomic bool. It does so not on its first call but the
-  //    first time it classifies an instruction whose text neither starts
-  //    with "v_" nor contains "branch": an s_ instruction, which nearly
-  //    every wave runs (s_endpgm at least). Concurrent fills race on its
-  //    std::unordered_map writes — UB. Once a trace has filled it,
-  //    std::thread construction publishes those writes to workers, which
-  //    then only read. A trace that is unreadable, or whose run's code
-  //    objects did not all load, never reaches the decoder, hence "until
-  //    one has been decoded" rather than just trace[0]. One decoded without
-  //    a single wave fills nothing either, and still ends the warm-up.
+  //    first time it classifies an instruction that is neither a v_ one nor
+  //    a branch (text containing "branch"): s_endpgm, for instance, which
+  //    nearly every wave runs. Concurrent fills race on its std::unordered_map
+  //    writes — UB. Once a trace has filled it, std::thread construction
+  //    publishes those writes to workers, which then only read. A trace that
+  //    is unreadable, or whose run's code objects did not all load, never
+  //    reaches the decoder, hence "until one has been decoded" rather than
+  //    just trace[0]. A decoded trace can still end the warm-up with the
+  //    trie unfilled: one without a single wave, or one whose PCs name only
+  //    code objects its run lacks, since the decoder classifies no
+  //    instruction the ISA callback fails.
   // 2. The serial Disassembler then becomes the main thread's worker, so
   //    no per-worker setup work is wasted.
   DisasByPrefix main_disas;
@@ -702,17 +705,25 @@ int run_main(const std::string& att_output_dir_path,
     std::map<std::pair<std::string, uint64_t>, DispatchAgg> by_dispatch;
     for (const auto& s : summaries) {
       auto& d = by_dispatch[{s.prefix, s.dispatch_id}];
+      switch (s.failure) {
+        case TraceSummary::Failure::None:
+          break;
+        case TraceSummary::Failure::Unreadable:
+          unreadable_traces++;
+          break;
+        case TraceSummary::Failure::CodeObjectLoad:
+          code_object_load_traces++;
+          break;
+        case TraceSummary::Failure::UnknownCodeObject:
+          unknown_code_object_traces++;
+          break;
+        case TraceSummary::Failure::DurationBelowStall:
+          rejected_traces++;
+          break;
+      }
       // Never reported, so not an empty capture: it adds nothing to the
       // totals, but leaves its dispatch's verdict open.
       if (s.failure != TraceSummary::Failure::None) {
-        if (s.failure == TraceSummary::Failure::Unreadable)
-          unreadable_traces++;
-        else if (s.failure == TraceSummary::Failure::CodeObjectLoad)
-          code_object_load_traces++;
-        else if (s.failure == TraceSummary::Failure::UnknownCodeObject)
-          unknown_code_object_traces++;
-        else
-          rejected_traces++;
         d.failed = true;
         continue;
       }
@@ -838,7 +849,8 @@ int main(int argc, char* argv[]) {
   std::optional<my_rocperf_tool::DurationCheck> duration_check =
       parse_duration_check(duration_check_text);
   if (!duration_check) {
-    std::cerr << "--verify_trace_duration must be off, warn or error; got '"
+    std::cerr << "--verify_trace_duration must be off, warn or error (true "
+                 "and false are accepted as warn and off); got '"
               << duration_check_text << "'\n";
     return 2;
   }
@@ -850,8 +862,10 @@ int main(int argc, char* argv[]) {
   options.wave_loop_rows = absl::GetFlag(FLAGS_dump_loop_contents) &&
                            !absl::GetFlag(FLAGS_aggregate_wave_only);
   options.duration_check = *duration_check;
-  // After absl is done with argv: on some platforms InitLLVM rewrites it.
-  my_rocperf_tool::InitLLVM init_llvm(argc, argv);
+  // For crash handlers and stack traces; a Disassembler registers its target
+  // itself. After absl is done with argv: on some platforms InitLLVM rewrites
+  // it.
+  llvm::InitLLVM init_llvm(argc, argv);
   // Outlives run_main so its TOTAL scope has closed by the time we write.
   PHASE_TIMER_SESSION();
   return run_main(*att_output_dir, options);

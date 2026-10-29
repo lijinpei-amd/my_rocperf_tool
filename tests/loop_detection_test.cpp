@@ -114,6 +114,7 @@ TEST(DetectLoopsTest, CountsEachPassThroughTheBody) {
   expect_body_loop(info.loops[0], 3);
 }
 
+// No back-edge: a taken one yields 2 iterations, so `>= 2` cannot drop one.
 TEST(DetectLoopsTest, IgnoresBodyRunOnce) {
   WaveBuilder builder;
   builder.inst(kPrologue, kSalu)

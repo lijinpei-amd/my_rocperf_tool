@@ -328,8 +328,49 @@ TEST(WaveAnalysisTest, ThreeIterationsOfAFourInstructionLoop) {
   EXPECT_EQ(loop.stats.total_idle, 12u * (kSpacing - kDuration));
   auto body = list_body(kLoop);
   for (const auto& row : loop_metrics(result, body).rows) EXPECT_EQ(row.n, 3u);
-  // Classified only for the per-loop MFMA analysis, which is off.
+  // Guards lazy classification on purpose: only the per-loop MFMA analysis,
+  // off here, and an assert on s_barrier token pairs ask for kinds.
   EXPECT_EQ(table.calls, 0);
+}
+
+// A record without a PC is not an instruction of the wave: it is neither
+// counted nor checked, and adds nothing to a loop's stats or rows, nor to the
+// idle time of the record after it.
+TEST(WaveAnalysisTest, SkipsNullPcRecords) {
+  KindTable table;
+  WaveBuilder builder;
+  builder.inst(kPrologue, kSalu);
+  for (int pass = 0; pass < 3; pass++)
+    builder.inst(kLoopHeader, kValu)
+        .null_pc()
+        .inst(kLoopHeader + 4, kValu)
+        .inst(kLoopHeader + 8, kSalu)
+        .null_pc()
+        .inst(kLoopBranch, pass < 2 ? kJump : kNext);
+  builder.inst(kEpilogue, kSalu);
+  WaveAnalysis analysis(options_with(DurationCheck::Error), table.classifier());
+
+  analysis.add_wave(builder.wave());
+  auto result = std::move(analysis).finish();
+
+  EXPECT_EQ(result.counts.insts, 14u);
+  EXPECT_TRUE(result.diagnostics.empty());
+  EXPECT_FALSE(result.duration_check_failure);
+  ASSERT_EQ(result.wave_loops.size(), 1u);
+  ASSERT_EQ(result.wave_loops[0].loops.size(), 1u);
+  const auto& stats = result.wave_loops[0].loops[0].stats;
+  EXPECT_EQ(stats.iteration_count, 3u);
+  EXPECT_EQ(stats.total_inst_count, 12u);
+  EXPECT_EQ(stats.total_duration, 12u * kDuration);
+  EXPECT_EQ(stats.total_stall, 12u * kStall);
+  EXPECT_EQ(stats.total_idle, 12u * (kSpacing - kDuration));
+  auto body = list_body(kLoop);
+  for (const auto& row : loop_metrics(result, body).rows) {
+    EXPECT_EQ(row.n, 3u);
+    EXPECT_EQ(row.dur, 3u * kDuration);
+    EXPECT_EQ(row.stall, 3u * kStall);
+    EXPECT_EQ(row.idle, 3u * (kSpacing - kDuration));
+  }
 }
 
 // Coalescing runs before loop detection and the per-loop analyses, so each

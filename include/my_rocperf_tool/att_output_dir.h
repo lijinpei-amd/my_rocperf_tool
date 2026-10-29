@@ -41,7 +41,9 @@ class AttOutputDir {
   llvm::Expected<std::unique_ptr<llvm::MemoryBuffer>> read_att_data(
       const AttPath& path) const;
 
+  // Sorted by prefix, id, then path.
   std::vector<CodeObjectPath> code_objects;
+  // Sorted by prefix, dispatch id, SE, then path.
   std::vector<AttPath> att_paths;
 
  private:
