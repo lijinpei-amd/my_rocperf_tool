@@ -57,6 +57,10 @@ inline bool is_null_pc(const rocprofiler_thread_trace_decoder_inst_t& inst) {
 }
 
 /// Detect loops in a wave's instruction trace via back-edge analysis.
+///
+/// Expects each s_barrier's MSG+IMMED token pair coalesced into one record,
+/// as WaveAnalysis does before calling this; uncoalesced, every pass through
+/// a body holding a barrier counts it as two instructions.
 WaveLoopInfo detect_loops(const rocprofiler_thread_trace_decoder_wave_t& wave);
 
 }  // namespace my_rocperf_tool

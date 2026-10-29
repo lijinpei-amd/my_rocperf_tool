@@ -1,5 +1,7 @@
 #pragma once
 
+#include "my_rocperf_tool/inst_kind.h"
+
 #include "rocprofiler-sdk/callback_tracing.h"
 
 #include "llvm/ADT/ArrayRef.h"
@@ -77,19 +79,6 @@ namespace my_rocperf_tool {
 
 class Disassembler;
 class SubTargetContext;
-
-// What the analyses need to know about an instruction. The rules match LLVM
-// AMDGPU opcode names, so an LLVM bump that renames opcodes is fixed where
-// they are defined, in disassembler.cpp.
-enum class InstKind : uint8_t {
-  Other,
-  // Opcode name starts with V_MFMA: every v_mfma_*, v_mfma_ld_scale_b32
-  // included, but not the sparse v_smfmac_* family.
-  Mfma,
-  // The classic s_barrier, not gfx12's split s_barrier_signal /
-  // s_barrier_wait family.
-  ClassicBarrier,
-};
 
 // One loaded code object, answering questions about the instruction at an
 // ELF vaddr. Addresses here are ELF vaddrs throughout: the trace decoder
