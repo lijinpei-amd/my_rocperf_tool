@@ -12,6 +12,7 @@ my_rocperf_tool is a C++17 performance analysis tool for AMD GPUs. It decodes Ad
 git submodule update --init --recursive
 cmake -B build -G Ninja -DCMAKE_PREFIX_PATH=/opt/rocm
 cmake --build build
+ctest --test-dir build --output-on-failure
 ```
 
 CMake minimum 3.28, Ninja generator, C++17, compiled with `-fPIC -fno-rtti`.
@@ -22,11 +23,13 @@ CMake minimum 3.28, Ninja generator, C++17, compiled with `-fPIC -fno-rtti`.
 - **LLVM** (CONFIG mode) — MC disassembler infrastructure
 - **rocprof-trace-decoder** — git submodule at `3rd_party/rocm-systems` (built from `projects/rocprof-trace-decoder/source`)
 - **abseil-cpp**, **fmt** — git submodules under `3rd_party/`
+- **googletest** — git submodule at `3rd_party/googletest` (gtest only, no gmock), for `tests/`
 
 ### Build Outputs
 
 - `build/lib/libmy_rocperf_tool.so` — shared library
 - `build/tools/load_issue_stall` — CLI tool
+- `build/tests/my_rocperf_tool_tests` — unit tests, built by default
 
 ## Code Style
 
@@ -53,4 +56,11 @@ All project code lives in the `my_rocperf_tool` namespace. LLVM `DenseMapInfo` s
 
 ## Testing
 
-No test suite currently exists.
+`tests/` holds one googletest executable, `my_rocperf_tool_tests`, linked against the core library. `gtest_discover_tests` registers each test case with CTest, so `ctest --test-dir build --output-on-failure` runs them all (or run the binary directly, with `--gtest_filter` to pick cases).
+
+Tests use module interfaces only:
+
+- `loop_detection_test.cpp` — `detect_loops` on synthetic waves built from plain `rocprofiler_thread_trace_decoder_*` structs: iteration counts, back-edges, per-loop totals, null-PC skipping.
+- `att_output_dir_test.cpp` — `AttOutputDir` on temp directories of empty, rocprofv3-named files: prefix parsing, per-subdirectory runs, trace sort order, and the "cannot read <path>: <reason>" failures.
+
+The CLI's end-to-end output is not covered.

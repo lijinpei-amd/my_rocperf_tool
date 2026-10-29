@@ -13,6 +13,13 @@ set(BUILD_SHARED_LIBS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE TRUE)
 add_subdirectory(fmt EXCLUDE_FROM_ALL)
 
+# googletest for tests/. Static and PIC like fmt (the settings above apply to
+# the whole directory), so the test binary has no libgtest.so runtime
+# dependency. The tests use gtest only, so gmock is not built.
+set(BUILD_GMOCK OFF CACHE BOOL "Build googlemock (off: tests use gtest only)")
+set(INSTALL_GTEST OFF CACHE BOOL "Generate googletest install rules (off: bundled googletest)")
+add_subdirectory(googletest EXCLUDE_FROM_ALL)
+
 # rocprof-trace-decoder lives in the ROCm/rocm-systems monorepo. Build the
 # library subdirectory directly so we depend on neither the upstream top-level
 # CMakeLists (docs/coverage/packaging) nor a system install.

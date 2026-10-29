@@ -5,6 +5,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC -fno-rtti")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+enable_testing()
+
 find_package(rocprofiler-sdk REQUIRED)
 find_package(LLVM REQUIRED CONFIG)
 
@@ -18,3 +20,4 @@ include_directories("${CMAKE_CURRENT_SOURCE_DIR}/include")
 
 add_subdirectory(lib)
 add_subdirectory(tools)
+add_subdirectory(tests)

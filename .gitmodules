@@ -9,3 +9,7 @@
 	url = https://github.com/ROCm/rocm-systems.git
 	branch = develop
 	shallow = true
+[submodule "3rd_party/googletest"]
+	path = 3rd_party/googletest
+	url = https://github.com/google/googletest.git
+	shallow = true
