@@ -38,6 +38,10 @@ struct WaveAnalysisOptions {
   bool detect_loops = true;
   // Accumulate MFMA-shadow bubbles over each detected loop's body.
   bool mfma_coexec = false;
+  // Keep each wave's per-instruction loop rows, not only the aggregate's.
+  // Without, the profile answers a wave's loop record with its summary alone,
+  // and keeps no per-wave slots.
+  bool wave_loop_rows = true;
   DurationCheck duration_check = DurationCheck::Error;
 };
 
@@ -79,7 +83,8 @@ struct DurationCheckFailure {
 // What the waves of one trace add up to.
 struct WaveAnalysisResult {
   WaveCounts counts;
-  // Every analyzed wave's records and loops, as per-loop, per-PC metrics.
+  // Each wave's executions of its detected loops' bodies, as per-loop, per-PC
+  // metrics.
   LoopProfile profile;
   // The detected loops of each wave that has any, in the order the waves were
   // added. Empty unless detect_loops.

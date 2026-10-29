@@ -142,6 +142,26 @@ TEST(WaveAnalysisTest, SimdFilterDropsOtherWavesBeforeAnyAccumulator) {
   EXPECT_FALSE(result.duration_check_failure);
 }
 
+TEST(WaveAnalysisTest, WithoutWaveLoopRowsOnlyTheAggregateHasRows) {
+  KindTable table;
+  WaveBuilder builder;
+  builder.iteration(/*branch_taken=*/true).iteration(/*branch_taken=*/false);
+  WaveAnalysisOptions options;
+  options.wave_loop_rows = false;
+  WaveAnalysis analysis(options, table.classifier());
+
+  analysis.add_wave(builder.wave());
+  auto result = std::move(analysis).finish();
+
+  ASSERT_EQ(result.wave_loops.size(), 1u);
+  const auto& wave = result.wave_loops[0];
+  ASSERT_EQ(wave.loops.size(), 1u);
+  auto body = list_body(kLoop);
+  LoopRecord wave_record{kLoop, wave.loops[0].stats, 1, wave.wave_index};
+  EXPECT_TRUE(result.profile.metrics(wave_record, body).rows.empty());
+  EXPECT_EQ(loop_metrics(result, body).rows.size(), body.size());
+}
+
 // MFMA tests: a loop body of two MFMAs, a VALU and the branch, run twice with
 // passes 100 cycles apart so no shadow reaches into the next pass.
 constexpr uint64_t kMfma1 = kLoopHeader;

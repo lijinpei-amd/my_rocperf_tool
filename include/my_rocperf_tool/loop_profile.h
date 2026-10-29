@@ -2,9 +2,7 @@
 
 #include "my_rocperf_tool/inst_kind.h"
 #include "my_rocperf_tool/loop_detection.h"
-#include "my_rocperf_tool/trace_pc.h"
 
-#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
 
@@ -14,6 +12,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace my_rocperf_tool {
@@ -98,18 +97,20 @@ struct LoopRecordMetrics {
 
 // The per-loop, per-PC metrics of one trace's waves. Waves are added one at a
 // time, each with the loops detect_loops found in it, and nothing of a wave is
-// kept but running sums: memory grows with the PCs and loop bodies seen, not
-// with the records.
+// kept but running sums: a bubble total per loop it ran, and that loop's rows
+// only where a wave's rows are kept. Memory grows with the loop bodies and the
+// waves' loops, not with the records.
 //
-// A query names the record it is for, a wave's or the aggregate, so that what
-// each number covers is decided here rather than by the callers. Only the
-// summary's dur, stall and idle averages follow the record, through its
-// LoopStats; every record of a loop gets the same trace-wide rows. Their n,
-// dur, stall, idle and issue count each execution of the PC in every wave
-// added, and their bubble and rel_issue the passes of the waves in which
-// detect_loops found the loop. As n counts over the trace rather than the
-// record's passes, avg_bubble divides the loop's bubble by the largest n among
-// its rows with stats.
+// A query names the record it is for, a wave's or the aggregate, and every
+// number in the answer counts that record's executions, so averages per
+// execution and per iteration divide within one population:
+// - a wave's record: each execution, in that wave, of a PC in the loop's
+//   body, which is what detect_loops sums into that wave's LoopStats;
+// - the aggregate: those of the waves in which detect_loops found the loop,
+//   the waves whose LoopStats the aggregate record sums.
+// A wave that runs a body without detect_loops finding the loop adds to no
+// record of it. avg_bubble is the record's bubble per iteration, like the
+// dur, stall and idle averages beside it.
 class LoopProfile {
  public:
   using pc_t = rocprofiler_thread_trace_decoder_pc_t;
@@ -118,49 +119,78 @@ class LoopProfile {
   using KindLookup = llvm::function_ref<InstKind(const pc_t&)>;
 
   LoopProfile() = default;
-  // With mfma_coexec, bubbles are accumulated over each loop's body.
-  explicit LoopProfile(bool mfma_coexec);
+  // With mfma_coexec, bubbles are accumulated over each loop's body. Without
+  // wave_rows, a wave's record keeps only what its summary needs, and its
+  // metrics have no rows.
+  explicit LoopProfile(bool mfma_coexec, bool wave_rows = true);
 
   // Adds a wave's records, with each s_barrier's MSG+IMMED token pair
-  // coalesced, and `loops`, what detect_loops found in them. kind_at is asked
-  // only under mfma_coexec, at most once per PC of each loop body. Returns the
-  // MFMA shadow overlaps the wave's loops show, in the order found.
+  // coalesced, and `loops`, what detect_loops found in them; a loop's records
+  // are filed under loops.wave_index. kind_at is asked only under
+  // mfma_coexec, at most once per PC of each loop body. Returns the MFMA
+  // shadow overlaps the wave's loops show, in the order found.
   std::vector<MfmaShadowOverlap> add_wave(const wave_t& wave,
                                           const WaveLoopInfo& loops,
                                           KindLookup kind_at);
 
-  // `body` is the listing of record.back_edge's body.
+  // `body` is the listing of record.back_edge's body. A wave's record must
+  // name a wave added with that loop; the aggregate of a loop never added has
+  // every row 0.
   LoopRecordMetrics metrics(const LoopRecord& record,
                             const LoopBody& body) const;
 
  private:
-  struct PcTotals {
+  // A body dword's sums over a record's executions.
+  struct SlotTotals {
     uint64_t count = 0;
     uint64_t duration = 0;
     uint64_t stall = 0;
     uint64_t idle = 0;
     uint64_t issue = 0;
-  };
-  // A loop body dword's totals, and the kind of the instruction there once
-  // the MFMA analysis has asked.
-  struct BodySlot {
     uint64_t bubble = 0;
     uint64_t rel_issue = 0;
-    std::optional<InstKind> kind;
+
+    SlotTotals& operator+=(const SlotTotals& other) {
+      count += other.count;
+      duration += other.duration;
+      stall += other.stall;
+      idle += other.idle;
+      issue += other.issue;
+      bubble += other.bubble;
+      rel_issue += other.rel_issue;
+      return *this;
+    }
+  };
+  // One record's sums. The bubble total is kept apart from the slots, so a
+  // wave's summary needs no rows.
+  struct RecordTotals {
+    // A slot per body dword: the walk touches every record of every pass, so
+    // its lookup must be an index rather than a hash. Empty for a wave's
+    // record without wave_rows.
+    std::vector<SlotTotals> slots;
+    uint64_t bubble = 0;
+  };
+  // A loop's aggregate record, and the kind of the instruction at each body
+  // dword once the MFMA analysis has asked.
+  struct LoopTotals {
+    RecordTotals aggregate;
+    std::vector<std::optional<InstKind>> kinds;
   };
 
-  // Relative issue and, under mfma_coexec, MFMA-shadow bubbles over the
-  // wave's passes through `edge`'s body, in one walk.
-  void add_passes(const wave_t& wave, const BackEdge& edge, KindLookup kind_at,
-                  std::vector<MfmaShadowOverlap>& overlaps);
-  static LoopSummary summarize(const LoopStats& stats,
-                               llvm::ArrayRef<LoopInstRow> rows);
+  // Sums the wave's executions of `edge`'s body into the wave's record and the
+  // loop's aggregate, relative issue and, under mfma_coexec, MFMA-shadow
+  // bubbles included, in one walk.
+  void add_passes(const wave_t& wave, uint64_t wave_index, const BackEdge& edge,
+                  KindLookup kind_at, std::vector<MfmaShadowOverlap>& overlaps);
 
   bool mfma_coexec = false;
-  llvm::DenseMap<pc_t, PcTotals> pc_totals;
-  // Per loop, a slot per dword of its body: the analyses touch every record
-  // of every pass, so their lookup must be an index rather than a hash.
-  llvm::DenseMap<BackEdge, std::vector<BodySlot>> body_slots;
+  bool wave_rows = true;
+  llvm::DenseMap<BackEdge, LoopTotals> loop_totals;
+  // Keyed by wave_index and loop.
+  llvm::DenseMap<std::pair<uint64_t, BackEdge>, RecordTotals> wave_totals;
+  // The walk's slots when the wave's are not kept, reused across waves so
+  // that only kept rows allocate.
+  std::vector<SlotTotals> scratch_slots;
 };
 
 }  // namespace my_rocperf_tool

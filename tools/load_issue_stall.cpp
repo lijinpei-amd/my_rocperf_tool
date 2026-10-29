@@ -1302,6 +1302,9 @@ int main(int argc, char* argv[]) {
   options.simd = absl::GetFlag(FLAGS_simd);
   options.detect_loops = absl::GetFlag(FLAGS_detect_loops);
   options.mfma_coexec = absl::GetFlag(FLAGS_mfma_coexec);
+  // Only the loop contents of per-wave records print a wave's rows.
+  options.wave_loop_rows = absl::GetFlag(FLAGS_dump_loop_contents) &&
+                           !absl::GetFlag(FLAGS_aggregate_wave_only);
   options.duration_check = *duration_check;
   // After absl is done with argv: on some platforms InitLLVM rewrites it.
   my_rocperf_tool::InitLLVM init_llvm(argc, argv);

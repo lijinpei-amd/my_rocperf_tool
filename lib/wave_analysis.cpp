@@ -16,7 +16,7 @@ namespace my_rocperf_tool {
 
 WaveAnalysis::WaveAnalysis(WaveAnalysisOptions options, InstClassifier classify)
     : options(options), classify(std::move(classify)) {
-  result.profile = LoopProfile(options.mfma_coexec);
+  result.profile = LoopProfile(options.mfma_coexec, options.wave_loop_rows);
 }
 
 void WaveAnalysis::add_wave(const wave_t& decoded) {
