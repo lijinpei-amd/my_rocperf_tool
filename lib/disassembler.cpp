@@ -134,8 +134,6 @@ void ObjectFileInfo::scan_elf(
     return;
   }
   processor = iter->Processor;
-  sram_ecc_supported = iter->SrameccSupported;
-  xnack_supported = iter->XnackSupported;
 
   auto sections = elf_file.sections();
   assert(sections);
@@ -147,54 +145,11 @@ void ObjectFileInfo::scan_section(const typename ELFT::Shdr& section,
                                   const llvm::object::ELFFile<ELFT>& elf_file) {
   auto sec_name = elf_file.getSectionName(section);
   assert(sec_name);
-  if (*sec_name == ".symtab") {
-    auto section_symbols = elf_file.symbols(&section);
-    assert(section_symbols);
-    auto symbol_strtab = elf_file.getStringTableForSymtab(section);
-    assert(symbol_strtab);
-    for (auto& symbol : *section_symbols) {
-      symbol_index.add_symbol<ELFT>(symbol, *symbol_strtab);
-    }
-  }
   if (*sec_name == ".text") {
     text_sec_offset = section.sh_offset;
     text_sec_address = section.sh_addr;
     text_sec_size = section.sh_size;
     inst_cache.push_back({section.sh_addr, section.sh_size, section.sh_offset});
-  }
-}
-
-template <class ELFT>
-void ObjectFileInfo::disassemble(
-    Disassembler& disas, const llvm::object::ELFObjectFile<ELFT>& elf_obj) {
-  return;
-  const auto& elf_file = elf_obj.getELFFile();
-  auto sections = elf_file.sections();
-  assert(sections);
-  for (auto section : *sections) {
-    auto sec_name = elf_file.getSectionName(section);
-    assert(sec_name);
-    if (*sec_name == ".text") {
-      auto buffer = memory_buffer->getBuffer();
-      auto section_buffer =
-          buffer.drop_front(section.sh_offset).take_front(section.sh_size);
-      llvm::ArrayRef<unsigned char> bytes{section_buffer.bytes_begin(),
-                                          section_buffer.size()};
-      uint64_t virt_addr = section.sh_addr;
-      while (!bytes.empty()) {
-        llvm::MCInst inst;
-        uint64_t inst_size;
-        auto status = sub_target_ctx->get_mc_disassembler().getInstruction(
-            inst, inst_size, bytes, virt_addr, llvm::nulls());
-        if (status == llvm::MCDisassembler::Success) {
-          sub_target_ctx->print_inst(inst);
-        } else {
-          assert(false);
-        }
-        virt_addr += inst_size;
-        bytes = bytes.drop_front(inst_size);
-      }
-    }
   }
 }
 
@@ -214,22 +169,18 @@ void ObjectFileInfo::init_elf(Disassembler& disas) {
           llvm::dyn_cast<llvm::object::ELF32LEObjectFile>(object_file.get())) {
     scan_elf(*elf32_le);
     initialize_mc(disas);
-    disassemble(disas, *elf32_le);
   } else if (auto* elf64_le = llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(
                  object_file.get())) {
     scan_elf(*elf64_le);
     initialize_mc(disas);
-    disassemble(disas, *elf64_le);
   } else if (auto* elf32_be = llvm::dyn_cast<llvm::object::ELF32BEObjectFile>(
                  object_file.get())) {
     scan_elf(*elf32_be);
     initialize_mc(disas);
-    disassemble(disas, *elf32_be);
   } else if (auto* elf64_be = llvm::dyn_cast<llvm::object::ELF64BEObjectFile>(
                  object_file.get())) {
     scan_elf(*elf64_be);
     initialize_mc(disas);
-    disassemble(disas, *elf64_be);
   } else {
     assert(false);
   }

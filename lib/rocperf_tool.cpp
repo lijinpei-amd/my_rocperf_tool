@@ -45,12 +45,6 @@ void RocPerfTool::code_object_tracing_callback(
         static_cast<rocprofiler_callback_tracing_code_object_load_data_t*>(
             record.payload);
     disassembler->addCodeObject(*data);
-  } else if (record.operation ==
-             ROCPROFILER_CODE_OBJECT_DEVICE_KERNEL_SYMBOL_REGISTER) {
-    auto* data = static_cast<
-        rocprofiler_callback_tracing_code_object_kernel_symbol_register_data_t*>(
-        record.payload);
-    disassembler->registerSymbol(*data);
   }
 }
 }  // namespace my_rocperf_tool

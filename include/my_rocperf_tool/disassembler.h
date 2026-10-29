@@ -118,58 +118,6 @@ class SubTargetContext {
   std::unique_ptr<llvm::MCStreamer> streamer;
 };
 
-class SymbolIndex {
-  struct SymbolInfo {
-    llvm::StringRef name;
-    uint64_t value;
-    uint64_t size;
-    const void* symbol;
-  };
-  std::vector<SymbolInfo> symbols;
-  llvm::StringMap<const SymbolInfo*> symbol_map;
-
- public:
-  void clear() {
-    symbols.clear();
-    symbol_map.clear();
-  }
-  template <class ELFT>
-  void add_symbol(const typename ELFT::Sym& symbol, llvm::StringRef strtab) {
-    if (symbol.getType() != llvm::ELF::STT_FUNC) {
-      return;
-    }
-    auto symbol_name = symbol.getName(strtab);
-    assert(symbol_name);
-    symbols.push_back(
-        SymbolInfo{*symbol_name, symbol.st_value, symbol.st_size, &symbol});
-  }
-  void finish_adding() {
-    llvm::sort(symbols, [](const SymbolInfo& LHS, const SymbolInfo& RHS) {
-      return LHS.value < RHS.value;
-    });
-    for (const auto& symbol_info : symbols) {
-      symbol_map.try_emplace(symbol_info.name, &symbol_info);
-    }
-  }
-  const void* find_symbol_by_name(llvm::StringRef name) const {
-    auto iter = symbol_map.find(name);
-    return iter == symbol_map.end() ? nullptr : iter->second->symbol;
-  }
-  const void* find_symbol_contain_address(uint64_t addr) const {
-    auto iter = llvm::upper_bound(
-        symbols, addr,
-        [](uint64_t LHS, const SymbolInfo& RHS) { return LHS < RHS.value; });
-    if (iter == symbols.begin()) {
-      return nullptr;
-    }
-    iter = std::prev(iter);
-    if (iter->value + iter->size < addr) {
-      return iter->symbol;
-    }
-    return nullptr;
-  }
-};
-
 struct DecodedSlot {
   llvm::MCInst inst;
   uint32_t inst_size =
@@ -185,9 +133,6 @@ struct CachedSection {
 };
 
 class ObjectFileInfo {
-  template <class ELFT>
-  void disassemble(Disassembler& disas,
-                   const llvm::object::ELFObjectFile<ELFT>& elf_obj);
   template <class ELFT>
   void scan_elf(const llvm::object::ELFObjectFile<ELFT>& elf_obj);
   template <class ELFT>
@@ -219,8 +164,6 @@ class ObjectFileInfo {
   }
 
   llvm::StringRef processor;
-  bool sram_ecc_supported = false;
-  bool xnack_supported = false;
   // Addresses here are ELF vaddrs throughout: the trace decoder resolves a
   // hardware PC to {code object, vaddr} before the tool sees it, so nothing
   // downstream needs the object's runtime load address.
@@ -231,8 +174,6 @@ class ObjectFileInfo {
   std::unique_ptr<llvm::object::ObjectFile> object_file;
   // Owned by the Disassembler's cache, keyed on this object's ISA.
   const SubTargetContext* sub_target_ctx = nullptr;
-
-  SymbolIndex symbol_index;
 };
 
 class Disassembler {
@@ -258,11 +199,6 @@ class Disassembler {
       const rocprofiler_callback_tracing_code_object_load_data_t& load_data) {
     return object_files.try_emplace(load_data.code_object_id, *this, load_data)
         .second;
-  }
-  bool registerSymbol(
-      const rocprofiler_callback_tracing_code_object_kernel_symbol_register_data_t&
-          symbol_register) {
-    return false;
   }
   ObjectFileInfo& get_object_file_by_id(uint64_t id) {
     auto iter = object_files.find(id);
