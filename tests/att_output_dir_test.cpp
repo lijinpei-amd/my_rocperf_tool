@@ -181,6 +181,22 @@ TEST_F(AttOutputDirTest, KeepsMissingTraceAndReportsItOnRead) {
                         std::errc::no_such_file_or_directory));
 }
 
+// The Disassembler reports why it cannot load the code object; dropping it
+// here would instead leave the traces that need it to fail on a missing id.
+TEST_F(AttOutputDirTest, KeepsMissingCodeObject) {
+  touch("run_gfx942_code_object_id_1.out");
+  fs::create_symlink(root_ / "gone.out",
+                     root_ / "run_gfx942_code_object_id_2.out");
+
+  auto dir = AttOutputDir::scan(root_.string());
+  ASSERT_TRUE(static_cast<bool>(dir)) << llvm::toString(dir.takeError());
+  EXPECT_EQ(sorted_code_objects(*dir),
+            (std::vector<CodeObjectFields>{
+                {path("run_gfx942_code_object_id_1.out"), "run", "gfx942", 1},
+                {path("run_gfx942_code_object_id_2.out"), "run", "gfx942", 2},
+            }));
+}
+
 TEST_F(AttOutputDirTest, ScanReportsMissingRoot) {
   auto dir = AttOutputDir::scan(path("missing"));
   ASSERT_FALSE(static_cast<bool>(dir));

@@ -2,30 +2,28 @@
 
 #include "rocprofiler-sdk/callback_tracing.h"
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseMapInfo.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/StringRef.h"
-#include "llvm/MC/MCAsmInfo.h"
-#include "llvm/MC/MCContext.h"
-#include "llvm/MC/MCDisassembler/MCDisassembler.h"
-#include "llvm/MC/MCInst.h"
-#include "llvm/MC/MCInstrInfo.h"
-#include "llvm/MC/MCRegisterInfo.h"
-#include "llvm/MC/MCStreamer.h"
-#include "llvm/MC/MCSubtargetInfo.h"
 #include "llvm/MC/MCTargetOptions.h"
-#include "llvm/MC/TargetRegistry.h"
-#include "llvm/Object/ELFObjectFile.h"
-#include "llvm/Object/ELFTypes.h"
-#include "llvm/Object/ObjectFile.h"
-#include "llvm/Support/MemoryBuffer.h"
-#include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/Error.h"
+#include "llvm/TargetParser/Triple.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
+
+namespace llvm {
+class MCAsmInfo;
+class MCRegisterInfo;
+class MemoryBuffer;
+class Target;
+}  // namespace llvm
 
 namespace my_rocperf_tool {
 
@@ -78,118 +76,134 @@ struct DenseMapInfo<my_rocperf_tool::SubTargetKey> {
 namespace my_rocperf_tool {
 
 class Disassembler;
+class SubTargetContext;
 
-// The MC objects that vary with the ISA -- everything downstream of one
-// (mcpu, features) pair. Code objects sharing an ISA share one of these; the
-// owning Disassembler caches them by SubTargetKey, so the whole stack is built
-// once per gfx target rather than once per loaded executable.
+// What the analyses need to know about an instruction. The rules match LLVM
+// AMDGPU opcode names, so an LLVM bump that renames opcodes is fixed where
+// they are defined, in disassembler.cpp.
+enum class InstKind : uint8_t {
+  Other,
+  // Opcode name starts with V_MFMA: every v_mfma_*, v_mfma_ld_scale_b32
+  // included, but not the sparse v_smfmac_* family.
+  Mfma,
+  // The classic s_barrier, not gfx12's split s_barrier_signal /
+  // s_barrier_wait family.
+  ClassicBarrier,
+};
+
+// One loaded code object, answering questions about the instruction at an
+// ELF vaddr. Addresses here are ELF vaddrs throughout: the trace decoder
+// resolves a hardware PC to {code object, vaddr} before the tool sees it, so
+// nothing downstream needs the object's runtime load address.
 //
-// Not thread-safe: print_inst writes a shared scratch buffer and the MC
-// disassembler carries per-call state. That is fine as used, because each
-// worker thread owns a Disassembler and therefore its own contexts.
-class SubTargetContext {
+// The per-vaddr queries take the vaddr of an instruction's first byte in one
+// of the object's .text sections, and assert otherwise. A section is decoded
+// whole on its first query, after which a query costs a section bounds check
+// and a slot index. Not thread-safe; see Disassembler.
+class ObjectFileInfo {
  public:
-  SubTargetContext(const Disassembler& disas, llvm::StringRef mcpu,
-                   llvm::StringRef features);
+  ObjectFileInfo(ObjectFileInfo&&);
+  ~ObjectFileInfo();
 
-  const llvm::MCSubtargetInfo& get_sub_target_info() const {
-    return *sub_target;
-  }
-  const llvm::MCDisassembler& get_mc_disassembler() const {
-    return *mc_dis_asm;
-  }
-  const llvm::MCInstrInfo& get_instr_info() const { return *mc_instr_info; }
+  // Encoded size in bytes: 4, or more for an instruction that carries a
+  // literal or a 64-bit encoding.
+  uint32_t size_at(uint64_t vaddr) const;
+  InstKind kind_at(uint64_t vaddr) const;
+  // The instruction as LLVM prints it, trimmed. The trace decoder classifies
+  // instructions by this text, so its exact bytes are part of the contract.
+  std::string text_at(uint64_t vaddr) const;
+  // The same text, copied into `buf` only if it fits. Returns its length
+  // either way, so a caller can grow its buffer and ask again without a heap
+  // allocation per instruction.
+  size_t copy_text_at(uint64_t vaddr, llvm::MutableArrayRef<char> buf) const;
 
-  // Renders one instruction to text, trimmed. The result points into a scratch
-  // buffer that the next call overwrites -- copy it to keep it longer.
-  llvm::StringRef print_inst(const llvm::MCInst& inst) const;
+  // The vaddrs of the instructions starting in [first, last], in order,
+  // walking from the one at `first`. Empty unless a single .text section
+  // holds both ends.
+  std::vector<uint64_t> inst_vaddrs(uint64_t first, uint64_t last) const;
 
  private:
-  // Declaration order is lifetime order. The streamer holds a
-  // formatted_raw_ostream over inst_stream, an inst printer and code emitter
-  // over mc_instr_info/mc_ctx, and an asm backend over sub_target, so it must
-  // be destroyed before any of them.
-  mutable std::string inst_str;
-  std::unique_ptr<llvm::raw_string_ostream> inst_stream;
-  std::unique_ptr<llvm::MCSubtargetInfo> sub_target;
-  std::unique_ptr<llvm::MCInstrInfo> mc_instr_info;
-  std::unique_ptr<llvm::MCContext> mc_ctx;
-  std::unique_ptr<llvm::MCDisassembler> mc_dis_asm;
-  std::unique_ptr<llvm::MCStreamer> streamer;
-};
+  friend class Disassembler;
+  // One decoded instruction, or the continuation of a multi-dword one.
+  struct Slot;
+  // A .text section and, once decoded, its slots by dword.
+  struct Section;
 
-struct DecodedSlot {
-  llvm::MCInst inst;
-  uint32_t inst_size =
-      0;  // 0 = continuation of previous multi-dword instruction
-};
+  ObjectFileInfo(std::unique_ptr<llvm::MemoryBuffer> buffer,
+                 std::vector<Section> sections,
+                 const SubTargetContext& sub_target_ctx);
+  // Fails with "<buffer name>: <reason>": not an ELF file, not AMDGPU, or an
+  // ISA (e_flags machine) missing from comgr-isa-metadata.def.
+  static llvm::Expected<ObjectFileInfo> load(
+      Disassembler& disas, std::unique_ptr<llvm::MemoryBuffer> buffer);
 
-struct CachedSection {
-  uint64_t start_addr;
-  uint64_t byte_size;
-  uint64_t file_offset;
-  bool is_decoded = false;
-  std::vector<DecodedSlot> slots;
-};
-
-class ObjectFileInfo {
-  template <class ELFT>
-  void scan_elf(const llvm::object::ELFObjectFile<ELFT>& elf_obj);
-  template <class ELFT>
-  void scan_section(const typename ELFT::Shdr& section,
-                    const llvm::object::ELFFile<ELFT>& elf_file);
-
-  void initialize_mc(Disassembler& disas);
-  void ensure_section_decoded(CachedSection& sec) const;
-  mutable std::vector<CachedSection> inst_cache;
-  mutable CachedSection* hot_section = nullptr;
-
- public:
-  ObjectFileInfo(
-      Disassembler& disas,
-      const rocprofiler_callback_tracing_code_object_load_data_t& load_data);
-  ObjectFileInfo(Disassembler& disas, const std::string& file_path);
-  void init_elf(Disassembler& disas);
-  const llvm::MCInst& decode_at(uint64_t addr, uint64_t& inst_size) const;
+  Section* find_section(uint64_t vaddr) const;
+  void ensure_section_decoded(Section& sec) const;
   void decode_all_sections() const;
+  // The decoded instruction at vaddr, found through hot_section.
+  const Slot& slot_at(uint64_t vaddr) const;
 
-  const SubTargetContext& get_sub_target_context() const {
-    return *sub_target_ctx;
-  }
-  const llvm::MCInstrInfo& get_instr_info() const {
-    return sub_target_ctx->get_instr_info();
-  }
-  llvm::StringRef print_inst(const llvm::MCInst& inst) const {
-    return sub_target_ctx->print_inst(inst);
-  }
-
-  llvm::StringRef processor;
-  // Addresses here are ELF vaddrs throughout: the trace decoder resolves a
-  // hardware PC to {code object, vaddr} before the tool sees it, so nothing
-  // downstream needs the object's runtime load address.
-  uint64_t text_sec_offset;
-  uint64_t text_sec_address;
-  uint64_t text_sec_size;
-  std::unique_ptr<llvm::MemoryBuffer> memory_buffer;
-  std::unique_ptr<llvm::object::ObjectFile> object_file;
+  std::unique_ptr<llvm::MemoryBuffer> buffer;
+  // Sorted by vaddr. Decoding fills them through the const queries.
+  mutable std::vector<Section> sections;
+  // The section the last query hit. It points into the vector's heap block,
+  // so it survives a move of this object.
+  mutable Section* hot_section = nullptr;
   // Owned by the Disassembler's cache, keyed on this object's ISA.
-  const SubTargetContext* sub_target_ctx = nullptr;
+  const SubTargetContext* sub_target_ctx;
 };
 
 // Owns the code objects of one run and the MC stacks that decode them. Needs no
 // setup: the first construction in the process registers the AMDGPU target
 // with LLVM.
 //
-// Not thread-safe; give each thread its own Disassembler. Decoding fills
-// caches even through a const ObjectFileInfo (decode_at), and the MC stack
-// keeps per-call state (see SubTargetContext).
+// Not thread-safe; give each thread its own Disassembler. Every query fills
+// caches, even through a const ObjectFileInfo, and the MC stack keeps per-call
+// state.
 //
 // Never relocated, hence neither copyable nor movable: every SubTargetContext's
 // MCContext holds a pointer to mc_options, which a move would leave dangling.
 // Construct it where it will stay, e.g. behind a unique_ptr or in place in a
 // node-based map.
 class Disassembler {
-  llvm::DenseMap<uint64_t, ObjectFileInfo> object_files;
+ public:
+  Disassembler();
+  ~Disassembler();
+  Disassembler(const Disassembler&) = delete;
+  Disassembler& operator=(const Disassembler&) = delete;
+
+  // Loads a code object, from a file or a live load record, under `id`. Fails
+  // with "<path or uri>: <reason>" if it cannot be read, is not an AMDGPU ELF
+  // object, or has an ISA missing from comgr-isa-metadata.def; `id` then
+  // stays unknown. An id already present keeps its code object, and the new
+  // one is not read.
+  llvm::Error add_code_object(uint64_t id, const std::string& file_path);
+  llvm::Error add_code_object(
+      const rocprofiler_callback_tracing_code_object_load_data_t& load_data);
+
+  // Null if no code object was loaded under `id`. The pointer stays valid for
+  // the lifetime of this Disassembler.
+  const ObjectFileInfo* find_code_object(uint64_t id) const;
+
+  // Decodes every .text section of every code object now instead of on its
+  // first query.
+  void decode_all() const;
+
+ private:
+  friend class ObjectFileInfo;
+  friend class SubTargetContext;
+
+  llvm::Error add_buffer(uint64_t id,
+                         std::unique_ptr<llvm::MemoryBuffer> buffer);
+  // Returns the cached MC stack for this ISA, building it on first request.
+  // The reference stays valid for the lifetime of this Disassembler.
+  const SubTargetContext& get_sub_target_context(llvm::StringRef mcpu,
+                                                 llvm::StringRef features);
+
+  // Node-based, so find_code_object's pointers survive later additions. Ids
+  // come from the trace, so any value must be a safe lookup -- which rules out
+  // DenseMap, whose reserved keys a corrupt trace could name.
+  std::unordered_map<uint64_t, ObjectFileInfo> object_files;
   llvm::DenseMap<SubTargetKey, std::unique_ptr<SubTargetContext>>
       sub_target_contexts;
   llvm::Triple triple;
@@ -200,36 +214,6 @@ class Disassembler {
   llvm::MCTargetOptions mc_options;
   std::unique_ptr<llvm::MCRegisterInfo> mc_reg_info;
   std::unique_ptr<llvm::MCAsmInfo> mc_asm_info;
-
- public:
-  Disassembler();
-  Disassembler(const Disassembler&) = delete;
-  Disassembler& operator=(const Disassembler&) = delete;
-  // Returns the cached MC stack for this ISA, building it on first request.
-  // The reference stays valid for the lifetime of this Disassembler.
-  const SubTargetContext& get_sub_target_context(llvm::StringRef mcpu,
-                                                 llvm::StringRef features);
-  bool addCodeObject(uint64_t id, const std::string& file_path) {
-    return object_files.try_emplace(id, *this, file_path).second;
-  }
-  bool addCodeObject(
-      const rocprofiler_callback_tracing_code_object_load_data_t& load_data) {
-    return object_files.try_emplace(load_data.code_object_id, *this, load_data)
-        .second;
-  }
-  ObjectFileInfo& get_object_file_by_id(uint64_t id) {
-    auto iter = object_files.find(id);
-    assert(iter != object_files.end());
-    return iter->second;
-  }
-  const llvm::DenseMap<uint64_t, ObjectFileInfo>& get_object_files() const {
-    return object_files;
-  }
-  const llvm::Triple& getTriple() const { return triple; }
-  const llvm::Target* getTarget() const { return target; }
-  const llvm::MCTargetOptions& getMCOptions() const { return mc_options; }
-  const llvm::MCRegisterInfo& getMCRegisterInfo() const { return *mc_reg_info; }
-  const llvm::MCAsmInfo& getMCAsmInfo() const { return *mc_asm_info; }
 };
 
 }  // namespace my_rocperf_tool

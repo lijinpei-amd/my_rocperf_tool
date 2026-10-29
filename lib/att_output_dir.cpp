@@ -70,21 +70,20 @@ llvm::Expected<AttOutputDir> AttOutputDir::scan(const std::string& path) {
         continue;
       }
       // Follows symlinks, so type_ec is set when the target cannot be stat'ed.
-      const bool regular = dir_ent.is_regular_file(type_ec);
+      // Such a file (a dangling symlink, say) is kept: reading it reports why,
+      // where skipping it here would silently shrink the capture.
+      const bool keep = dir_ent.is_regular_file(type_ec) || type_ec;
       auto filename = dir_ent.path().filename().string();
       std::smatch mat;
       if (std::regex_match(filename, mat, code_object_re)) {
-        if (!regular) continue;
+        if (!keep) continue;
         std::string prefix = run_prefix(dir, mat[1]);
         std::string arch = mat[2];
         auto id = parse_string<uint64_t>(mat[3]);
         out_dir.code_objects.push_back(CodeObjectPath{
             dir_ent.path().string(), std::move(prefix), arch, id});
       } else if (std::regex_match(filename, mat, att_re)) {
-        // A trace whose target cannot be stat'ed (a dangling symlink, say) is
-        // kept: reading it reports why, where skipping it here would silently
-        // shrink the capture.
-        if (!regular && !type_ec) continue;
+        if (!keep) continue;
         std::string prefix = run_prefix(dir, mat[1]);
         auto agent_id = parse_string<uint64_t>(mat[2]);
         auto se_id = parse_string<uint64_t>(mat[3]);

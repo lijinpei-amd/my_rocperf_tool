@@ -8,6 +8,9 @@
 #include "rocprofiler-sdk/fwd.h"
 #include "rocprofiler-sdk/registration.h"
 
+#include "llvm/Support/Error.h"
+#include "llvm/Support/raw_ostream.h"
+
 #include <memory>
 #include <optional>
 #include <utility>
@@ -44,7 +47,11 @@ void RocPerfTool::code_object_tracing_callback(
     auto* data =
         static_cast<rocprofiler_callback_tracing_code_object_load_data_t*>(
             record.payload);
-    disassembler->addCodeObject(*data);
+    // Only reported: a code object the tool cannot load must not take the
+    // profiled process down with it.
+    if (auto err = disassembler->add_code_object(*data))
+      llvm::logAllUnhandledErrors(std::move(err), llvm::errs(),
+                                  "my_rocperf_tool: ");
   }
 }
 }  // namespace my_rocperf_tool

@@ -12,8 +12,6 @@
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/StringRef.h"
-#include "llvm/MC/MCInst.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/MemoryBuffer.h"
 
@@ -27,12 +25,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
-#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -232,9 +230,9 @@ struct trace_decoder_context {
   // DurationCheck::Error the trace is reported by these instead of its output.
   uint64_t bad_duration_records = 0;
   rocprofiler_thread_trace_decoder_inst_t first_bad_duration{};
+  // The first code object id the decoder asked about that the run lacks.
+  std::optional<uint64_t> unknown_code_object_id;
   std::vector<my_rocperf_tool::WaveLoopInfo> wave_loops;
-  llvm::DenseMap<rocprofiler_thread_trace_decoder_pc_t, bool> mfma_cache;
-  llvm::DenseMap<rocprofiler_thread_trace_decoder_pc_t, bool> is_barrier_cache;
   PerLoopMap bubble_totals;
   PerLoopMap rel_issue_totals;
 
@@ -274,25 +272,31 @@ rocprofiler_thread_trace_decoder_status_t att_decoder_isa_callback(
     rocprofiler_thread_trace_decoder_pc_t pc, void* userdata) {
   assert(pc.code_object_id != 0);
   auto& ctx = *reinterpret_cast<trace_decoder_context*>(userdata);
-  auto& obj_file = ctx.disas.get_object_file_by_id(pc.code_object_id);
-  uint64_t inst_size;
-  auto mc_inst = obj_file.decode_at(pc.address, inst_size);
-  llvm::StringRef inst_ref = obj_file.print_inst(mc_inst);
-  auto str_size = inst_ref.size();
-  if (*isa_size < str_size) {
-    *isa_size = str_size;
+  const auto* obj = ctx.disas.find_code_object(pc.code_object_id);
+  if (!obj) {
+    // The decoder takes an error as "cannot stitch this PC" and decodes on,
+    // so run_trace fails the trace once the decode returns.
+    if (!ctx.unknown_code_object_id)
+      ctx.unknown_code_object_id = pc.code_object_id;
+    return ROCPROFILER_THREAD_TRACE_DECODER_STATUS_ERROR_INVALID_ARGUMENT;
+  }
+  size_t text_size = obj->copy_text_at(
+      pc.address, llvm::MutableArrayRef<char>(isa_instruction, *isa_size));
+  if (*isa_size < text_size) {
+    *isa_size = text_size;
     return ROCPROFILER_THREAD_TRACE_DECODER_STATUS_ERROR_OUT_OF_RESOURCES;
   }
-  memcpy(isa_instruction, inst_ref.data(), str_size);
-  *isa_size = str_size;
-  *isa_memory_size = inst_size;
+  *isa_size = text_size;
+  *isa_memory_size = obj->size_at(pc.address);
   return ROCPROFILER_THREAD_TRACE_DECODER_STATUS_SUCCESS;
 }
 
 void analyze_mfma_coexec(trace_decoder_context& ctx,
                          const rocprofiler_thread_trace_decoder_wave_t& wave,
                          const my_rocperf_tool::BackEdge& edge) {
-  auto& obj = ctx.disas.get_object_file_by_id(edge.code_object_id);
+  const auto* obj = ctx.disas.find_code_object(edge.code_object_id);
+  // Nothing is known about the loop's instructions, so no bubble either.
+  if (!obj) return;
   int64_t mfma_shadow_end = 0;
 
   for (size_t i = 0; i < wave.instructions_size; i++) {
@@ -303,17 +307,7 @@ void analyze_mfma_coexec(trace_decoder_context& ctx,
         inst.pc.address > edge.source_addr)
       continue;
 
-    // Check if this instruction is MFMA (cached per PC).
-    auto [cache_it, inserted] = ctx.mfma_cache.try_emplace(inst.pc, false);
-    if (inserted) {
-      uint64_t inst_size;
-      auto mc_inst = obj.decode_at(inst.pc.address, inst_size);
-      cache_it->second = obj.get_instr_info()
-                             .getName(mc_inst.getOpcode())
-                             .starts_with("V_MFMA");
-    }
-
-    if (cache_it->second) {
+    if (obj->kind_at(inst.pc.address) == my_rocperf_tool::InstKind::Mfma) {
       // MFMA is productive work — update shadow, don't count as bubble.
       int64_t issue_point = inst.time + inst.stall;
       // Verify no two MFMAs issue within each other's shadow. An overlap of
@@ -369,26 +363,13 @@ void compute_relative_issue(trace_decoder_context& ctx,
   }
 }
 
-bool is_s_barrier_pc(trace_decoder_context& ctx,
+// A PC in a code object the run lacks is not one: the decoder, unable to
+// read the instruction, cannot have taken it for a barrier either.
+bool is_s_barrier_pc(const trace_decoder_context& ctx,
                      const rocprofiler_thread_trace_decoder_pc_t& pc) {
-  auto [it, inserted] = ctx.is_barrier_cache.try_emplace(pc, false);
-  if (inserted) {
-    auto& obj = ctx.disas.get_object_file_by_id(pc.code_object_id);
-    uint64_t inst_size;
-    auto mc_inst = obj.decode_at(pc.address, inst_size);
-    auto name = obj.get_instr_info().getName(mc_inst.getOpcode());
-    // LLVM AMDGPU decorates opcode names with a lowercase subtarget tag
-    // ("S_BARRIER_vi", "S_BARRIER_gfx10", ...). The gfx12 split-barrier
-    // family is distinct: S_BARRIER_WAIT_*, S_BARRIER_SIGNAL_*, etc. — an
-    // uppercase mnemonic word follows S_BARRIER_. Match the classic
-    // s_barrier across subtargets without catching the split family.
-    constexpr llvm::StringRef kPrefix = "S_BARRIER_";
-    it->second =
-        name == "S_BARRIER" ||
-        (name.starts_with(kPrefix) && name.size() > kPrefix.size() &&
-         std::islower(static_cast<unsigned char>(name[kPrefix.size()])));
-  }
-  return it->second;
+  const auto* obj = ctx.disas.find_code_object(pc.code_object_id);
+  return obj &&
+         obj->kind_at(pc.address) == my_rocperf_tool::InstKind::ClassicBarrier;
 }
 
 // gfx9-style `s_barrier` is the only known instruction whose execution lands
@@ -506,6 +487,7 @@ rocprofiler_thread_trace_decoder_status_t att_decoder_trace_callback(
 struct LoopInstInfo {
   uint64_t addr;
   std::string inst_str;
+  my_rocperf_tool::InstKind kind;
   size_t n;
   uint64_t dur, stall, idle, issue;
   uint64_t bubble;
@@ -524,32 +506,15 @@ std::vector<LoopInstInfo> collect_loop_insts(
   const auto& rel_issues =
       ri != all_rel_issues.end() ? ri->second : empty_pc_map;
   std::vector<LoopInstInfo> result;
-  auto& obj = disas.get_object_file_by_id(edge.code_object_id);
-  uint64_t start_offset = edge.target_addr - obj.text_sec_address;
-  uint64_t end_offset = edge.source_addr - obj.text_sec_address;
-  if (start_offset >= obj.text_sec_size || end_offset >= obj.text_sec_size)
-    return result;
-
-  auto buffer = obj.memory_buffer->getBuffer();
-  auto section_buffer =
-      buffer.drop_front(obj.text_sec_offset).take_front(obj.text_sec_size);
-  auto block_buffer = section_buffer.drop_front(start_offset);
-  llvm::ArrayRef<unsigned char> bytes{block_buffer.bytes_begin(),
-                                      block_buffer.size()};
-
-  uint64_t sec_offset = start_offset;
-
-  while (sec_offset <= end_offset && !bytes.empty()) {
-    uint64_t inst_size;
-    auto mc_inst = obj.decode_at(sec_offset + obj.text_sec_address, inst_size);
-    std::string inst_str = obj.print_inst(mc_inst).str();
-
-    uint64_t addr = sec_offset + obj.text_sec_address;
+  const auto* obj = disas.find_code_object(edge.code_object_id);
+  if (!obj) return result;
+  for (uint64_t addr : obj->inst_vaddrs(edge.target_addr, edge.source_addr)) {
     rocprofiler_thread_trace_decoder_pc_t pc{addr, edge.code_object_id};
     auto stats_range = stats.get_inst_at(pc);
 
-    LoopInstInfo info{addr, std::move(inst_str), 0, 0, 0, 0, 0, 0,
-                      0,    !stats_range.empty()};
+    LoopInstInfo info{
+        addr, obj->text_at(addr),  obj->kind_at(addr), 0, 0, 0, 0, 0, 0,
+        0,    !stats_range.empty()};
     if (info.has_stats) {
       for (const auto& s : stats_range) {
         info.dur += s.duration;
@@ -565,9 +530,6 @@ std::vector<LoopInstInfo> collect_loop_insts(
       if (ri_it != rel_issues.end()) info.rel_issue = ri_it->second;
     }
     result.push_back(std::move(info));
-
-    sec_offset += inst_size;
-    bytes = bytes.drop_front(inst_size);
   }
   return result;
 }
@@ -653,7 +615,7 @@ LoopSummary compute_loop_summary(const my_rocperf_tool::LoopStats& s,
   for (const auto& ii : insts) {
     total_bubble += ii.bubble;
     if (ii.has_stats && ii.n > total_n) total_n = ii.n;
-    if (llvm::StringRef(ii.inst_str).starts_with("v_mfma")) sum.mfma_count++;
+    if (ii.kind == my_rocperf_tool::InstKind::Mfma) sum.mfma_count++;
   }
   if (s.iteration_count > 0) {
     sum.avg_dur = static_cast<double>(s.total_duration) / s.iteration_count;
@@ -1119,6 +1081,8 @@ struct TraceSummary {
   enum class Failure {
     None,
     Unreadable,          // the .att could not be read
+    CodeObjectLoad,      // a code object of its run could not be loaded
+    UnknownCodeObject,   // it names a code object its run lacks
     DurationBelowStall,  // rejected by --verify_trace_duration=error
   };
   Failure failure = Failure::None;
@@ -1132,10 +1096,11 @@ struct TraceSummary {
   uint64_t loops = 0;           // detected loops summed over those waves
 };
 
+// `disas` is null when a code object of the trace's run failed to load.
 void run_trace(TraceBuf& out, TraceSummary& summary,
                const my_rocperf_tool::AttOutputDir& out_dir,
                const my_rocperf_tool::AttPath& att_path,
-               my_rocperf_tool::Disassembler& disas,
+               my_rocperf_tool::Disassembler* disas,
                const LoopOutputConfig& cfg, DurationCheck duration_check,
                std::optional<uint64_t> dispatch_id_override) {
   // Keyed before the read, so an unreadable trace still names the dispatch
@@ -1143,7 +1108,12 @@ void run_trace(TraceBuf& out, TraceSummary& summary,
   summary.prefix = att_path.prefix;
   summary.dispatch_id = dispatch_id_override.value_or(att_path.dispatch_id);
   summary.se_id = att_path.se_id;
-  trace_decoder_context decoder_ctx(disas);
+  if (!disas) {
+    // Its run's load errors are already reported; the trace itself is not.
+    summary.failure = TraceSummary::Failure::CodeObjectLoad;
+    return;
+  }
+  trace_decoder_context decoder_ctx(*disas);
   {
     PHASE_TIMER("trace setup + I/O");
     auto att_data = out_dir.read_att_data(att_path);
@@ -1168,6 +1138,17 @@ void run_trace(TraceBuf& out, TraceSummary& summary,
     auto parse_res = rocprof_trace_decoder_parse_data(
         att_decoder_se_data_callback, att_decoder_trace_callback,
         att_decoder_isa_callback, &decoder_ctx);
+    // Checked first: the decoder survives an ISA callback error and still
+    // returns success, but the waves it delivered are partly unattributed.
+    // Fails like an unreadable trace.
+    if (decoder_ctx.unknown_code_object_id) {
+      fmt::print(stderr,
+                 "error: {}: names code object id {}, which its run does not "
+                 "have\n",
+                 att_path.path, *decoder_ctx.unknown_code_object_id);
+      summary.failure = TraceSummary::Failure::UnknownCodeObject;
+      return;
+    }
     assert(parse_res == ROCPROFILER_THREAD_TRACE_DECODER_STATUS_SUCCESS);
   }
 
@@ -1187,8 +1168,7 @@ void run_trace(TraceBuf& out, TraceSummary& summary,
 
   if (absl::GetFlag(FLAGS_decode_all_insts)) {
     PHASE_TIMER("decode_all_insts");
-    for (const auto& [obj_id, obj] : decoder_ctx.disas.get_object_files())
-      obj.decode_all_sections();
+    decoder_ctx.disas.decode_all();
   }
 
   {
@@ -1293,16 +1273,38 @@ int run_main(const std::string& att_output_dir_path,
   // and holding only that run's code objects. A Disassembler cannot move (each
   // of its MCContexts points at its MC options), so it is built in place by
   // try_emplace in a node-based map, which never relocates its values.
-  using DisasByPrefix = std::map<std::string, my_rocperf_tool::Disassembler>;
-  auto disas_for = [&](DisasByPrefix& by_prefix,
-                       const std::string& prefix) -> auto& {
+  struct RunDisassembler {
+    my_rocperf_tool::Disassembler disas;
+    // A code object of the run failed to load, which fails all its traces:
+    // their PCs may land in it.
+    bool load_failed = false;
+  };
+  using DisasByPrefix = std::map<std::string, RunDisassembler>;
+  // Every worker loads a run's code objects for itself and meets the same
+  // errors, so only the first to fail reports them.
+  std::map<std::string, std::once_flag> load_errors_reported;
+  for (const auto& prefix : trace_prefixes)
+    load_errors_reported.try_emplace(prefix);
+  // Null if the run's code objects did not all load.
+  auto disas_for =
+      [&](DisasByPrefix& by_prefix,
+          const std::string& prefix) -> my_rocperf_tool::Disassembler* {
     auto [it, inserted] = by_prefix.try_emplace(prefix);
+    auto& run = it->second;
     if (inserted) {
-      for (const auto& obj_file : out_dir.code_objects)
-        if (obj_file.prefix == prefix)
-          it->second.addCodeObject(obj_file.id, obj_file.path);
+      TraceBuf errors;
+      for (const auto& obj_file : out_dir.code_objects) {
+        if (obj_file.prefix != prefix) continue;
+        if (auto err = run.disas.add_code_object(obj_file.id, obj_file.path))
+          writef(errors, "error: {}\n", llvm::toString(std::move(err)));
+      }
+      run.load_failed = errors.size() != 0;
+      if (run.load_failed)
+        std::call_once(load_errors_reported.at(prefix), [&] {
+          std::fwrite(errors.data(), 1, errors.size(), stderr);
+        });
     }
-    return it->second;
+    return run.load_failed ? nullptr : &run.disas;
   };
 
   // Per-trace output buffers. Indexed in (prefix, dispatch_id) order; workers
@@ -1321,7 +1323,9 @@ int run_main(const std::string& att_output_dir_path,
     run_trace(chunks[i], summaries[i], out_dir, att_path,
               disas_for(by_prefix, att_path.prefix), cfg, duration_check,
               dispatch_id_override);
-    return summaries[i].failure != TraceSummary::Failure::Unreadable;
+    const auto failure = summaries[i].failure;
+    return failure != TraceSummary::Failure::Unreadable &&
+           failure != TraceSummary::Failure::CodeObjectLoad;
   };
 
   // Always process traces serially until one has been decoded. Two reasons:
@@ -1330,8 +1334,9 @@ int run_main(const std::string& att_output_dir_path,
   //    first call, guarded only by a non-atomic bool. Concurrent first
   //    calls race on its std::unordered_map writes — UB. After the first
   //    call returns, std::thread construction publishes those writes to
-  //    workers, which then only read. An unreadable trace never makes that
-  //    call, hence "until one has been decoded" rather than just trace[0].
+  //    workers, which then only read. A trace that is unreadable, or whose
+  //    run's code objects did not all load, never makes that call, hence
+  //    "until one has been decoded" rather than just trace[0].
   // 2. The serial Disassembler then becomes the main thread's worker, so
   //    no per-worker setup work is wasted.
   DisasByPrefix main_disas;
@@ -1397,6 +1402,7 @@ int run_main(const std::string& att_output_dir_path,
     uint64_t tot_filtered = 0;
     uint64_t no_wave_traces = 0, filtered_only_traces = 0;
     uint64_t unreadable_traces = 0, rejected_traces = 0;
+    uint64_t code_object_load_traces = 0, unknown_code_object_traces = 0;
     // A dispatch is loop-free only if some SE decoded waves, none found a
     // loop, and no SE failed; per-SE slots would otherwise report the same
     // dispatch repeatedly, including dispatches whose loops all landed in
@@ -1416,6 +1422,10 @@ int run_main(const std::string& att_output_dir_path,
       if (s.failure != TraceSummary::Failure::None) {
         if (s.failure == TraceSummary::Failure::Unreadable)
           unreadable_traces++;
+        else if (s.failure == TraceSummary::Failure::CodeObjectLoad)
+          code_object_load_traces++;
+        else if (s.failure == TraceSummary::Failure::UnknownCodeObject)
+          unknown_code_object_traces++;
         else
           rejected_traces++;
         d.failed = true;
@@ -1435,7 +1445,9 @@ int run_main(const std::string& att_output_dir_path,
       d.waves += s.waves;
       d.loops += s.loops;
     }
-    const uint64_t n_reported = n_traces - unreadable_traces - rejected_traces;
+    const uint64_t failed_traces = unreadable_traces + code_object_load_traces +
+                                   unknown_code_object_traces + rejected_traces;
+    const uint64_t n_reported = n_traces - failed_traces;
 
     const bool detect = absl::GetFlag(FLAGS_detect_loops);
     if (detect)
@@ -1451,6 +1463,16 @@ int run_main(const std::string& att_output_dir_path,
     if (unreadable_traces)
       fmt::print(stderr, "[summary] {} of {} trace(s) could not be read\n",
                  unreadable_traces, n_traces);
+    if (code_object_load_traces)
+      fmt::print(stderr,
+                 "[summary] {} of {} trace(s) not decoded: a code object of "
+                 "their run could not be loaded\n",
+                 code_object_load_traces, n_traces);
+    if (unknown_code_object_traces)
+      fmt::print(stderr,
+                 "[summary] {} of {} trace(s) name a code object their run "
+                 "does not have\n",
+                 unknown_code_object_traces, n_traces);
     if (rejected_traces)
       fmt::print(stderr,
                  "[summary] {} of {} trace(s) rejected by "
@@ -1510,7 +1532,7 @@ int run_main(const std::string& att_output_dir_path,
     }
     // Each failed trace was reported as it failed; the exit status keeps a
     // script from taking the partial result for the whole capture.
-    if (unreadable_traces || rejected_traces) return 1;
+    if (failed_traces) return 1;
   }
   return 0;
 }

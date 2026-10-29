@@ -2,9 +2,9 @@
 # rocprofiler-sdk runtime (and its libamd_comgr -> libLLVM.so.23 chain) so the
 # offline CLI can link a single LLVM. disassembler.h takes the SDK's
 # code-object load record (rocprofiler_callback_tracing_code_object_load_data_t)
-# in the live-tracing addCodeObject() / ObjectFileInfo overloads, and
-# disassembler.cpp reads its fields, but nothing here calls a rocprofiler-sdk
-# function, so headers-only linkage suffices.
+# in the live-tracing add_code_object() overload, and disassembler.cpp reads its
+# fields, but nothing here calls a rocprofiler-sdk function, so headers-only
+# linkage suffices.
 add_library(my_rocperf_tool SHARED
     att_output_dir.cpp
     disassembler.cpp
