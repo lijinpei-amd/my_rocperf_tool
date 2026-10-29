@@ -883,7 +883,9 @@ void dump_csv_loop_rows(TraceBuf& out, const LoopOutputConfig& cfg,
           writef(out, ",{:.2f}", static_cast<double>(ii.bubble) / ii.n);
         writef(out, ",{:.2f}", static_cast<double>(ii.rel_issue) / ii.n);
       } else {
-        writef(out, ",,,,");
+        // Same shape as the branch above with every field empty, so the row
+        // keeps the header's column count.
+        writef(out, ",,,");
         if (cfg.show_mfma_coexec) writef(out, ",");
         writef(out, ",");
       }
