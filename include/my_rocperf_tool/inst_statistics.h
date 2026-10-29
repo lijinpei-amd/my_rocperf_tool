@@ -62,8 +62,5 @@ class InstStatistics {
     return iter->second;
   }
   size_t size() const { return insts.size(); }
-  const llvm::DenseMap<pc_t, std::vector<Inst>>& getInsts() const {
-    return insts;
-  }
 };
 }  // namespace my_rocperf_tool

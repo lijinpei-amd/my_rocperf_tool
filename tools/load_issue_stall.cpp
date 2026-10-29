@@ -119,8 +119,12 @@ ABSL_FLAG(bool, aggregate_wave, false,
           "show loop statistics aggregated across waves");
 ABSL_FLAG(bool, aggregate_wave_only, false,
           "show only loop statistics aggregated across waves");
-ABSL_FLAG(bool, verify_trace_duration, false,
-          "verify duration >= stall for each trace record");
+ABSL_FLAG(std::string, verify_trace_duration, "error",
+          "check that each trace record's duration >= stall: off; warn (print "
+          "a WARNING per offending record and continue); error (print one "
+          "error per offending trace with its count and first offending "
+          "record, emit nothing for that trace, and exit 1 once the other "
+          "traces are done). true and false are accepted as warn and off");
 ABSL_FLAG(bool, mfma_coexec, false,
           "analyze MFMA shadow coverage for loop instructions");
 ABSL_FLAG(bool, color_mfma_bubble, false,
@@ -154,6 +158,20 @@ static constexpr int64_t kMfmaShadowCycles = 16;
 static constexpr int64_t kAttTimestampGranule = 4;
 
 enum class LoopOutputFormat { Text, Csv, Json };
+
+// The decoder defines a record's duration as its stall plus its issue (or
+// execution) time, so a record whose stall exceeds its duration is
+// inconsistent, and so is every number derived from it.
+enum class DurationCheck { Off, Warn, Error };
+
+// true and false were the values of the boolean flag this replaced; they stay
+// accepted so existing invocations keep working.
+std::optional<DurationCheck> parse_duration_check(const std::string& text) {
+  if (text == "off" || text == "false") return DurationCheck::Off;
+  if (text == "warn" || text == "true") return DurationCheck::Warn;
+  if (text == "error") return DurationCheck::Error;
+  return std::nullopt;
+}
 
 struct LoopOutputConfig {
   LoopOutputFormat format = LoopOutputFormat::Text;
@@ -199,7 +217,7 @@ struct trace_decoder_context {
   my_rocperf_tool::Disassembler& disas;
   my_rocperf_tool::InstStatistics stats;
   bool detect_loops_flag;
-  bool verify_duration;
+  DurationCheck duration_check;
   bool mfma_coexec_flag;
   // -1 keeps every wave; otherwise only waves on this SIMD are decoded.
   int32_t simd_filter = -1;
@@ -210,6 +228,10 @@ struct trace_decoder_context {
   // Waves dropped by simd_filter. Kept apart from waves_seen so a trace
   // whose waves all ran on other SIMDs is not reported as an empty capture.
   uint64_t waves_filtered = 0;
+  // Records that failed the duration check, and the first of them: under
+  // DurationCheck::Error the trace is reported by these instead of its output.
+  uint64_t bad_duration_records = 0;
+  rocprofiler_thread_trace_decoder_inst_t first_bad_duration{};
   std::vector<my_rocperf_tool::WaveLoopInfo> wave_loops;
   llvm::DenseMap<rocprofiler_thread_trace_decoder_pc_t, bool> mfma_cache;
   llvm::DenseMap<rocprofiler_thread_trace_decoder_pc_t, bool> is_barrier_cache;
@@ -451,13 +473,16 @@ rocprofiler_thread_trace_decoder_status_t att_decoder_trace_callback(
           ctx.insts_seen++;
           assert(inst.pc.code_object_id != 0);
           uint32_t idle = my_rocperf_tool::compute_idle(inst, last_time);
-          if (ctx.verify_duration &&
+          if (ctx.duration_check != DurationCheck::Off &&
               inst.duration < static_cast<int32_t>(inst.stall)) {
-            fmt::print(stderr,
-                       "WARNING: duration < stall at PC 0x{:x} "
-                       "code_object={}: duration={} stall={}\n",
-                       inst.pc.address, inst.pc.code_object_id, inst.duration,
-                       inst.stall);
+            if (ctx.bad_duration_records == 0) ctx.first_bad_duration = inst;
+            ctx.bad_duration_records++;
+            if (ctx.duration_check == DurationCheck::Warn)
+              fmt::print(stderr,
+                         "WARNING: duration < stall at PC 0x{:x} "
+                         "code_object={}: duration={} stall={}\n",
+                         inst.pc.address, inst.pc.code_object_id, inst.duration,
+                         inst.stall);
           }
           ctx.stats.add_inst(inst, idle);
         }
@@ -476,19 +501,6 @@ rocprofiler_thread_trace_decoder_status_t att_decoder_trace_callback(
       }
   }
   return ROCPROFILER_THREAD_TRACE_DECODER_STATUS_SUCCESS;
-}
-
-void dump_states(my_rocperf_tool::Disassembler& disas,
-                 my_rocperf_tool::InstStatistics& stats, bool decode_all) {
-  for (const auto& [pc, inst_vec] : stats.getInsts()) {
-    for (const auto& stat : inst_vec) {
-      assert(stat.stall <= stat.duration);
-    }
-  }
-  if (decode_all) {
-    for (const auto& [obj_id, obj] : disas.get_object_files())
-      obj.decode_all_sections();
-  }
 }
 
 struct LoopInstInfo {
@@ -1101,9 +1113,15 @@ void dump_loops(const DumpCtx& ctx,
 // What one trace decoded, for the end-of-run summary on stderr. Written by
 // run_trace, aggregated by run_main.
 struct TraceSummary {
-  // The .att could not be read, so nothing was decoded or emitted. Kept apart
-  // from waves == 0, which is a capture that was read and found empty.
-  bool unreadable = false;
+  // Why the trace emitted nothing, if it failed. A failure was reported on
+  // stderr as it happened, and is kept apart from waves == 0, which is a
+  // capture that was read and found empty.
+  enum class Failure {
+    None,
+    Unreadable,          // the .att could not be read
+    DurationBelowStall,  // rejected by --verify_trace_duration=error
+  };
+  Failure failure = Failure::None;
   std::string prefix;
   uint64_t dispatch_id = 0;
   uint64_t se_id = 0;  // one .att per shader engine per dispatch
@@ -1118,7 +1136,7 @@ void run_trace(TraceBuf& out, TraceSummary& summary,
                const my_rocperf_tool::AttOutputDir& out_dir,
                const my_rocperf_tool::AttPath& att_path,
                my_rocperf_tool::Disassembler& disas,
-               const LoopOutputConfig& cfg,
+               const LoopOutputConfig& cfg, DurationCheck duration_check,
                std::optional<uint64_t> dispatch_id_override) {
   // Keyed before the read, so an unreadable trace still names the dispatch
   // whose loop-free verdict it leaves open.
@@ -1133,14 +1151,14 @@ void run_trace(TraceBuf& out, TraceSummary& summary,
       // One bad file should not cost the rest of the capture: report it, emit
       // nothing for it, and leave failing the run to run_main.
       fmt::print(stderr, "error: {}\n", llvm::toString(att_data.takeError()));
-      summary.unreadable = true;
+      summary.failure = TraceSummary::Failure::Unreadable;
       return;
     }
     decoder_ctx.first_run = true;
     decoder_ctx.att_data = std::move(*att_data);
     decoder_ctx.dispatch_id = summary.dispatch_id;
     decoder_ctx.detect_loops_flag = absl::GetFlag(FLAGS_detect_loops);
-    decoder_ctx.verify_duration = absl::GetFlag(FLAGS_verify_trace_duration);
+    decoder_ctx.duration_check = duration_check;
     decoder_ctx.mfma_coexec_flag = absl::GetFlag(FLAGS_mfma_coexec);
     decoder_ctx.simd_filter = absl::GetFlag(FLAGS_simd);
   }
@@ -1153,10 +1171,24 @@ void run_trace(TraceBuf& out, TraceSummary& summary,
     assert(parse_res == ROCPROFILER_THREAD_TRACE_DECODER_STATUS_SUCCESS);
   }
 
-  {
-    PHASE_TIMER("dump_states (verify + decode_all)");
-    dump_states(decoder_ctx.disas, decoder_ctx.stats,
-                absl::GetFlag(FLAGS_decode_all_insts));
+  if (duration_check == DurationCheck::Error &&
+      decoder_ctx.bad_duration_records > 0) {
+    // Fails like an unreadable trace: emit nothing for it and leave failing
+    // the run to run_main.
+    const auto& inst = decoder_ctx.first_bad_duration;
+    fmt::print(stderr,
+               "error: {}: {} record(s) with duration < stall, the first at "
+               "PC 0x{:x} code_object={}: duration={} stall={}\n",
+               att_path.path, decoder_ctx.bad_duration_records, inst.pc.address,
+               inst.pc.code_object_id, inst.duration, inst.stall);
+    summary.failure = TraceSummary::Failure::DurationBelowStall;
+    return;
+  }
+
+  if (absl::GetFlag(FLAGS_decode_all_insts)) {
+    PHASE_TIMER("decode_all_insts");
+    for (const auto& [obj_id, obj] : decoder_ctx.disas.get_object_files())
+      obj.decode_all_sections();
   }
 
   {
@@ -1207,7 +1239,8 @@ void run_trace(TraceBuf& out, TraceSummary& summary,
   }
 }
 
-int run_main(const std::string& att_output_dir_path) {
+int run_main(const std::string& att_output_dir_path,
+             DurationCheck duration_check) {
   PHASE_TIMER("TOTAL");
 
   auto scanned = my_rocperf_tool::AttOutputDir::scan(att_output_dir_path);
@@ -1285,8 +1318,9 @@ int run_main(const std::string& att_output_dir_path) {
   auto process_one = [&](DisasByPrefix& by_prefix, size_t i) {
     const auto& att_path = out_dir.att_paths[i];
     run_trace(chunks[i], summaries[i], out_dir, att_path,
-              disas_for(by_prefix, att_path.prefix), cfg, dispatch_id_override);
-    return !summaries[i].unreadable;
+              disas_for(by_prefix, att_path.prefix), cfg, duration_check,
+              dispatch_id_override);
+    return summaries[i].failure != TraceSummary::Failure::Unreadable;
   };
 
   // Always process traces serially until one has been decoded. Two reasons:
@@ -1361,26 +1395,29 @@ int run_main(const std::string& att_output_dir_path) {
     uint64_t tot_waves = 0, tot_insts = 0, tot_loop_waves = 0, tot_loops = 0;
     uint64_t tot_filtered = 0;
     uint64_t no_wave_traces = 0, filtered_only_traces = 0;
-    uint64_t unreadable_traces = 0;
+    uint64_t unreadable_traces = 0, rejected_traces = 0;
     // A dispatch is loop-free only if some SE decoded waves, none found a
-    // loop, and every SE was read; per-SE slots would otherwise report the
-    // same dispatch repeatedly, including dispatches whose loops all landed
-    // in another SE's trace.
+    // loop, and no SE failed; per-SE slots would otherwise report the same
+    // dispatch repeatedly, including dispatches whose loops all landed in
+    // another SE's trace.
     struct DispatchAgg {
       uint64_t waves = 0;
       uint64_t loops = 0;
-      // An SE trace could not be read, so its loops (if any) are unknown.
-      bool unread = false;
+      // An SE trace failed, so its loops (if any) are unknown.
+      bool failed = false;
     };
     // Keyed by run too: the same dispatch id in two runs is two dispatches.
     std::map<std::pair<std::string, uint64_t>, DispatchAgg> by_dispatch;
     for (const auto& s : summaries) {
       auto& d = by_dispatch[{s.prefix, s.dispatch_id}];
-      // Never decoded, so not an empty capture: it adds nothing to the
+      // Never reported, so not an empty capture: it adds nothing to the
       // totals, but leaves its dispatch's verdict open.
-      if (s.unreadable) {
-        unreadable_traces++;
-        d.unread = true;
+      if (s.failure != TraceSummary::Failure::None) {
+        if (s.failure == TraceSummary::Failure::Unreadable)
+          unreadable_traces++;
+        else
+          rejected_traces++;
+        d.failed = true;
         continue;
       }
       tot_waves += s.waves;
@@ -1397,22 +1434,27 @@ int run_main(const std::string& att_output_dir_path) {
       d.waves += s.waves;
       d.loops += s.loops;
     }
-    const uint64_t n_decoded = n_traces - unreadable_traces;
+    const uint64_t n_reported = n_traces - unreadable_traces - rejected_traces;
 
     const bool detect = absl::GetFlag(FLAGS_detect_loops);
     if (detect)
       fmt::print(stderr,
                  "[summary] {} trace(s), {} waves, {} instructions decoded; "
                  "{} loop instance(s) in {} wave(s)\n",
-                 n_decoded, tot_waves, tot_insts, tot_loops, tot_loop_waves);
+                 n_reported, tot_waves, tot_insts, tot_loops, tot_loop_waves);
     else
       fmt::print(stderr,
                  "[summary] {} trace(s), {} waves, {} instructions decoded; "
                  "loop detection disabled\n",
-                 n_decoded, tot_waves, tot_insts);
+                 n_reported, tot_waves, tot_insts);
     if (unreadable_traces)
       fmt::print(stderr, "[summary] {} of {} trace(s) could not be read\n",
                  unreadable_traces, n_traces);
+    if (rejected_traces)
+      fmt::print(stderr,
+                 "[summary] {} of {} trace(s) rejected by "
+                 "--verify_trace_duration=error\n",
+                 rejected_traces, n_traces);
 
     // Decoding nothing is a different fact from finding no loop -- keep the
     // two apart, or the loop-free report makes a claim about a capture whose
@@ -1421,7 +1463,7 @@ int run_main(const std::string& att_output_dir_path) {
       fmt::print(stderr,
                  "[summary] {} of {} trace(s) decoded no waves "
                  "(empty, truncated, or wrong-agent capture)\n",
-                 no_wave_traces, n_decoded);
+                 no_wave_traces, n_reported);
     const int32_t simd = absl::GetFlag(FLAGS_simd);
     if (simd >= 0) {
       fmt::print(stderr,
@@ -1431,19 +1473,19 @@ int run_main(const std::string& att_output_dir_path) {
         fmt::print(stderr,
                    "[summary] {} of {} trace(s) had waves only on other "
                    "SIMDs\n",
-                   filtered_only_traces, n_decoded);
+                   filtered_only_traces, n_reported);
     }
 
     if (detect) {
       // detect_loops keeps a loop at iteration_count >= 2, and one taken
       // back-edge already yields 2 (the flush at the edge plus the trailing
       // partial iteration) -- so the criterion is "taken", not "taken twice".
-      // Unread dispatches stay in the "of M" count, like those that decoded
-      // no waves: M is every dispatch in the capture, the verdict only the
-      // ones that could be judged.
+      // Dispatches with a failed trace stay in the "of M" count, like those
+      // that decoded no waves: M is every dispatch in the capture, the
+      // verdict only the ones that could be judged.
       std::vector<std::pair<std::string, uint64_t>> loop_free;
       for (const auto& [key, d] : by_dispatch)
-        if (d.waves > 0 && d.loops == 0 && !d.unread) loop_free.push_back(key);
+        if (d.waves > 0 && d.loops == 0 && !d.failed) loop_free.push_back(key);
       if (!loop_free.empty()) {
         fmt::print(stderr,
                    "[summary] {} of {} dispatch(es) contained no loop "
@@ -1465,9 +1507,9 @@ int run_main(const std::string& att_output_dir_path) {
         }
       }
     }
-    // Each unreadable trace was reported as it failed; the exit status keeps
-    // a script from taking the partial result for the whole capture.
-    if (unreadable_traces) return 1;
+    // Each failed trace was reported as it failed; the exit status keeps a
+    // script from taking the partial result for the whole capture.
+    if (unreadable_traces || rejected_traces) return 1;
   }
   return 0;
 }
@@ -1485,10 +1527,19 @@ int main(int argc, char* argv[]) {
               << "\n";
     return 2;
   }
+  const std::string duration_check_text =
+      absl::GetFlag(FLAGS_verify_trace_duration);
+  std::optional<DurationCheck> duration_check =
+      parse_duration_check(duration_check_text);
+  if (!duration_check) {
+    std::cerr << "--verify_trace_duration must be off, warn or error; got '"
+              << duration_check_text << "'\n";
+    return 2;
+  }
   int LLVMArgc = 1;
   const char** LLVMArgv = const_cast<const char**>(argv);
   my_rocperf_tool::InitLLVM X(LLVMArgc, LLVMArgv);
   // Outlives run_main so its TOTAL scope has closed by the time we write.
   PHASE_TIMER_SESSION();
-  return run_main(*att_output_dir);
+  return run_main(*att_output_dir, *duration_check);
 }
