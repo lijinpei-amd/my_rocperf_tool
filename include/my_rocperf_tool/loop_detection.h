@@ -19,6 +19,12 @@ struct BackEdge {
     return code_object_id == other.code_object_id &&
            source_addr == other.source_addr && target_addr == other.target_addr;
   }
+
+  // Whether `pc` lies in the loop body, header and branch included.
+  bool contains(const rocprofiler_thread_trace_decoder_pc_t& pc) const {
+    return pc.code_object_id == code_object_id && pc.address >= target_addr &&
+           pc.address <= source_addr;
+  }
 };
 
 struct LoopStats {
@@ -27,6 +33,17 @@ struct LoopStats {
   uint64_t total_duration = 0;
   uint64_t total_stall = 0;
   uint64_t total_idle = 0;
+
+  // Adds the passes `other` covers. The one merge: of a pass into its wave's
+  // loop, and of a wave's loop into an aggregate over waves.
+  LoopStats& operator+=(const LoopStats& other) {
+    iteration_count += other.iteration_count;
+    total_inst_count += other.total_inst_count;
+    total_duration += other.total_duration;
+    total_stall += other.total_stall;
+    total_idle += other.total_idle;
+    return *this;
+  }
 };
 
 struct DetectedLoop {
@@ -38,6 +55,10 @@ struct WaveLoopInfo {
   uint8_t cu;
   uint8_t simd;
   uint8_t wave_id;
+  // The wave's position among those its trace's WaveAnalysis analyzed, which
+  // tells apart waves that ran in the same slot. detect_loops cannot know it
+  // and leaves 0.
+  uint64_t wave_index = 0;
   std::vector<DetectedLoop> loops;
 };
 

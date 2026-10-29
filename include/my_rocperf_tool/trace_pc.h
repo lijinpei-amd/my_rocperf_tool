@@ -1,17 +1,14 @@
 #pragma once
 
-#include "llvm/ADT/ArrayRef.h"
-#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseMapInfo.h"
 #include "llvm/ADT/Hashing.h"
 
 #include "trace_decoder_types.h"
 
-#include <cstddef>
 #include <cstdint>
-#include <iostream>
-#include <vector>
 
+// The decoder's {ELF vaddr, code object} PC as a DenseMap key, for the
+// per-PC caches and totals.
 namespace llvm {
 template <>
 struct DenseMapInfo<rocprofiler_thread_trace_decoder_pc_t> {
@@ -37,30 +34,3 @@ struct DenseMapInfo<rocprofiler_thread_trace_decoder_pc_t> {
   }
 };
 }  // namespace llvm
-
-namespace my_rocperf_tool {
-class InstStatistics {
-  using pc_t = rocprofiler_thread_trace_decoder_pc_t;
-  using rocprof_inst_t = rocprofiler_thread_trace_decoder_inst_t;
-  struct Inst : public rocprof_inst_t {
-    Inst(rocprof_inst_t inst, uint32_t idle)
-        : rocprof_inst_t(inst), idle(idle) {}
-    uint32_t idle;
-  };
-  llvm::DenseMap<pc_t, std::vector<Inst>> insts;
-
- public:
-  void add_inst(const rocprofiler_thread_trace_decoder_inst_t& inst,
-                uint32_t idle) {
-    insts[inst.pc].push_back({inst, idle});
-  }
-  llvm::ArrayRef<Inst> get_inst_at(const pc_t& pc) const {
-    auto iter = insts.find(pc);
-    if (iter == insts.end()) {
-      return {};
-    }
-    return iter->second;
-  }
-  size_t size() const { return insts.size(); }
-};
-}  // namespace my_rocperf_tool

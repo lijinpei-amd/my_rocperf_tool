@@ -9,6 +9,7 @@ add_library(my_rocperf_tool SHARED
     att_output_dir.cpp
     disassembler.cpp
     loop_detection.cpp
+    loop_profile.cpp
     wave_analysis.cpp
     )
 # -external-nolink is an INTERFACE target that carries the HIP/HSA/comgr include

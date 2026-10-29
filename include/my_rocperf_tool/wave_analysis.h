@@ -1,8 +1,9 @@
 #pragma once
 
 #include "my_rocperf_tool/inst_kind.h"
-#include "my_rocperf_tool/inst_statistics.h"
 #include "my_rocperf_tool/loop_detection.h"
+#include "my_rocperf_tool/loop_profile.h"
+#include "my_rocperf_tool/trace_pc.h"
 
 #include "llvm/ADT/DenseMap.h"
 
@@ -15,16 +16,6 @@
 #include <vector>
 
 namespace my_rocperf_tool {
-
-// Cycles an MFMA is assumed to keep the MAI pipe busy, during which a
-// co-issued non-MFMA instruction executes for free.
-inline constexpr int64_t kMfmaShadowCycles = 16;
-
-// ATT hardware timestamps land on a 4-cycle grid, and the decoder splits the
-// cycles between two timestamp packets across the instructions it saw in
-// between. A single instruction's duration can therefore be off by one
-// granule.
-inline constexpr int64_t kAttTimestampGranule = 4;
 
 // The decoder defines a record's duration as its stall plus its issue (or
 // execution) time, so a record whose stall exceeds its duration is
@@ -41,8 +32,8 @@ enum class DurationCheck {
 struct WaveAnalysisOptions {
   // -1 analyzes every wave; otherwise only waves on this SIMD. Dropping the
   // waves at the source rather than filtering the reports keeps every
-  // accumulator -- per-PC stats, bubble and relative-issue totals, loops --
-  // consistently scoped to the selected SIMD.
+  // accumulator -- the loop profile, loops -- consistently scoped to the
+  // selected SIMD.
   int32_t simd = -1;
   bool detect_loops = true;
   // Accumulate MFMA-shadow bubbles over each detected loop's body.
@@ -54,10 +45,6 @@ struct WaveAnalysisOptions {
 // answer, so it asks once per PC.
 using InstClassifier =
     std::function<InstKind(const rocprofiler_thread_trace_decoder_pc_t&)>;
-
-using PerPCMap =
-    llvm::DenseMap<rocprofiler_thread_trace_decoder_pc_t, uint64_t>;
-using PerLoopMap = llvm::DenseMap<BackEdge, PerPCMap>;
 
 // Decode counters, reported in the run summary so a trace that yields no
 // loops is distinguishable from one that failed to decode.
@@ -81,15 +68,6 @@ struct DurationBelowStall {
   uint32_t stall;
 };
 
-// An MFMA that issued inside the previous MFMA's shadow by more than one
-// timestamp granule: more than decoder slop, so kMfmaShadowCycles is wrong for
-// this ISA.
-struct MfmaShadowOverlap {
-  rocprofiler_thread_trace_decoder_pc_t pc;
-  int64_t issue_point;
-  int64_t shadow_end;
-};
-
 using WaveDiagnostic = std::variant<DurationBelowStall, MfmaShadowOverlap>;
 
 // What DurationCheck::Error found: how many records failed, and the first.
@@ -101,17 +79,11 @@ struct DurationCheckFailure {
 // What the waves of one trace add up to.
 struct WaveAnalysisResult {
   WaveCounts counts;
-  // Every attributed record by PC, with its idle cycles.
-  InstStatistics stats;
+  // Every analyzed wave's records and loops, as per-loop, per-PC metrics.
+  LoopProfile profile;
   // The detected loops of each wave that has any, in the order the waves were
   // added. Empty unless detect_loops.
   std::vector<WaveLoopInfo> wave_loops;
-  // Per loop and per PC in its body, summed over every pass through the body
-  // in every wave that has the loop. bubble_totals holds the cycles no MFMA
-  // shadow covered and is empty unless mfma_coexec; rel_issue_totals holds
-  // issue times relative to the pass's issue of the loop header.
-  PerLoopMap bubble_totals;
-  PerLoopMap rel_issue_totals;
   // In the order they were found.
   std::vector<WaveDiagnostic> diagnostics;
   std::optional<DurationCheckFailure> duration_check_failure;
@@ -122,10 +94,10 @@ struct WaveAnalysisResult {
 // kept.
 //
 // Each wave goes through the same steps in a fixed order: the SIMD filter,
-// then s_barrier token coalescing, then per-record accumulation and the
-// duration check, then loop detection and the per-loop analyses. A filtered
-// wave reaches no accumulator, and every accumulator sees the coalesced
-// records.
+// then s_barrier token coalescing, then the duration check, then loop
+// detection, then the loop profile, which takes the wave's records and loops.
+// A filtered wave reaches no accumulator, and every accumulator sees the
+// coalesced records.
 class WaveAnalysis {
  public:
   WaveAnalysis(WaveAnalysisOptions options, InstClassifier classify);
@@ -145,16 +117,10 @@ class WaveAnalysis {
   // Applies the duration-check policy to a record that failed the check.
   void add_duration_below_stall(
       const rocprofiler_thread_trace_decoder_inst_t& inst);
-  void compute_relative_issue(const wave_t& wave, const BackEdge& edge);
-  void analyze_mfma_coexec(const wave_t& wave, const BackEdge& edge);
 
   WaveAnalysisOptions options;
   InstClassifier classify;
   llvm::DenseMap<pc_t, InstKind> kinds;
-  // Per loop, an InstKind per dword of its body, -1 until first asked: the
-  // MFMA analysis asks about every record it walks, so its lookup must be an
-  // index rather than a hash. Filled through `kinds`.
-  llvm::DenseMap<BackEdge, std::vector<int8_t>> body_kinds;
   // Reused across waves, so coalescing allocates only when a wave outgrows
   // every earlier one.
   std::vector<rocprofiler_thread_trace_decoder_inst_t> coalesced;

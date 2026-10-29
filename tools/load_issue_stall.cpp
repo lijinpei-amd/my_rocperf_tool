@@ -1,8 +1,8 @@
 #include "my_rocperf_tool/att_output_dir.h"
 #include "my_rocperf_tool/disassembler.h"
 #include "my_rocperf_tool/init_llvm.h"
-#include "my_rocperf_tool/inst_statistics.h"
 #include "my_rocperf_tool/loop_detection.h"
+#include "my_rocperf_tool/loop_profile.h"
 #include "my_rocperf_tool/wave_analysis.h"
 
 #include "absl/flags/flag.h"
@@ -34,6 +34,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <tuple>
 #include <unordered_map>
@@ -136,8 +137,6 @@ ABSL_FLAG(uint32_t, jobs, 0,
           "hardware concurrency, and 64)");
 ABSL_FLAG(int32_t, simd, -1,
           "analyze only waves on this SIMD ([0,3]); -1 analyzes all SIMDs");
-
-static const my_rocperf_tool::PerPCMap empty_pc_map;
 
 enum class LoopOutputFormat { Text, Csv, Json };
 
@@ -275,59 +274,32 @@ rocprofiler_thread_trace_decoder_status_t att_decoder_trace_callback(
   return ROCPROFILER_THREAD_TRACE_DECODER_STATUS_SUCCESS;
 }
 
-struct LoopInstInfo {
-  uint64_t addr;
-  std::string inst_str;
-  my_rocperf_tool::InstKind kind;
-  size_t n;
-  uint64_t dur, stall, idle, issue;
-  uint64_t bubble;
-  uint64_t rel_issue;
-  bool has_stats;
+// A trace's loop bodies, each listed once: listing prints every instruction,
+// and every record of a loop -- one per wave that has it, and the aggregate --
+// needs the loop's body.
+class LoopBodies {
+ public:
+  explicit LoopBodies(const my_rocperf_tool::Disassembler& disas)
+      : disas(disas) {}
+
+  const my_rocperf_tool::LoopBody& of(const my_rocperf_tool::BackEdge& edge) {
+    auto [it, inserted] = listed.try_emplace(edge);
+    auto& body = it->second;
+    if (!inserted) return body;
+    const auto* obj = disas.find_code_object(edge.code_object_id);
+    if (!obj) return body;
+    for (uint64_t vaddr : obj->inst_vaddrs(edge.target_addr, edge.source_addr))
+      body.push_back({vaddr, obj->text_at(vaddr), obj->kind_at(vaddr)});
+    return body;
+  }
+
+ private:
+  const my_rocperf_tool::Disassembler& disas;
+  llvm::DenseMap<my_rocperf_tool::BackEdge, my_rocperf_tool::LoopBody> listed;
 };
 
-std::vector<LoopInstInfo> collect_loop_insts(
-    my_rocperf_tool::Disassembler& disas,
-    my_rocperf_tool::InstStatistics& stats,
-    const my_rocperf_tool::BackEdge& edge,
-    const my_rocperf_tool::PerLoopMap& all_bubbles,
-    const my_rocperf_tool::PerLoopMap& all_rel_issues) {
-  auto bi = all_bubbles.find(edge);
-  const auto& bubbles = bi != all_bubbles.end() ? bi->second : empty_pc_map;
-  auto ri = all_rel_issues.find(edge);
-  const auto& rel_issues =
-      ri != all_rel_issues.end() ? ri->second : empty_pc_map;
-  std::vector<LoopInstInfo> result;
-  const auto* obj = disas.find_code_object(edge.code_object_id);
-  if (!obj) return result;
-  for (uint64_t addr : obj->inst_vaddrs(edge.target_addr, edge.source_addr)) {
-    rocprofiler_thread_trace_decoder_pc_t pc{addr, edge.code_object_id};
-    auto stats_range = stats.get_inst_at(pc);
-
-    LoopInstInfo info{
-        addr, obj->text_at(addr),  obj->kind_at(addr), 0, 0, 0, 0, 0, 0,
-        0,    !stats_range.empty()};
-    if (info.has_stats) {
-      for (const auto& s : stats_range) {
-        info.dur += s.duration;
-        info.stall += s.stall;
-        info.idle += s.idle;
-        int32_t iss = s.duration - static_cast<int32_t>(s.stall);
-        info.issue += iss > 0 ? static_cast<uint64_t>(iss) : 0;
-      }
-      info.n = stats_range.size();
-      auto bi_it = bubbles.find(pc);
-      if (bi_it != bubbles.end()) info.bubble = bi_it->second;
-      auto ri_it = rel_issues.find(pc);
-      if (ri_it != rel_issues.end()) info.rel_issue = ri_it->second;
-    }
-    result.push_back(std::move(info));
-  }
-  return result;
-}
-
 // Escape a string for CSV output (RFC 4180: double embedded quotes)
-std::string csv_escape(const std::string& s) {
+std::string csv_escape(std::string_view s) {
   std::string out;
   out.reserve(s.size());
   for (char c : s) {
@@ -340,7 +312,7 @@ std::string csv_escape(const std::string& s) {
 }
 
 // Escape a string for JSON output (handles all JSON-required escapes)
-std::string json_escape(const std::string& s) {
+std::string json_escape(std::string_view s) {
   std::string out;
   out.reserve(s.size() + 2);
   for (unsigned char c : s) {
@@ -381,7 +353,8 @@ std::string json_escape(const std::string& s) {
 
 // ANSI color for bubble severity, relative to max bubble in the loop.
 // Green (0%) -> Yellow (1-25%) -> Red (25-75%) -> Bright Red (75-100%)
-const char* bubble_color(const LoopInstInfo& ii, uint64_t max_bubble) {
+const char* bubble_color(const my_rocperf_tool::LoopInstRow& ii,
+                         uint64_t max_bubble) {
   if (!ii.has_stats || ii.n == 0 || ii.bubble == 0 || max_bubble == 0)
     return "\033[32m";  // green: fully covered
   double ratio = static_cast<double>(ii.bubble) / max_bubble;
@@ -390,46 +363,9 @@ const char* bubble_color(const LoopInstInfo& ii, uint64_t max_bubble) {
   return "\033[1;31m";                   // bright red: high
 }
 
-struct LoopSummary {
-  double avg_dur, avg_stall, avg_idle, avg_bubble;
-  double mfma_util;  // mfma_time / avg_dur
-  uint32_t mfma_count;
-  uint32_t mfma_time;  // mfma_count * kMfmaShadowCycles
-};
-
-LoopSummary compute_loop_summary(const my_rocperf_tool::LoopStats& s,
-                                 const std::vector<LoopInstInfo>& insts) {
-  LoopSummary sum{};
-  uint64_t total_bubble = 0;
-  // ii.bubble and ii.dur/stall/idle are accumulated globally across
-  // all waves, so use ii.n (total observations) for per-iteration averages.
-  size_t total_n = 0;
-  for (const auto& ii : insts) {
-    total_bubble += ii.bubble;
-    if (ii.has_stats && ii.n > total_n) total_n = ii.n;
-    if (ii.kind == my_rocperf_tool::InstKind::Mfma) sum.mfma_count++;
-  }
-  if (s.iteration_count > 0) {
-    sum.avg_dur = static_cast<double>(s.total_duration) / s.iteration_count;
-    sum.avg_stall = static_cast<double>(s.total_stall) / s.iteration_count;
-    sum.avg_idle = static_cast<double>(s.total_idle) / s.iteration_count;
-  }
-  if (total_n > 0) sum.avg_bubble = static_cast<double>(total_bubble) / total_n;
-  sum.mfma_time = sum.mfma_count * my_rocperf_tool::kMfmaShadowCycles;
-  if (sum.avg_dur > 0)
-    sum.mfma_util = static_cast<double>(sum.mfma_time) / sum.avg_dur;
-  return sum;
-}
-
-struct LoopRecord {
-  my_rocperf_tool::BackEdge back_edge;
-  my_rocperf_tool::LoopStats stats;
-  uint32_t wave_count;  // 1 for per-wave, N for aggregate
-};
-
-std::vector<LoopRecord> aggregate_loops_by_back_edge(
+std::vector<my_rocperf_tool::LoopRecord> aggregate_loops_by_back_edge(
     const std::vector<my_rocperf_tool::WaveLoopInfo>& wave_loops) {
-  std::vector<LoopRecord> result;
+  std::vector<my_rocperf_tool::LoopRecord> result;
   llvm::DenseMap<my_rocperf_tool::BackEdge, size_t> index_by_edge;
   for (const auto& wl : wave_loops) {
     for (const auto& dl : wl.loops) {
@@ -437,20 +373,17 @@ std::vector<LoopRecord> aggregate_loops_by_back_edge(
       auto it = index_by_edge.find(edge);
       if (it == index_by_edge.end()) {
         it = index_by_edge.try_emplace(edge, result.size()).first;
-        result.push_back(LoopRecord{edge, {}, 0});
+        result.push_back({edge, {}, 0, std::nullopt});
       }
 
       auto& agg = result[it->second];
       agg.wave_count++;
-      agg.stats.iteration_count += dl.stats.iteration_count;
-      agg.stats.total_inst_count += dl.stats.total_inst_count;
-      agg.stats.total_duration += dl.stats.total_duration;
-      agg.stats.total_stall += dl.stats.total_stall;
-      agg.stats.total_idle += dl.stats.total_idle;
+      agg.stats += dl.stats;
     }
   }
   std::sort(result.begin(), result.end(),
-            [](const LoopRecord& a, const LoopRecord& b) {
+            [](const my_rocperf_tool::LoopRecord& a,
+               const my_rocperf_tool::LoopRecord& b) {
               return std::tie(a.back_edge.code_object_id,
                               a.back_edge.target_addr,
                               a.back_edge.source_addr) <
@@ -465,11 +398,8 @@ struct LoopGroup {
   uint8_t cu = 0;        // valid only when !is_aggregate
   uint8_t simd = 0;      // valid only when !is_aggregate
   uint32_t wave_id = 0;  // valid only when !is_aggregate
-  std::vector<LoopRecord> loops;
+  std::vector<my_rocperf_tool::LoopRecord> loops;
 };
-
-using LoopInstCache =
-    llvm::DenseMap<my_rocperf_tool::BackEdge, std::vector<LoopInstInfo>>;
 
 std::vector<LoopGroup> build_loop_groups(
     const std::vector<my_rocperf_tool::WaveLoopInfo>& wave_loops,
@@ -480,7 +410,7 @@ std::vector<LoopGroup> build_loop_groups(
       LoopGroup g{false, wl.cu, wl.simd, wl.wave_id, {}};
       g.loops.reserve(wl.loops.size());
       for (const auto& dl : wl.loops)
-        g.loops.push_back({dl.back_edge, dl.stats, 1});
+        g.loops.push_back({dl.back_edge, dl.stats, 1, wl.wave_index});
       groups.push_back(std::move(g));
     }
   }
@@ -489,18 +419,6 @@ std::vector<LoopGroup> build_loop_groups(
     groups.push_back(std::move(g));
   }
   return groups;
-}
-
-const std::vector<LoopInstInfo>& get_loop_insts(
-    LoopInstCache& cache, my_rocperf_tool::Disassembler& disas,
-    my_rocperf_tool::InstStatistics& stats,
-    const my_rocperf_tool::BackEdge& edge,
-    const my_rocperf_tool::PerLoopMap& bubbles,
-    const my_rocperf_tool::PerLoopMap& rel_issues) {
-  auto it = cache.find(edge);
-  if (it != cache.end()) return it->second;
-  auto insts = collect_loop_insts(disas, stats, edge, bubbles, rel_issues);
-  return cache.try_emplace(edge, std::move(insts)).first->second;
 }
 
 // Per-trace output buffer type. Lower SBO than fmt::memory_buffer's default
@@ -526,10 +444,10 @@ inline void writef(std::string& out, fmt::format_string<T...> f, T&&... args) {
 
 void dump_loop_json(TraceBuf& out, const my_rocperf_tool::BackEdge& e,
                     const my_rocperf_tool::LoopStats& s,
-                    const std::vector<LoopInstInfo>& insts,
+                    const my_rocperf_tool::LoopRecordMetrics& metrics,
                     const LoopOutputConfig& cfg,
                     std::optional<uint32_t> wave_count = std::nullopt) {
-  auto sum = compute_loop_summary(s, insts);
+  const auto& sum = metrics.summary;
   writef(out,
          "    {{\"target_addr\":\"0x{:x}\",\"source_addr\":\"0x{:x}\","
          "\"code_object\":{}",
@@ -548,11 +466,11 @@ void dump_loop_json(TraceBuf& out, const my_rocperf_tool::BackEdge& e,
   if (cfg.show_contents) {
     writef(out, ",\"instructions\":[\n");
     bool first_inst = true;
-    for (const auto& ii : insts) {
+    for (const auto& ii : metrics.rows) {
       if (!first_inst) writef(out, ",\n");
       first_inst = false;
-      writef(out, "      {{\"addr\":\"0x{:x}\",\"inst\":\"{}\"", ii.addr,
-             json_escape(ii.inst_str));
+      writef(out, "      {{\"addr\":\"0x{:x}\",\"inst\":\"{}\"", ii.vaddr,
+             json_escape(ii.text));
       if (cfg.show_stats && ii.has_stats) {
         writef(out, ",\"n\":{}", ii.n);
         if (cfg.show_avg) {
@@ -624,11 +542,12 @@ void dump_csv_row_prefix(TraceBuf& out, const LoopOutputConfig& cfg,
 
 void dump_csv_loop_rows(TraceBuf& out, const LoopOutputConfig& cfg,
                         const std::string& prefix, uint64_t dispatch_id,
-                        const LoopGroup& g, const LoopRecord& lr,
-                        const std::vector<LoopInstInfo>& insts) {
+                        const LoopGroup& g,
+                        const my_rocperf_tool::LoopRecord& lr,
+                        const my_rocperf_tool::LoopRecordMetrics& metrics) {
   const auto& e = lr.back_edge;
   const auto& s = lr.stats;
-  auto sum = compute_loop_summary(s, insts);
+  const auto& sum = metrics.summary;
   auto print_loop_fields = [&]() {
     writef(out, "0x{:x},0x{:x},{},{},{},{},{},{:.2f},{:.2f},{:.2f},",
            e.target_addr, e.source_addr, e.code_object_id, s.iteration_count,
@@ -645,10 +564,10 @@ void dump_csv_loop_rows(TraceBuf& out, const LoopOutputConfig& cfg,
     return;
   }
 
-  for (const auto& ii : insts) {
+  for (const auto& ii : metrics.rows) {
     dump_csv_row_prefix(out, cfg, prefix, dispatch_id, g, lr.wave_count);
     print_loop_fields();
-    writef(out, ",0x{:x},\"{}\",{},", ii.addr, csv_escape(ii.inst_str), ii.n);
+    writef(out, ",0x{:x},\"{}\",{},", ii.vaddr, csv_escape(ii.text), ii.n);
     if (cfg.show_avg) {
       if (ii.n > 0) {
         writef(out, "{:.2f},{:.2f},{:.2f},{:.2f}",
@@ -679,17 +598,19 @@ void dump_csv_loop_rows(TraceBuf& out, const LoopOutputConfig& cfg,
 // trailing comma. Caller is responsible for the surrounding "[\n" / "\n]\n"
 // and for inserting ",\n" between non-empty per-trace bodies.
 // Per-trace dump state, threaded through dump_loops*.  Holds references —
-// owners are run_trace (cache, out) and trace_decoder_context (others).
+// owned by run_trace and its analysis result.
 struct DumpCtx {
   TraceBuf& out;
-  my_rocperf_tool::Disassembler& disas;
-  my_rocperf_tool::InstStatistics& stats;
+  const my_rocperf_tool::LoopProfile& profile;
+  LoopBodies& bodies;
   const LoopOutputConfig& cfg;
-  const my_rocperf_tool::PerLoopMap& bubbles;
-  const my_rocperf_tool::PerLoopMap& rel_issues;
-  LoopInstCache& cache;
   const std::string& prefix;
   uint64_t dispatch_id;
+
+  my_rocperf_tool::LoopRecordMetrics metrics(
+      const my_rocperf_tool::LoopRecord& lr) const {
+    return profile.metrics(lr, bodies.of(lr.back_edge));
+  }
 };
 
 // "DispatchID=N", qualified by the run when the output spans several.
@@ -722,12 +643,9 @@ void dump_loops_json(const DumpCtx& ctx, const std::vector<LoopGroup>& groups) {
     for (const auto& lr : g.loops) {
       if (!first_loop) writef(ctx.out, ",\n");
       first_loop = false;
-      const auto& insts =
-          get_loop_insts(ctx.cache, ctx.disas, ctx.stats, lr.back_edge,
-                         ctx.bubbles, ctx.rel_issues);
       auto wave_count = g.is_aggregate ? std::optional<uint32_t>(lr.wave_count)
                                        : std::nullopt;
-      dump_loop_json(ctx.out, lr.back_edge, lr.stats, insts, ctx.cfg,
+      dump_loop_json(ctx.out, lr.back_edge, lr.stats, ctx.metrics(lr), ctx.cfg,
                      wave_count);
     }
     writef(ctx.out, "\n  ]}}");
@@ -737,19 +655,16 @@ void dump_loops_json(const DumpCtx& ctx, const std::vector<LoopGroup>& groups) {
 void dump_loops_csv(const DumpCtx& ctx, const std::vector<LoopGroup>& groups) {
   for (const auto& g : groups) {
     for (const auto& lr : g.loops) {
-      const auto& insts =
-          get_loop_insts(ctx.cache, ctx.disas, ctx.stats, lr.back_edge,
-                         ctx.bubbles, ctx.rel_issues);
       dump_csv_loop_rows(ctx.out, ctx.cfg, ctx.prefix, ctx.dispatch_id, g, lr,
-                         insts);
+                         ctx.metrics(lr));
     }
   }
 }
 
-void dump_loop_text_stats(TraceBuf& out, const my_rocperf_tool::LoopStats& s,
-                          const std::vector<LoopInstInfo>& insts,
+void dump_loop_text_stats(TraceBuf& out,
+                          const my_rocperf_tool::LoopRecordMetrics& metrics,
                           const LoopOutputConfig& cfg) {
-  auto sum = compute_loop_summary(s, insts);
+  const auto& sum = metrics.summary;
   writef(out, "    avg/iter: dur={:.2f} stall={:.2f} idle={:.2f}", sum.avg_dur,
          sum.avg_stall, sum.avg_idle);
   if (cfg.show_mfma_coexec) writef(out, " bubble={:.2f}", sum.avg_bubble);
@@ -776,10 +691,10 @@ void dump_loop_text_stats(TraceBuf& out, const my_rocperf_tool::LoopStats& s,
 
   uint64_t max_bubble = 0;
   if (cfg.color_mfma_bubble) {
-    for (const auto& ii : insts)
+    for (const auto& ii : metrics.rows)
       if (ii.bubble > max_bubble) max_bubble = ii.bubble;
   }
-  for (const auto& ii : insts) {
+  for (const auto& ii : metrics.rows) {
     if (cfg.color_mfma_bubble && ii.has_stats)
       writef(out, "{}", bubble_color(ii, max_bubble));
     writef(out, "    ");
@@ -810,8 +725,8 @@ void dump_loop_text_stats(TraceBuf& out, const my_rocperf_tool::LoopStats& s,
       if (cfg.show_mfma_coexec) writef(out, "{:<10} ", "");
       writef(out, "{:<10} ", "");
     }
-    if (cfg.show_addr) writef(out, "0x{:x}:  ", ii.addr);
-    writef(out, "{}", ii.inst_str);
+    if (cfg.show_addr) writef(out, "0x{:x}:  ", ii.vaddr);
+    writef(out, "{}", ii.text);
     if (cfg.color_mfma_bubble && ii.has_stats) writef(out, "\033[0m");
     writef(out, "\n");
   }
@@ -850,9 +765,7 @@ void dump_loops_text(const DumpCtx& ctx, const std::vector<LoopGroup>& groups) {
                e.target_addr, e.source_addr, e.code_object_id,
                s.iteration_count, s.total_duration, avg_dur, s.total_stall,
                avg_stall, s.total_idle);
-      const auto& insts = get_loop_insts(ctx.cache, ctx.disas, ctx.stats, e,
-                                         ctx.bubbles, ctx.rel_issues);
-      dump_loop_text_stats(ctx.out, s, insts, ctx.cfg);
+      dump_loop_text_stats(ctx.out, ctx.metrics(lr), ctx.cfg);
     }
   }
 }
@@ -1018,16 +931,9 @@ void run_trace(TraceBuf& out, TraceSummary& summary,
   {
     PHASE_TIMER("dump_loops");
     if (options.detect_loops) {
-      LoopInstCache cache;
-      DumpCtx dump_ctx{out,
-                       *disas,
-                       result.stats,
-                       cfg,
-                       result.bubble_totals,
-                       result.rel_issue_totals,
-                       cache,
-                       att_path.prefix,
-                       summary.dispatch_id};
+      LoopBodies bodies(*disas);
+      DumpCtx dump_ctx{out, result.profile,  bodies,
+                       cfg, att_path.prefix, summary.dispatch_id};
       // Test what dump_loops actually emitted rather than whether loops were
       // found: --aggregate_wave writes an (empty) aggregate header even with
       // no loops, and a second "no loops" banner would contradict it.

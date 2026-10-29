@@ -2,10 +2,10 @@
 
 #include "my_rocperf_tool/inst_kind.h"
 #include "my_rocperf_tool/loop_detection.h"
+#include "my_rocperf_tool/loop_profile.h"
 
 #include "trace_decoder_types.h"
 
-#include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -15,7 +15,9 @@
 namespace my_rocperf_tool {
 
 WaveAnalysis::WaveAnalysis(WaveAnalysisOptions options, InstClassifier classify)
-    : options(options), classify(std::move(classify)) {}
+    : options(options), classify(std::move(classify)) {
+  result.profile = LoopProfile(options.mfma_coexec);
+}
 
 void WaveAnalysis::add_wave(const wave_t& decoded) {
   if (options.simd >= 0 && decoded.simd != options.simd) {
@@ -26,28 +28,25 @@ void WaveAnalysis::add_wave(const wave_t& decoded) {
   wave_t wave = decoded;
   wave.instructions_array = coalesced.data();
   wave.instructions_size = coalesced.size();
-  result.counts.waves++;
+  const uint64_t wave_index = result.counts.waves++;
 
-  int64_t last_time = wave.begin_time;
   for (size_t j = 0; j < wave.instructions_size; j++) {
     const auto& inst = wave.instructions_array[j];
     if (is_null_pc(inst)) continue;
     result.counts.insts++;
     assert(inst.pc.code_object_id != 0);
-    uint32_t idle = compute_idle(inst, last_time);
     if (options.duration_check != DurationCheck::Off &&
         inst.duration < static_cast<int32_t>(inst.stall))
       add_duration_below_stall(inst);
-    result.stats.add_inst(inst, idle);
   }
 
-  if (!options.detect_loops) return;
-  auto loop_info = detect_loops(wave);
+  WaveLoopInfo loop_info{};
+  if (options.detect_loops) loop_info = detect_loops(wave);
+  loop_info.wave_index = wave_index;
+  for (const auto& overlap : result.profile.add_wave(
+           wave, loop_info, [this](const pc_t& pc) { return kind_at(pc); }))
+    result.diagnostics.push_back(overlap);
   if (loop_info.loops.empty()) return;
-  for (const auto& dl : loop_info.loops) {
-    compute_relative_issue(wave, dl.back_edge);
-    if (options.mfma_coexec) analyze_mfma_coexec(wave, dl.back_edge);
-  }
   result.counts.loop_waves++;
   result.counts.loops += loop_info.loops.size();
   result.wave_loops.push_back(std::move(loop_info));
@@ -121,74 +120,6 @@ void WaveAnalysis::add_duration_below_stall(
     result.duration_check_failure->records++;
   else
     result.duration_check_failure = DurationCheckFailure{1, record};
-}
-
-void WaveAnalysis::compute_relative_issue(const wave_t& wave,
-                                          const BackEdge& edge) {
-  int64_t iter_start = -1;
-  for (size_t i = 0; i < wave.instructions_size; i++) {
-    const auto& inst = wave.instructions_array[i];
-    if (is_null_pc(inst)) continue;
-    if (inst.pc.code_object_id != edge.code_object_id ||
-        inst.pc.address < edge.target_addr ||
-        inst.pc.address > edge.source_addr)
-      continue;
-    // New iteration starts when we hit the loop header.
-    if (inst.pc.address == edge.target_addr)
-      iter_start = inst.time + inst.stall;
-    if (iter_start >= 0) {
-      int64_t rel = (inst.time + inst.stall) - iter_start;
-      if (rel >= 0)
-        result.rel_issue_totals[edge][inst.pc] += static_cast<uint64_t>(rel);
-    }
-  }
-}
-
-void WaveAnalysis::analyze_mfma_coexec(const wave_t& wave,
-                                       const BackEdge& edge) {
-  // Instructions are dword-aligned, so a body PC's slot is its dword offset.
-  auto& body = body_kinds[edge];
-  if (body.empty())
-    body.assign((edge.source_addr - edge.target_addr) / 4 + 1, -1);
-  int64_t mfma_shadow_end = 0;
-
-  for (size_t i = 0; i < wave.instructions_size; i++) {
-    const auto& inst = wave.instructions_array[i];
-    if (is_null_pc(inst)) continue;
-    if (inst.pc.code_object_id != edge.code_object_id ||
-        inst.pc.address < edge.target_addr ||
-        inst.pc.address > edge.source_addr)
-      continue;
-
-    auto& kind = body[(inst.pc.address - edge.target_addr) / 4];
-    if (kind < 0) kind = static_cast<int8_t>(kind_at(inst.pc));
-    if (static_cast<InstKind>(kind) == InstKind::Mfma) {
-      // MFMA is productive work — update shadow, don't count as bubble.
-      int64_t issue_point = inst.time + inst.stall;
-      // Verify no two MFMAs issue within each other's shadow. An overlap of
-      // up to one timestamp granule is decoder slop, not a pipe violation --
-      // only a larger one means kMfmaShadowCycles is wrong for this ISA.
-      if (mfma_shadow_end > 0 &&
-          issue_point < mfma_shadow_end - kAttTimestampGranule)
-        result.diagnostics.push_back(
-            MfmaShadowOverlap{inst.pc, issue_point, mfma_shadow_end});
-      // Never rewind: a slop-induced overlap must not un-cover cycles the
-      // previous MFMA already accounted for, which would attribute a bubble
-      // to whatever follows.
-      mfma_shadow_end =
-          std::max(mfma_shadow_end, issue_point + kMfmaShadowCycles);
-    } else {
-      // Non-MFMA: compute bubble (portion not covered by co-exec shadow).
-      int64_t end_time = inst.time + inst.duration;
-      if (end_time > mfma_shadow_end) {
-        int64_t uncovered = end_time - mfma_shadow_end;
-        int64_t bubble =
-            std::min(static_cast<int64_t>(inst.duration), uncovered);
-        if (bubble > 0)
-          result.bubble_totals[edge][inst.pc] += static_cast<uint64_t>(bubble);
-      }
-    }
-  }
 }
 
 }  // namespace my_rocperf_tool
