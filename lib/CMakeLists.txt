@@ -8,7 +8,6 @@
 add_library(my_rocperf_tool SHARED
     att_output_dir.cpp
     disassembler.cpp
-    init_llvm.cpp
     loop_detection.cpp
     )
 # -external-nolink is an INTERFACE target that carries the HIP/HSA/comgr include

@@ -39,10 +39,10 @@ Pre-commit hooks enforce clang-format and other checks. Set up with `pre-commit 
 
 **Library (`lib/` → `libmy_rocperf_tool.so`):**
 
-- **Disassembler / ObjectFileInfo** (`disassembler.h/cpp`) — LLVM MC-based AMDGPU disassembler. Parses ELF code objects, identifies ISA from ELF machine flags (matched against `include/my_rocperf_tool/data/comgr-isa-metadata.def`), caches subtarget info, and provides on-demand instruction decoding via `decode_at(addr)`.
+- **Disassembler / ObjectFileInfo** (`disassembler.h/cpp`) — LLVM MC-based AMDGPU disassembler. Parses ELF code objects, identifies ISA from ELF machine flags (matched against `include/my_rocperf_tool/data/comgr-isa-metadata.def`), caches subtarget info, and provides on-demand instruction decoding via `decode_at(addr)`. Needs no setup: the first construction registers the AMDGPU target (once per process). Not thread-safe (one per thread), and neither copyable nor movable because each MCContext points at the Disassembler's MC options.
 - **RocPerfTool** (`rocperf_tool.h/cpp`) — Registers rocprofiler-sdk callbacks for code object load tracing; feeds loaded code objects to the Disassembler.
 - **InstStatistics** (`inst_statistics.h`) — Header-only; accumulates per-PC execution statistics (stall, duration, idle, category) from decoded thread trace data.
-- **init_llvm** (`init_llvm.h/cpp`) — Initializes all LLVM targets, MC layers, disassemblers, and asm parsers.
+- **InitLLVM** (`init_llvm.h`) — Header-only, optional process setup for executables: `llvm::InitLLVM`'s crash handlers and stack traces, and `llvm_shutdown` on destruction. Registers no targets and parses no LLVM options.
 
 **CLI Tool (`tools/load_issue_stall.cpp`):**
 
@@ -61,6 +61,7 @@ All project code lives in the `my_rocperf_tool` namespace. LLVM `DenseMapInfo` s
 Tests use module interfaces only:
 
 - `loop_detection_test.cpp` — `detect_loops` on synthetic waves built from plain `rocprofiler_thread_trace_decoder_*` structs: iteration counts, back-edges, per-loop totals, null-PC skipping.
+- `disassembler_test.cpp` — `Disassembler` with no `InitLLVM`, concurrent first construction, and compile-time checks that it cannot be copied or moved.
 - `att_output_dir_test.cpp` — `AttOutputDir` on temp directories of empty, rocprofv3-named files: prefix parsing, per-subdirectory runs, trace sort order, and the "cannot read <path>: <reason>" failures.
 
 The CLI's end-to-end output is not covered.

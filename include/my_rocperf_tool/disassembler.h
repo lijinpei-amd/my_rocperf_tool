@@ -176,18 +176,35 @@ class ObjectFileInfo {
   const SubTargetContext* sub_target_ctx = nullptr;
 };
 
+// Owns the code objects of one run and the MC stacks that decode them. Needs no
+// setup: the first construction in the process registers the AMDGPU target
+// with LLVM.
+//
+// Not thread-safe; give each thread its own Disassembler. Decoding fills
+// caches even through a const ObjectFileInfo (decode_at), and the MC stack
+// keeps per-call state (see SubTargetContext).
+//
+// Never relocated, hence neither copyable nor movable: every SubTargetContext's
+// MCContext holds a pointer to mc_options, which a move would leave dangling.
+// Construct it where it will stay, e.g. behind a unique_ptr or in place in a
+// node-based map.
 class Disassembler {
   llvm::DenseMap<uint64_t, ObjectFileInfo> object_files;
   llvm::DenseMap<SubTargetKey, std::unique_ptr<SubTargetContext>>
       sub_target_contexts;
   llvm::Triple triple;
   const llvm::Target* target = nullptr;
+  // Defaults, not llvm::mc::InitMCTargetOptionsFromFlags(): that reads cl::opts
+  // which exist only once a RegisterMCTargetOptionsFlags is constructed, and
+  // this tool exposes no LLVM options.
   llvm::MCTargetOptions mc_options;
   std::unique_ptr<llvm::MCRegisterInfo> mc_reg_info;
   std::unique_ptr<llvm::MCAsmInfo> mc_asm_info;
 
  public:
   Disassembler();
+  Disassembler(const Disassembler&) = delete;
+  Disassembler& operator=(const Disassembler&) = delete;
   // Returns the cached MC stack for this ISA, building it on first request.
   // The reference stays valid for the lifetime of this Disassembler.
   const SubTargetContext& get_sub_target_context(llvm::StringRef mcpu,

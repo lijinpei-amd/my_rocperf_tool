@@ -1,6 +1,7 @@
 #include "my_rocperf_tool/disassembler.h"
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/Twine.h"
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/BinaryFormat/MsgPackDocument.h"
 #include "llvm/MC/MCAsmBackend.h"
@@ -10,15 +11,16 @@
 #include "llvm/MC/MCInstPrinter.h"
 #include "llvm/MC/MCInstrInfo.h"
 #include "llvm/MC/MCStreamer.h"
-#include "llvm/MC/MCTargetOptionsCommandFlags.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Object/ELF.h"
 #include "llvm/Object/ELFObjectFile.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Compiler.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FormattedStream.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Triple.h"
 #include "rocprofiler-sdk/callback_tracing.h"
@@ -28,6 +30,7 @@
 #include <cstdint>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 
@@ -283,18 +286,36 @@ void ObjectFileInfo::decode_all_sections() const {
   for (auto& sec : inst_cache) ensure_section_decoded(sec);
 }
 
+namespace {
+// Registers only what the MC stack is built from: the target itself, its MC
+// layer (which also supplies the inst printer, code emitter, asm backend and
+// asm target streamer) and its MC disassembler. TargetRegistry is not
+// thread-safe and workers construct Disassemblers concurrently, hence once per
+// process.
+void register_amdgpu_target() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    LLVMInitializeAMDGPUTargetInfo();
+    LLVMInitializeAMDGPUTargetMC();
+    LLVMInitializeAMDGPUDisassembler();
+  });
+}
+}  // namespace
+
 Disassembler::Disassembler() {
+  register_amdgpu_target();
   triple = llvm::Triple(llvm::Triple::normalize("amdgcn-amd-amdhsa"));
   std::string error;
   target = llvm::TargetRegistry::lookupTarget(triple, error);
-  mc_options = llvm::mc::InitMCTargetOptionsFromFlags();
+  if (!target)
+    llvm::reportFatalInternalError(
+        llvm::Twine("cannot look up the AMDGPU target: ") + error);
   mc_reg_info.reset(target->createMCRegInfo(triple));
   mc_asm_info.reset(target->createMCAsmInfo(*mc_reg_info, triple, mc_options));
 }
 
 const SubTargetContext& Disassembler::get_sub_target_context(
     llvm::StringRef mcpu, llvm::StringRef features) {
-  assert(target);
   auto [iter, inserted] = sub_target_contexts.try_emplace(
       SubTargetKey{target, triple, mcpu.str(), features.str()});
   if (inserted)

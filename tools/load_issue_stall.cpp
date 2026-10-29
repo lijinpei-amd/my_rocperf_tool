@@ -1290,8 +1290,9 @@ int run_main(const std::string& att_output_dir_path,
   }
 
   // One Disassembler per run, built on a worker's first trace from that run
-  // and holding only that run's code objects. std::map never relocates its
-  // values, which matters: ObjectFileInfo keeps a reference to its owner.
+  // and holding only that run's code objects. A Disassembler cannot move (each
+  // of its MCContexts points at its MC options), so it is built in place by
+  // try_emplace in a node-based map, which never relocates its values.
   using DisasByPrefix = std::map<std::string, my_rocperf_tool::Disassembler>;
   auto disas_for = [&](DisasByPrefix& by_prefix,
                        const std::string& prefix) -> auto& {
@@ -1536,9 +1537,8 @@ int main(int argc, char* argv[]) {
               << duration_check_text << "'\n";
     return 2;
   }
-  int LLVMArgc = 1;
-  const char** LLVMArgv = const_cast<const char**>(argv);
-  my_rocperf_tool::InitLLVM X(LLVMArgc, LLVMArgv);
+  // After absl is done with argv: on some platforms InitLLVM rewrites it.
+  my_rocperf_tool::InitLLVM init_llvm(argc, argv);
   // Outlives run_main so its TOTAL scope has closed by the time we write.
   PHASE_TIMER_SESSION();
   return run_main(*att_output_dir, *duration_check);
