@@ -1,10 +1,11 @@
 #pragma once
 
-#include <cstddef>
+#include "llvm/Support/Error.h"
+#include "llvm/Support/MemoryBuffer.h"
+
 #include <cstdint>
 #include <memory>
 #include <string>
-#include <utility>
 #include <vector>
 
 namespace my_rocperf_tool {
@@ -29,15 +30,22 @@ struct AttPath {
   uint64_t dispatch_id;
 };
 
+// Both reads fail with "cannot read <path>: <OS reason>", so a caller only
+// adds its own framing.
 class AttOutputDir {
  public:
-  explicit AttOutputDir(const std::string& path);
+  // Fails if `path` or any directory under it cannot be listed: a partial
+  // scan would silently drop whole runs.
+  static llvm::Expected<AttOutputDir> scan(const std::string& path);
 
-  std::pair<std::unique_ptr<char[]>, size_t> read_att_data(
+  llvm::Expected<std::unique_ptr<llvm::MemoryBuffer>> read_att_data(
       const AttPath& path) const;
 
   std::vector<CodeObjectPath> code_objects;
   std::vector<AttPath> att_paths;
+
+ private:
+  AttOutputDir() = default;
 };
 
 }  // namespace my_rocperf_tool

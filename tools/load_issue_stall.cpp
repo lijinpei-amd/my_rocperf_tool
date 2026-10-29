@@ -14,6 +14,8 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/MC/MCInst.h"
+#include "llvm/Support/Error.h"
+#include "llvm/Support/MemoryBuffer.h"
 
 #include "fmt/base.h"
 #include "fmt/format.h"
@@ -47,7 +49,6 @@
 // lines. TimeProfiler aggregates same-named scopes into "Total <name>" entries
 // and keeps the nesting, viewable in perfetto.dev / speedscope.
 #ifdef ENABLE_TIMERS
-#include "llvm/Support/Error.h"
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -193,8 +194,7 @@ struct LoopOutputConfig {
 
 struct trace_decoder_context {
   bool first_run;
-  std::unique_ptr<char[]> att_file_content;
-  size_t att_file_size;
+  std::unique_ptr<llvm::MemoryBuffer> att_data;
   uint64_t dispatch_id;
   my_rocperf_tool::Disassembler& disas;
   my_rocperf_tool::InstStatistics stats;
@@ -238,9 +238,12 @@ uint64_t att_decoder_se_data_callback(uint8_t** buffer, uint64_t* buffer_size,
     return 0;
   }
   ctx.first_run = false;
-  uint64_t data_size = ctx.att_file_size;
+  uint64_t data_size = ctx.att_data->getBufferSize();
   *buffer_size = data_size;
-  *buffer = (uint8_t*)ctx.att_file_content.get();
+  // The decoder only reads the trace through this pointer (it parses a
+  // const uint8_t*); its callback type is just not const-qualified.
+  *buffer = reinterpret_cast<uint8_t*>(
+      const_cast<char*>(ctx.att_data->getBufferStart()));
   return data_size;
 }
 
@@ -1098,6 +1101,9 @@ void dump_loops(const DumpCtx& ctx,
 // What one trace decoded, for the end-of-run summary on stderr. Written by
 // run_trace, aggregated by run_main.
 struct TraceSummary {
+  // The .att could not be read, so nothing was decoded or emitted. Kept apart
+  // from waves == 0, which is a capture that was read and found empty.
+  bool unreadable = false;
   std::string prefix;
   uint64_t dispatch_id = 0;
   uint64_t se_id = 0;  // one .att per shader engine per dispatch
@@ -1108,20 +1114,31 @@ struct TraceSummary {
   uint64_t loops = 0;           // detected loops summed over those waves
 };
 
-int run_trace(TraceBuf& out, TraceSummary& summary,
-              const my_rocperf_tool::AttOutputDir& out_dir,
-              const my_rocperf_tool::AttPath& att_path,
-              my_rocperf_tool::Disassembler& disas, const LoopOutputConfig& cfg,
-              std::optional<uint64_t> dispatch_id_override) {
+void run_trace(TraceBuf& out, TraceSummary& summary,
+               const my_rocperf_tool::AttOutputDir& out_dir,
+               const my_rocperf_tool::AttPath& att_path,
+               my_rocperf_tool::Disassembler& disas,
+               const LoopOutputConfig& cfg,
+               std::optional<uint64_t> dispatch_id_override) {
+  // Keyed before the read, so an unreadable trace still names the dispatch
+  // whose loop-free verdict it leaves open.
+  summary.prefix = att_path.prefix;
+  summary.dispatch_id = dispatch_id_override.value_or(att_path.dispatch_id);
+  summary.se_id = att_path.se_id;
   trace_decoder_context decoder_ctx(disas);
   {
     PHASE_TIMER("trace setup + I/O");
-    auto [att_file_content, att_file_size] = out_dir.read_att_data(att_path);
+    auto att_data = out_dir.read_att_data(att_path);
+    if (!att_data) {
+      // One bad file should not cost the rest of the capture: report it, emit
+      // nothing for it, and leave failing the run to run_main.
+      fmt::print(stderr, "error: {}\n", llvm::toString(att_data.takeError()));
+      summary.unreadable = true;
+      return;
+    }
     decoder_ctx.first_run = true;
-    decoder_ctx.att_file_content = std::move(att_file_content);
-    decoder_ctx.att_file_size = att_file_size;
-    decoder_ctx.dispatch_id =
-        dispatch_id_override.value_or(att_path.dispatch_id);
+    decoder_ctx.att_data = std::move(*att_data);
+    decoder_ctx.dispatch_id = summary.dispatch_id;
     decoder_ctx.detect_loops_flag = absl::GetFlag(FLAGS_detect_loops);
     decoder_ctx.verify_duration = absl::GetFlag(FLAGS_verify_trace_duration);
     decoder_ctx.mfma_coexec_flag = absl::GetFlag(FLAGS_mfma_coexec);
@@ -1152,9 +1169,6 @@ int run_trace(TraceBuf& out, TraceSummary& summary,
               });
   }
 
-  summary.prefix = att_path.prefix;
-  summary.dispatch_id = decoder_ctx.dispatch_id;
-  summary.se_id = att_path.se_id;
   summary.waves = decoder_ctx.waves_seen;
   summary.insts = decoder_ctx.insts_seen;
   summary.waves_filtered = decoder_ctx.waves_filtered;
@@ -1191,13 +1205,17 @@ int run_trace(TraceBuf& out, TraceSummary& summary,
       }
     }
   }
-  return 0;
 }
 
 int run_main(const std::string& att_output_dir_path) {
   PHASE_TIMER("TOTAL");
 
-  my_rocperf_tool::AttOutputDir out_dir(att_output_dir_path);
+  auto scanned = my_rocperf_tool::AttOutputDir::scan(att_output_dir_path);
+  if (!scanned) {
+    std::cerr << "error: " << llvm::toString(scanned.takeError()) << "\n";
+    return 2;
+  }
+  const auto& out_dir = *scanned;
   if (out_dir.att_paths.empty()) {
     std::cerr << "no ATT trace files found in " << att_output_dir_path << "\n";
     return 2;
@@ -1263,30 +1281,36 @@ int run_main(const std::string& att_output_dir_path) {
   // Same indexing as chunks; each worker writes only its own slot.
   std::vector<TraceSummary> summaries(n_traces);
 
+  // Returns whether the trace reached the decoder.
   auto process_one = [&](DisasByPrefix& by_prefix, size_t i) {
     const auto& att_path = out_dir.att_paths[i];
     run_trace(chunks[i], summaries[i], out_dir, att_path,
               disas_for(by_prefix, att_path.prefix), cfg, dispatch_id_override);
+    return !summaries[i].unreadable;
   };
 
-  // Always process trace[0] serially first. Two reasons:
+  // Always process traces serially until one has been decoded. Two reasons:
   // 1. The decoder library lazy-inits a process-wide singleton trie
   //    (Trie::root_trie in rocprof-trace-decoder/source/trie.cpp) on its
   //    first call, guarded only by a non-atomic bool. Concurrent first
   //    calls race on its std::unordered_map writes — UB. After the first
   //    call returns, std::thread construction publishes those writes to
-  //    workers, which then only read.
+  //    workers, which then only read. An unreadable trace never makes that
+  //    call, hence "until one has been decoded" rather than just trace[0].
   // 2. The serial Disassembler then becomes the main thread's worker, so
   //    no per-worker setup work is wasted.
   DisasByPrefix main_disas;
+  size_t next_serial = 0;
   {
     PHASE_TIMER("load code objects + warmup");
-    process_one(main_disas, 0);
+    while (next_serial < n_traces) {
+      if (process_one(main_disas, next_serial++)) break;
+    }
   }
 
-  if (n_traces > 1) {
+  if (next_serial < n_traces) {
     PHASE_TIMER("parallel decode");
-    std::atomic<size_t> next{1};
+    std::atomic<size_t> next{next_serial};
     auto worker_loop = [&](DisasByPrefix& by_prefix) {
       while (true) {
         size_t i = next.fetch_add(1, std::memory_order_relaxed);
@@ -1337,16 +1361,28 @@ int run_main(const std::string& att_output_dir_path) {
     uint64_t tot_waves = 0, tot_insts = 0, tot_loop_waves = 0, tot_loops = 0;
     uint64_t tot_filtered = 0;
     uint64_t no_wave_traces = 0, filtered_only_traces = 0;
-    // A dispatch is loop-free only if some SE decoded waves and none found a
-    // loop; per-SE slots would otherwise report the same dispatch repeatedly,
-    // including dispatches whose loops all landed in another SE's trace.
+    uint64_t unreadable_traces = 0;
+    // A dispatch is loop-free only if some SE decoded waves, none found a
+    // loop, and every SE was read; per-SE slots would otherwise report the
+    // same dispatch repeatedly, including dispatches whose loops all landed
+    // in another SE's trace.
     struct DispatchAgg {
       uint64_t waves = 0;
       uint64_t loops = 0;
+      // An SE trace could not be read, so its loops (if any) are unknown.
+      bool unread = false;
     };
     // Keyed by run too: the same dispatch id in two runs is two dispatches.
     std::map<std::pair<std::string, uint64_t>, DispatchAgg> by_dispatch;
     for (const auto& s : summaries) {
+      auto& d = by_dispatch[{s.prefix, s.dispatch_id}];
+      // Never decoded, so not an empty capture: it adds nothing to the
+      // totals, but leaves its dispatch's verdict open.
+      if (s.unreadable) {
+        unreadable_traces++;
+        d.unread = true;
+        continue;
+      }
       tot_waves += s.waves;
       tot_insts += s.insts;
       tot_loop_waves += s.loop_waves;
@@ -1358,22 +1394,25 @@ int run_main(const std::string& att_output_dir_path) {
         else
           no_wave_traces++;
       }
-      auto& d = by_dispatch[{s.prefix, s.dispatch_id}];
       d.waves += s.waves;
       d.loops += s.loops;
     }
+    const uint64_t n_decoded = n_traces - unreadable_traces;
 
     const bool detect = absl::GetFlag(FLAGS_detect_loops);
     if (detect)
       fmt::print(stderr,
                  "[summary] {} trace(s), {} waves, {} instructions decoded; "
                  "{} loop instance(s) in {} wave(s)\n",
-                 n_traces, tot_waves, tot_insts, tot_loops, tot_loop_waves);
+                 n_decoded, tot_waves, tot_insts, tot_loops, tot_loop_waves);
     else
       fmt::print(stderr,
                  "[summary] {} trace(s), {} waves, {} instructions decoded; "
                  "loop detection disabled\n",
-                 n_traces, tot_waves, tot_insts);
+                 n_decoded, tot_waves, tot_insts);
+    if (unreadable_traces)
+      fmt::print(stderr, "[summary] {} of {} trace(s) could not be read\n",
+                 unreadable_traces, n_traces);
 
     // Decoding nothing is a different fact from finding no loop -- keep the
     // two apart, or the loop-free report makes a claim about a capture whose
@@ -1382,7 +1421,7 @@ int run_main(const std::string& att_output_dir_path) {
       fmt::print(stderr,
                  "[summary] {} of {} trace(s) decoded no waves "
                  "(empty, truncated, or wrong-agent capture)\n",
-                 no_wave_traces, n_traces);
+                 no_wave_traces, n_decoded);
     const int32_t simd = absl::GetFlag(FLAGS_simd);
     if (simd >= 0) {
       fmt::print(stderr,
@@ -1392,16 +1431,19 @@ int run_main(const std::string& att_output_dir_path) {
         fmt::print(stderr,
                    "[summary] {} of {} trace(s) had waves only on other "
                    "SIMDs\n",
-                   filtered_only_traces, n_traces);
+                   filtered_only_traces, n_decoded);
     }
 
     if (detect) {
       // detect_loops keeps a loop at iteration_count >= 2, and one taken
       // back-edge already yields 2 (the flush at the edge plus the trailing
       // partial iteration) -- so the criterion is "taken", not "taken twice".
+      // Unread dispatches stay in the "of M" count, like those that decoded
+      // no waves: M is every dispatch in the capture, the verdict only the
+      // ones that could be judged.
       std::vector<std::pair<std::string, uint64_t>> loop_free;
       for (const auto& [key, d] : by_dispatch)
-        if (d.waves > 0 && d.loops == 0) loop_free.push_back(key);
+        if (d.waves > 0 && d.loops == 0 && !d.unread) loop_free.push_back(key);
       if (!loop_free.empty()) {
         fmt::print(stderr,
                    "[summary] {} of {} dispatch(es) contained no loop "
@@ -1423,6 +1465,9 @@ int run_main(const std::string& att_output_dir_path) {
         }
       }
     }
+    // Each unreadable trace was reported as it failed; the exit status keeps
+    // a script from taking the partial result for the whole capture.
+    if (unreadable_traces) return 1;
   }
   return 0;
 }
