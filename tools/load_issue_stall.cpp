@@ -1,5 +1,6 @@
 #include "my_rocperf_tool/att_output_dir.h"
 #include "my_rocperf_tool/disassembler.h"
+#include "my_rocperf_tool/inst_report.h"
 #include "my_rocperf_tool/loop_detection.h"
 #include "my_rocperf_tool/loop_profile.h"
 #include "my_rocperf_tool/loop_report.h"
@@ -107,7 +108,10 @@ struct PhaseTimerSession {
 ABSL_FLAG(std::optional<std::string>, att_output_dir, std::nullopt,
           "output file dir");
 ABSL_FLAG(std::string, report, "loop_summary",
-          "report: loop_summary, loop_detail, none");
+          "report: loop_summary, loop_detail, static_inst, dynamic_inst, none. "
+          "dynamic_inst memory grows with the longest wave's records times "
+          "the groups. Waves caught mid-run in lossy captures are included, "
+          "which skews their relative issue times and occurrences");
 ABSL_FLAG(std::string, aggregate, "wave",
           "group records: wave, simd_slot, all");
 ABSL_FLAG(bool, inst_stats, true, "show per-instruction stats");
@@ -150,6 +154,8 @@ std::optional<my_rocperf_tool::ReportKind> parse_report_kind(
   using my_rocperf_tool::ReportKind;
   if (text == "loop_summary") return ReportKind::LoopSummary;
   if (text == "loop_detail") return ReportKind::LoopDetail;
+  if (text == "static_inst") return ReportKind::StaticInst;
+  if (text == "dynamic_inst") return ReportKind::DynamicInst;
   if (text == "none") return ReportKind::None;
   return std::nullopt;
 }
@@ -291,6 +297,28 @@ class LoopBodies {
  private:
   const my_rocperf_tool::Disassembler& disas;
   llvm::DenseMap<my_rocperf_tool::BackEdge, my_rocperf_tool::LoopBody> listed;
+};
+
+// Cache each executed PC's text once per trace. Map nodes keep views valid
+// when another instruction is listed, including small strings stored inline.
+class InstTexts {
+ public:
+  explicit InstTexts(const my_rocperf_tool::Disassembler& disas)
+      : disas(disas) {}
+
+  std::string_view of(const rocprofiler_thread_trace_decoder_pc_t& pc) {
+    auto [it, inserted] = listed.try_emplace({pc.code_object_id, pc.address});
+    if (inserted) {
+      const auto* obj = disas.find_code_object(pc.code_object_id);
+      assert(obj && "executed instruction names an unknown code object");
+      it->second = obj->text_at(pc.address);
+    }
+    return it->second;
+  }
+
+ private:
+  const my_rocperf_tool::Disassembler& disas;
+  std::map<std::pair<uint64_t, uint64_t>, std::string> listed;
 };
 
 std::vector<my_rocperf_tool::LoopRecord> aggregate_loops_by_back_edge(
@@ -530,6 +558,18 @@ void run_trace(my_rocperf_tool::ReportChunk& out, TraceSummary& summary,
       report.groups =
           build_loop_groups(result.wave_loops, result.profile, bodies, cfg);
       my_rocperf_tool::render_loop_report(out, cfg, report);
+    } else if (result.inst_profile) {
+      InstTexts texts(*disas);
+      my_rocperf_tool::TraceInstReport report;
+      report.prefix = att_path.prefix;
+      report.dispatch_id = summary.dispatch_id;
+      report.se_id = att_path.se_id;
+      report.counts = result.counts;
+      report.simd_filter = options.simd;
+      report.groups = result.inst_profile->groups();
+      for (auto& group : report.groups)
+        for (auto& row : group.rows) row.text = texts.of(row.pc);
+      my_rocperf_tool::render_inst_report(out, cfg, report);
     }
   }
 }
@@ -616,8 +656,8 @@ int run_main(const std::string& att_output_dir_path,
   // may complete out of order. fmt::memory_buffer owns its storage (RAII), so
   // exceptions between fill and emit don't leak.
   // Memory note: chunks hold all per-trace output until emit. For
-  // aggregate_wave_only this is small; --dump_loop_contents over thousands
-  // of traces could reach hundreds of MB.
+  // --aggregate=all loop summaries this is small; detailed per-wave
+  // reports over thousands of traces can reach hundreds of MB or more.
   std::vector<my_rocperf_tool::ReportChunk> chunks(n_traces);
   // Same indexing as chunks; each worker writes only its own slot.
   std::vector<TraceSummary> summaries(n_traces);
@@ -877,9 +917,9 @@ int main(int argc, char* argv[]) {
   }
   const auto report_text = absl::GetFlag(FLAGS_report);
   if (!parse_report_kind(report_text)) {
-    std::cerr
-        << "--report must be one of loop_summary, loop_detail, none; got '"
-        << report_text << "'\n";
+    std::cerr << "--report must be one of loop_summary, loop_detail, "
+                 "static_inst, dynamic_inst, none; got '"
+              << report_text << "'\n";
     return 2;
   }
   const auto aggregate_text = absl::GetFlag(FLAGS_aggregate);
@@ -894,6 +934,11 @@ int main(int argc, char* argv[]) {
   options.detect_loops =
       cfg.report == my_rocperf_tool::ReportKind::LoopSummary ||
       cfg.report == my_rocperf_tool::ReportKind::LoopDetail;
+  options.aggregate = cfg.aggregate;
+  if (cfg.report == my_rocperf_tool::ReportKind::StaticInst)
+    options.inst_profile = my_rocperf_tool::InstProfileKind::Static;
+  else if (cfg.report == my_rocperf_tool::ReportKind::DynamicInst)
+    options.inst_profile = my_rocperf_tool::InstProfileKind::Dynamic;
   options.mfma_coexec = absl::GetFlag(FLAGS_mfma_coexec);
   // Only the loop detail of per-wave records print a wave's rows. Taken
   // from the report's options, so the analysis keeps what they print.
