@@ -46,6 +46,7 @@ add_executable(my_rocperf_tool_tests
     att_output_dir_test.cpp
     disassembler_test.cpp
     loop_detection_test.cpp
+    inst_profile_test.cpp
     loop_profile_test.cpp
     loop_report_test.cpp
     wave_analysis_test.cpp

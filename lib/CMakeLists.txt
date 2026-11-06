@@ -10,6 +10,7 @@ add_library(my_rocperf_tool SHARED
     disassembler.cpp
     loop_detection.cpp
     mfma_shadow.cpp
+    inst_profile.cpp
     loop_profile.cpp
     loop_report.cpp
     report_document.cpp
