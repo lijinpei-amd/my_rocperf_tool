@@ -11,6 +11,7 @@ add_library(my_rocperf_tool SHARED
     loop_detection.cpp
     mfma_shadow.cpp
     inst_profile.cpp
+    inst_report.cpp
     loop_profile.cpp
     loop_report.cpp
     report_document.cpp

@@ -1,4 +1,5 @@
 #include "my_rocperf_tool/report_document.h"
+#include "my_rocperf_tool/inst_report.h"
 #include "my_rocperf_tool/loop_report.h"
 
 namespace my_rocperf_tool {
@@ -14,7 +15,11 @@ void write_report_document(const ReportConfig& cfg,
     write("[\n");
   } else if (cfg.format == ReportFormat::Csv) {
     ReportChunk header;
-    write_loop_csv_header(header, cfg);
+    if (cfg.report == ReportKind::StaticInst ||
+        cfg.report == ReportKind::DynamicInst)
+      write_inst_csv_header(header, cfg);
+    else
+      write_loop_csv_header(header, cfg);
     write_chunk(header);
   }
   // JSON separates entries: a trace that printed none, whose chunk is empty,
