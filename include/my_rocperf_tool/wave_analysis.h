@@ -1,6 +1,7 @@
 #pragma once
 
 #include "my_rocperf_tool/inst_kind.h"
+#include "my_rocperf_tool/inst_profile.h"
 #include "my_rocperf_tool/loop_detection.h"
 #include "my_rocperf_tool/loop_profile.h"
 #include "my_rocperf_tool/trace_pc.h"
@@ -43,6 +44,8 @@ struct WaveAnalysisOptions {
   // and keeps no per-wave slots.
   bool wave_loop_rows = true;
   DurationCheck duration_check = DurationCheck::Error;
+  std::optional<InstProfileKind> inst_profile;
+  AggregateScope aggregate = AggregateScope::Wave;
 };
 
 // The kind of the instruction at an attributed PC. WaveAnalysis caches the
@@ -86,6 +89,8 @@ struct WaveAnalysisResult {
   // Each wave's executions of its detected loops' bodies, as per-loop, per-PC
   // metrics.
   LoopProfile profile;
+  // Set only when a whole-wave instruction report is requested.
+  std::optional<InstProfile> inst_profile;
   // The detected loops of each wave that has any, in the order the waves were
   // added. Empty unless detect_loops.
   std::vector<WaveLoopInfo> wave_loops;
@@ -100,7 +105,7 @@ struct WaveAnalysisResult {
 //
 // Each wave goes through the same steps in a fixed order: the SIMD filter,
 // then s_barrier token coalescing, then the duration check, then loop
-// detection, then the loop profile, which takes the wave's records and loops.
+// detection, then the profiles, which take the coalesced records.
 // A filtered wave reaches no accumulator, and every accumulator sees the
 // coalesced records.
 class WaveAnalysis {

@@ -484,5 +484,90 @@ TEST(WaveAnalysisDurationCheckTest, ErrorCountsRecordsAndKeepsTheFirst) {
   EXPECT_EQ(first.stall, 5u);
 }
 
+TEST(WaveAnalysisTest, InstProfileSeesTheCoalescedWholeWave) {
+  KindTable table{{{0xf0, InstKind::ClassicBarrier}}};
+  WaveBuilder b;
+  b.at(0xf0, kMessage, 0, 5, 3)
+      .at(0xf0, kImmed, 5, 7, 2)
+      .iteration(true)
+      .iteration(false);
+  WaveAnalysisOptions options;
+  options.inst_profile = InstProfileKind::Static;
+  options.aggregate = AggregateScope::All;
+  options.detect_loops = false;
+  WaveAnalysis analysis(options, table.classifier());
+  analysis.add_wave(b.wave());
+  auto result = std::move(analysis).finish();
+  ASSERT_TRUE(result.inst_profile.has_value());
+  auto groups = result.inst_profile->groups();
+  ASSERT_EQ(groups.size(), 1u);
+  ASSERT_EQ(groups[0].rows.size(), 5u);
+  EXPECT_EQ(groups[0].rows[0].pc.address, 0xf0u);
+  EXPECT_EQ(groups[0].rows[0].sums.n, 1u);
+  EXPECT_EQ(groups[0].rows[0].sums.dur, 12u);
+  EXPECT_EQ(groups[0].rows[0].sums.stall, 5u);
+  EXPECT_EQ(groups[0].rows[1].pc.address, kLoopHeader);
+  EXPECT_EQ(groups[0].rows[1].sums.n, 2u);
+  EXPECT_EQ(result.counts.insts, 9u);
+  EXPECT_TRUE(result.wave_loops.empty());
+  EXPECT_EQ(table.calls, 5);
+}
+
+TEST(WaveAnalysisTest, InstProfileOverlapsBecomeDiagnostics) {
+  KindTable table{{{0xf0, InstKind::Mfma}, {0x100, InstKind::Mfma}}};
+  WaveBuilder b;
+  b.at(0xf0, kValu, 0, 4).at(0x100, kValu, 8, 4);
+  WaveAnalysisOptions options;
+  options.inst_profile = InstProfileKind::Dynamic;
+  options.mfma_coexec = true;
+  options.detect_loops = false;
+  WaveAnalysis analysis(options, table.classifier());
+  analysis.add_wave(b.wave());
+  auto result = std::move(analysis).finish();
+  ASSERT_EQ(result.diagnostics.size(), 1u);
+  const auto* overlap = std::get_if<MfmaShadowOverlap>(&result.diagnostics[0]);
+  ASSERT_NE(overlap, nullptr);
+  EXPECT_EQ(overlap->pc.address, 0x100u);
+  EXPECT_EQ(overlap->issue_point, 8);
+  EXPECT_EQ(overlap->shadow_end, 16);
+}
+
+TEST(WaveAnalysisTest, SimdFilterDropsWavesBeforeTheInstProfile) {
+  KindTable table;
+  WaveBuilder dropped(0, 0), kept(1, 2);
+  dropped.at(0x200, kValu, 0, 1, 9);
+  kept.inst(0xf0, kValu);
+  WaveAnalysisOptions options;
+  options.inst_profile = InstProfileKind::Static;
+  options.aggregate = AggregateScope::SimdSlot;
+  options.simd = 1;
+  options.detect_loops = false;
+  WaveAnalysis analysis(options, table.classifier());
+  analysis.add_wave(dropped.wave());
+  analysis.add_wave(kept.wave());
+  auto result = std::move(analysis).finish();
+  ASSERT_TRUE(result.inst_profile.has_value());
+  auto groups = result.inst_profile->groups();
+  ASSERT_EQ(groups.size(), 1u);
+  EXPECT_EQ(groups[0].slot.simd, 1);
+  EXPECT_EQ(groups[0].slot.wave_id, 2);
+  EXPECT_EQ(groups[0].summary.waves, 1u);
+  ASSERT_EQ(groups[0].rows.size(), 1u);
+  EXPECT_EQ(groups[0].rows[0].pc.address, 0xf0u);
+  EXPECT_EQ(result.counts.waves_filtered, 1u);
+  EXPECT_TRUE(result.diagnostics.empty());
+  EXPECT_FALSE(result.duration_check_failure);
+}
+
+TEST(WaveAnalysisTest, NoInstProfileUnlessAsked) {
+  KindTable table;
+  WaveBuilder b;
+  b.inst(0xf0, kValu);
+  WaveAnalysis analysis(WaveAnalysisOptions{}, table.classifier());
+  analysis.add_wave(b.wave());
+  auto result = std::move(analysis).finish();
+  EXPECT_FALSE(result.inst_profile.has_value());
+}
+
 }  // namespace
 }  // namespace my_rocperf_tool

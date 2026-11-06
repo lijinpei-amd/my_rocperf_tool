@@ -73,7 +73,7 @@ class InstProfile {
     WaveSlot slot;
     uint64_t wave_index;
     uint64_t waves = 0;
-    llvm::DenseMap<Key, InstRow> rows;
+    llvm::DenseMap<Key, InstRow> rows = llvm::DenseMap<Key, InstRow>();
   };
 
   InstProfileKind kind;
