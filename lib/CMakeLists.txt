@@ -12,6 +12,7 @@ add_library(my_rocperf_tool SHARED
     mfma_shadow.cpp
     loop_profile.cpp
     loop_report.cpp
+    report_document.cpp
     wave_analysis.cpp
     )
 # -external-nolink is an INTERFACE target that carries the HIP/HSA/comgr include

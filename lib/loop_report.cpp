@@ -1,6 +1,7 @@
 #include "my_rocperf_tool/loop_report.h"
 
 #include "my_rocperf_tool/loop_profile.h"
+#include "report_writer.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
@@ -18,82 +19,8 @@ namespace my_rocperf_tool {
 
 namespace {
 
-// Small wrapper around fmt::format_to so call sites stay terse.
-// fmt::format_string gives compile-time format-string checks; fmt::appender
-// is fmt's canonical writer for memory_buffer (tighter codegen than
-// std::back_inserter).
-template <typename... T>
-inline void writef(LoopReportChunk& out, fmt::format_string<T...> f,
-                   T&&... args) {
-  fmt::format_to(fmt::appender(out), f, std::forward<T>(args)...);
-}
-
-// Escape a string for CSV output (RFC 4180: double embedded quotes)
-std::string csv_escape(std::string_view s) {
-  std::string out;
-  out.reserve(s.size());
-  for (char c : s) {
-    if (c == '"')
-      out += "\"\"";
-    else
-      out += c;
-  }
-  return out;
-}
-
-// Escape a string for JSON output (handles all JSON-required escapes)
-std::string json_escape(std::string_view s) {
-  std::string out;
-  out.reserve(s.size() + 2);
-  for (unsigned char c : s) {
-    switch (c) {
-      case '"':
-        out += "\\\"";
-        break;
-      case '\\':
-        out += "\\\\";
-        break;
-      case '\b':
-        out += "\\b";
-        break;
-      case '\f':
-        out += "\\f";
-        break;
-      case '\n':
-        out += "\\n";
-        break;
-      case '\r':
-        out += "\\r";
-        break;
-      case '\t':
-        out += "\\t";
-        break;
-      default:
-        if (c < 0x20) {
-          char buf[8];
-          std::snprintf(buf, sizeof(buf), "\\u%04x", c);
-          out += buf;
-        } else {
-          out += static_cast<char>(c);
-        }
-    }
-  }
-  return out;
-}
-
-// ANSI color for bubble severity, relative to max bubble in the loop.
-// Green (0%) -> Yellow (1-25%) -> Red (25-75%) -> Bright Red (75-100%)
-const char* bubble_color(const LoopInstRow& ii, uint64_t max_bubble) {
-  if (!ii.has_stats || ii.n == 0 || ii.bubble == 0 || max_bubble == 0)
-    return "\033[32m";  // green: fully covered
-  double ratio = static_cast<double>(ii.bubble) / max_bubble;
-  if (ratio <= 0.25) return "\033[33m";  // yellow: low
-  if (ratio <= 0.75) return "\033[31m";  // red: medium
-  return "\033[1;31m";                   // bright red: high
-}
-
-void render_loop_json(LoopReportChunk& out, const ReportedLoop& loop,
-                      const LoopOutputConfig& cfg,
+void render_loop_json(ReportChunk& out, const ReportedLoop& loop,
+                      const ReportConfig& cfg,
                       std::optional<uint32_t> wave_count) {
   const auto& e = loop.record.back_edge;
   const auto& s = loop.record.stats;
@@ -113,7 +40,7 @@ void render_loop_json(LoopReportChunk& out, const ReportedLoop& loop,
     writef(out, ",\"avg_bubble\":{:.2f}", sum.avg_bubble);
   writef(out, ",\"mfma_count\":{},\"mfma_time\":{},\"mfma_util\":{:.4f}",
          sum.mfma_count, sum.mfma_time, sum.mfma_util);
-  if (cfg.show_contents) {
+  if ((cfg.report == ReportKind::LoopDetail)) {
     writef(out, ",\"instructions\":[\n");
     bool first_inst = true;
     for (const auto& ii : loop.metrics.rows) {
@@ -151,8 +78,8 @@ void render_loop_json(LoopReportChunk& out, const ReportedLoop& loop,
 }
 
 // Entries separated by ",\n", with no leading or trailing separator:
-// write_loop_report_document joins the chunks and brackets the document.
-void render_json(LoopReportChunk& out, const LoopOutputConfig& cfg,
+// write_report_document joins the chunks and brackets the document.
+void render_json(ReportChunk& out, const ReportConfig& cfg,
                  const TraceLoopReport& report) {
   bool first_entry = true;
   for (const auto& g : report.groups) {
@@ -161,19 +88,22 @@ void render_json(LoopReportChunk& out, const LoopOutputConfig& cfg,
     writef(out, "  {{");
     if (cfg.show_prefix)
       writef(out, "\"prefix\":\"{}\",", json_escape(report.prefix));
-    if (g.is_aggregate)
+    if ((g.scope == AggregateScope::All))
       writef(out, "\"dispatch_id\":{},\"aggregate\":true,\"loops\":[\n",
              report.dispatch_id);
-    else
+    else {
+      if (g.scope == AggregateScope::SimdSlot)
+        writef(out, "\"simd_slot\":true,");
       writef(out,
              "\"dispatch_id\":{},\"cu\":{},\"simd\":{},\"wave_id\":{},"
              "\"loops\":[\n",
-             report.dispatch_id, g.cu, g.simd, g.wave_id);
+             report.dispatch_id, g.slot.cu, g.slot.simd, g.slot.wave_id);
+    }
     bool first_loop = true;
     for (const auto& loop : g.loops) {
       if (!first_loop) writef(out, ",\n");
       first_loop = false;
-      auto wave_count = g.is_aggregate
+      auto wave_count = (g.scope != AggregateScope::Wave)
                             ? std::optional<uint32_t>(loop.record.wave_count)
                             : std::nullopt;
       render_loop_json(out, loop, cfg, wave_count);
@@ -182,20 +112,19 @@ void render_json(LoopReportChunk& out, const LoopOutputConfig& cfg,
   }
 }
 
-// What one CSV row is about: a loop record and, under show_contents, one of
+// What one CSV row is about: a loop record and, under LoopDetail, one of
 // its body instructions.
 struct CsvRow {
   const TraceLoopReport& report;
   const LoopGroup& group;
   const LoopRecord& record;
   const LoopSummary& summary;
-  const LoopInstRow* inst = nullptr;  // null unless show_contents
+  const LoopInstRow* inst = nullptr;  // null unless LoopDetail
 };
 
 // `total` per execution of the row's instruction. An instruction never
 // executed has no average, and its field stays blank.
-void write_per_execution(LoopReportChunk& out, const CsvRow& row,
-                         uint64_t total) {
+void write_per_execution(ReportChunk& out, const CsvRow& row, uint64_t total) {
   if (row.inst->n > 0)
     writef(out, "{:.2f}", static_cast<double>(total) / row.inst->n);
 }
@@ -205,11 +134,13 @@ void write_per_execution(LoopReportChunk& out, const CsvRow& row,
 // for each column `cfg` shows, where value(out, row) appends that column's
 // field of `row`, or nothing for a blank one.
 template <typename Column>
-void csv_columns(const LoopOutputConfig& cfg, Column&& column) {
-  using Out = LoopReportChunk;
-  if (cfg.aggregate_wave)
+void csv_columns(const ReportConfig& cfg, Column&& column) {
+  using Out = ReportChunk;
+  if ((cfg.aggregate != AggregateScope::Wave))
     column("record_type", [](Out& out, const CsvRow& r) {
-      writef(out, "{}", r.group.is_aggregate ? "aggregate" : "wave");
+      writef(
+          out, "{}",
+          (r.group.scope == AggregateScope::All) ? "aggregate" : "simd_slot");
     });
   if (cfg.show_prefix)
     column("prefix", [](Out& out, const CsvRow& r) {
@@ -220,15 +151,18 @@ void csv_columns(const LoopOutputConfig& cfg, Column&& column) {
   });
   // The aggregate is no one wave's, so its wave fields stay blank.
   column("cu", [](Out& out, const CsvRow& r) {
-    if (!r.group.is_aggregate) writef(out, "{}", r.group.cu);
+    if (!(r.group.scope == AggregateScope::All))
+      writef(out, "{}", r.group.slot.cu);
   });
   column("simd", [](Out& out, const CsvRow& r) {
-    if (!r.group.is_aggregate) writef(out, "{}", r.group.simd);
+    if (!(r.group.scope == AggregateScope::All))
+      writef(out, "{}", r.group.slot.simd);
   });
   column("wave_id", [](Out& out, const CsvRow& r) {
-    if (!r.group.is_aggregate) writef(out, "{}", r.group.wave_id);
+    if (!(r.group.scope == AggregateScope::All))
+      writef(out, "{}", r.group.slot.wave_id);
   });
-  if (cfg.aggregate_wave)
+  if ((cfg.aggregate != AggregateScope::Wave))
     column("wave_count", [](Out& out, const CsvRow& r) {
       writef(out, "{}", r.record.wave_count);
     });
@@ -276,7 +210,7 @@ void csv_columns(const LoopOutputConfig& cfg, Column&& column) {
   column("mfma_util", [](Out& out, const CsvRow& r) {
     writef(out, "{:.4f}", r.summary.mfma_util);
   });
-  if (!cfg.show_contents) return;
+  if (!(cfg.report == ReportKind::LoopDetail)) return;
 
   column("inst_addr", [](Out& out, const CsvRow& r) {
     writef(out, "0x{:x}", r.inst->vaddr);
@@ -324,7 +258,7 @@ void csv_columns(const LoopOutputConfig& cfg, Column&& column) {
   }
 }
 
-void write_csv_header(LoopReportChunk& out, const LoopOutputConfig& cfg) {
+void write_csv_header(ReportChunk& out, const ReportConfig& cfg) {
   bool first = true;
   csv_columns(cfg, [&](std::string_view name, const auto&) {
     if (!first) out.push_back(',');
@@ -334,7 +268,7 @@ void write_csv_header(LoopReportChunk& out, const LoopOutputConfig& cfg) {
   out.push_back('\n');
 }
 
-void write_csv_row(LoopReportChunk& out, const LoopOutputConfig& cfg,
+void write_csv_row(ReportChunk& out, const ReportConfig& cfg,
                    const CsvRow& row) {
   bool first = true;
   csv_columns(cfg, [&](std::string_view, const auto& value) {
@@ -345,14 +279,14 @@ void write_csv_row(LoopReportChunk& out, const LoopOutputConfig& cfg,
   out.push_back('\n');
 }
 
-// A row per record or, under show_contents, per body instruction of each
+// A row per record or, under LoopDetail, per body instruction of each
 // record.
-void render_csv(LoopReportChunk& out, const LoopOutputConfig& cfg,
+void render_csv(ReportChunk& out, const ReportConfig& cfg,
                 const TraceLoopReport& report) {
   for (const auto& g : report.groups) {
     for (const auto& loop : g.loops) {
       CsvRow row{report, g, loop.record, loop.metrics.summary};
-      if (!cfg.show_contents) {
+      if (!(cfg.report == ReportKind::LoopDetail)) {
         write_csv_row(out, cfg, row);
         continue;
       }
@@ -364,23 +298,15 @@ void render_csv(LoopReportChunk& out, const LoopOutputConfig& cfg,
   }
 }
 
-// "DispatchID=N", qualified by the run when the output spans several.
-void write_dispatch_label(LoopReportChunk& out, const LoopOutputConfig& cfg,
-                          const TraceLoopReport& report) {
-  if (cfg.show_prefix) writef(out, "Prefix={}, ", report.prefix);
-  writef(out, "DispatchID={}", report.dispatch_id);
-}
-
-void render_loop_text_stats(LoopReportChunk& out,
-                            const LoopRecordMetrics& metrics,
-                            const LoopOutputConfig& cfg) {
+void render_loop_text_stats(ReportChunk& out, const LoopRecordMetrics& metrics,
+                            const ReportConfig& cfg) {
   const auto& sum = metrics.summary;
   writef(out, "    avg/iter: dur={:.2f} stall={:.2f} idle={:.2f}", sum.avg_dur,
          sum.avg_stall, sum.avg_idle);
   if (cfg.show_mfma_coexec) writef(out, " bubble={:.2f}", sum.avg_bubble);
   writef(out, " mfma_time={} ({} mfma * {}) mfma_util={:.1f}%\n", sum.mfma_time,
          sum.mfma_count, kMfmaShadowCycles, sum.mfma_util * 100.0);
-  if (!cfg.show_contents) return;
+  if (!(cfg.report == ReportKind::LoopDetail)) return;
 
   writef(out, "    ");
   if (cfg.show_stats) {
@@ -405,7 +331,7 @@ void render_loop_text_stats(LoopReportChunk& out,
   }
   for (const auto& ii : metrics.rows) {
     if (cfg.color_mfma_bubble && ii.has_stats)
-      writef(out, "{}", bubble_color(ii, max_bubble));
+      writef(out, "{}", bubble_color(ii.bubble, max_bubble));
     writef(out, "    ");
     if (cfg.show_stats && ii.has_stats) {
       writef(out, "{:<6} ", ii.n);
@@ -441,16 +367,21 @@ void render_loop_text_stats(LoopReportChunk& out,
   }
 }
 
-void render_text(LoopReportChunk& out, const LoopOutputConfig& cfg,
+void render_text(ReportChunk& out, const ReportConfig& cfg,
                  const TraceLoopReport& report) {
   for (const auto& g : report.groups) {
-    writef(out, g.is_aggregate ? "=== Aggregate Across Waves (" : "=== Wave (");
-    write_dispatch_label(out, cfg, report);
-    if (g.is_aggregate)
+    if (g.scope == AggregateScope::All)
+      writef(out, "=== Aggregate Across Waves (");
+    else if (g.scope == AggregateScope::SimdSlot)
+      writef(out, "=== SIMD Slot (");
+    else
+      writef(out, "=== Wave (");
+    write_dispatch_label(out, cfg, report.prefix, report.dispatch_id);
+    if ((g.scope == AggregateScope::All))
       writef(out, ") ===\n");
     else
-      writef(out, ", CU={}, SIMD={}, WaveID={}) ===\n", g.cu, g.simd,
-             g.wave_id);
+      writef(out, ", CU={}, SIMD={}, WaveID={}) ===\n", g.slot.cu, g.slot.simd,
+             g.slot.wave_id);
     for (const auto& loop : g.loops) {
       const auto& e = loop.record.back_edge;
       const auto& s = loop.record.stats;
@@ -459,7 +390,7 @@ void render_text(LoopReportChunk& out, const LoopOutputConfig& cfg,
       // the avg/iter line under it shows them to two decimals.
       const auto avg_dur = static_cast<uint64_t>(sum.avg_dur);
       const auto avg_stall = static_cast<uint64_t>(sum.avg_stall);
-      if (g.is_aggregate)
+      if (g.scope != AggregateScope::Wave)
         writef(out,
                "  Loop [0x{:x} -> 0x{:x}] code_object={}: "
                "{} waves, {} iterations, {} total cycles (avg {}/iter), "
@@ -481,11 +412,11 @@ void render_text(LoopReportChunk& out, const LoopOutputConfig& cfg,
 
   // Text prints a heading per group, so a trace without groups printed
   // nothing, which would read like a failed run. A group without loops still
-  // counts: --aggregate_wave prints the aggregate's heading even when no wave
+  // counts: --aggregate=all prints the aggregate's heading even when no wave
   // has a loop, and a banner would contradict it.
   if (!report.groups.empty()) return;
   writef(out, "=== ");
-  write_dispatch_label(out, cfg, report);
+  write_dispatch_label(out, cfg, report.prefix, report.dispatch_id);
   writef(out, ", SE={}: no loops detected ({} waves, {} instructions",
          report.se_id, report.counts.waves, report.counts.insts);
   if (report.simd_filter >= 0)
@@ -496,44 +427,23 @@ void render_text(LoopReportChunk& out, const LoopOutputConfig& cfg,
 
 }  // namespace
 
-void render_loop_report(LoopReportChunk& out, const LoopOutputConfig& cfg,
+void write_loop_csv_header(ReportChunk& out, const ReportConfig& cfg) {
+  write_csv_header(out, cfg);
+}
+
+void render_loop_report(ReportChunk& out, const ReportConfig& cfg,
                         const TraceLoopReport& report) {
   switch (cfg.format) {
-    case LoopOutputFormat::Json:
+    case ReportFormat::Json:
       render_json(out, cfg, report);
       break;
-    case LoopOutputFormat::Csv:
+    case ReportFormat::Csv:
       render_csv(out, cfg, report);
       break;
-    case LoopOutputFormat::Text:
+    case ReportFormat::Text:
       render_text(out, cfg, report);
       break;
   }
-}
-
-void write_loop_report_document(
-    const LoopOutputConfig& cfg, llvm::ArrayRef<LoopReportChunk> chunks,
-    llvm::function_ref<void(std::string_view)> write) {
-  auto write_chunk = [&](const LoopReportChunk& chunk) {
-    write(std::string_view(chunk.data(), chunk.size()));
-  };
-  if (cfg.format == LoopOutputFormat::Json) {
-    write("[\n");
-  } else if (cfg.format == LoopOutputFormat::Csv) {
-    LoopReportChunk header;
-    write_csv_header(header, cfg);
-    write_chunk(header);
-  }
-  // JSON separates entries: a trace that printed none, whose chunk is empty,
-  // gets no separator either.
-  bool first_nonempty = true;
-  for (const auto& chunk : chunks) {
-    if (chunk.size() == 0) continue;
-    if (cfg.format == LoopOutputFormat::Json && !first_nonempty) write(",\n");
-    write_chunk(chunk);
-    first_nonempty = false;
-  }
-  if (cfg.format == LoopOutputFormat::Json) write("\n]\n");
 }
 
 }  // namespace my_rocperf_tool

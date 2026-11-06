@@ -3,6 +3,7 @@
 #include "my_rocperf_tool/loop_detection.h"
 #include "my_rocperf_tool/loop_profile.h"
 #include "my_rocperf_tool/loop_report.h"
+#include "my_rocperf_tool/report_document.h"
 #include "my_rocperf_tool/wave_analysis.h"
 
 #include "absl/flags/flag.h"
@@ -105,21 +106,15 @@ struct PhaseTimerSession {
 
 ABSL_FLAG(std::optional<std::string>, att_output_dir, std::nullopt,
           "output file dir");
-ABSL_FLAG(bool, detect_loops, true, "detect and report loops in ATT traces");
-ABSL_FLAG(bool, dump_loop_contents, false,
-          "disassemble instructions inside each detected loop");
-ABSL_FLAG(bool, loop_inst_stats, true,
-          "show per-instruction stats column in loop contents");
-ABSL_FLAG(bool, loop_inst_addr, true,
-          "show instruction address column in loop contents");
-ABSL_FLAG(bool, loop_inst_avg, false,
-          "show average per-execution stats in loop contents");
-ABSL_FLAG(std::string, loop_output_format, "text",
-          "output format for loop data: text, csv, json");
-ABSL_FLAG(bool, aggregate_wave, false,
-          "show loop statistics aggregated across waves");
-ABSL_FLAG(bool, aggregate_wave_only, false,
-          "show only loop statistics aggregated across waves");
+ABSL_FLAG(std::string, report, "loop_summary",
+          "report: loop_summary, loop_detail, none");
+ABSL_FLAG(std::string, aggregate, "wave",
+          "group records: wave, simd_slot, all");
+ABSL_FLAG(bool, inst_stats, true, "show per-instruction stats");
+ABSL_FLAG(bool, inst_addr, true, "show instruction addresses in text");
+ABSL_FLAG(bool, inst_avg, false,
+          "show average per-execution instruction stats");
+ABSL_FLAG(std::string, output_format, "text", "output format: text, csv, json");
 ABSL_FLAG(std::string, verify_trace_duration, "error",
           "check that each trace record's duration >= stall: off; warn (print "
           "a WARNING per offending record and continue); error (print one "
@@ -127,7 +122,7 @@ ABSL_FLAG(std::string, verify_trace_duration, "error",
           "record, emit nothing for that trace, and exit 1 once the other "
           "traces are done). true and false are accepted as warn and off");
 ABSL_FLAG(bool, mfma_coexec, false,
-          "analyze MFMA shadow coverage for loop instructions");
+          "analyze MFMA shadow coverage for reported instructions");
 ABSL_FLAG(bool, color_mfma_bubble, false,
           "colorize instructions by bubble severity (text output only)");
 ABSL_FLAG(bool, decode_all_insts, false,
@@ -150,26 +145,39 @@ std::optional<my_rocperf_tool::DurationCheck> parse_duration_check(
   return std::nullopt;
 }
 
-// The loop report's options, but for show_prefix, which depends on the
-// directory.
-my_rocperf_tool::LoopOutputConfig loop_output_config_from_flags() {
-  my_rocperf_tool::LoopOutputConfig cfg;
-  cfg.show_contents = absl::GetFlag(FLAGS_dump_loop_contents);
-  cfg.show_stats = absl::GetFlag(FLAGS_loop_inst_stats);
-  cfg.show_addr = absl::GetFlag(FLAGS_loop_inst_addr);
-  cfg.show_avg = absl::GetFlag(FLAGS_loop_inst_avg);
+std::optional<my_rocperf_tool::ReportKind> parse_report_kind(
+    const std::string& text) {
+  using my_rocperf_tool::ReportKind;
+  if (text == "loop_summary") return ReportKind::LoopSummary;
+  if (text == "loop_detail") return ReportKind::LoopDetail;
+  if (text == "none") return ReportKind::None;
+  return std::nullopt;
+}
+
+std::optional<my_rocperf_tool::AggregateScope> parse_aggregate_scope(
+    const std::string& text) {
+  using my_rocperf_tool::AggregateScope;
+  if (text == "wave") return AggregateScope::Wave;
+  if (text == "simd_slot") return AggregateScope::SimdSlot;
+  if (text == "all") return AggregateScope::All;
+  return std::nullopt;
+}
+
+// show_prefix depends on the directory and is filled by run_main.
+my_rocperf_tool::ReportConfig report_config_from_flags() {
+  my_rocperf_tool::ReportConfig cfg;
+  cfg.report = *parse_report_kind(absl::GetFlag(FLAGS_report));
+  cfg.aggregate = *parse_aggregate_scope(absl::GetFlag(FLAGS_aggregate));
+  cfg.show_stats = absl::GetFlag(FLAGS_inst_stats);
+  cfg.show_addr = absl::GetFlag(FLAGS_inst_addr);
+  cfg.show_avg = absl::GetFlag(FLAGS_inst_avg);
   cfg.show_mfma_coexec = absl::GetFlag(FLAGS_mfma_coexec);
   cfg.color_mfma_bubble = absl::GetFlag(FLAGS_color_mfma_bubble);
-  cfg.aggregate_wave = absl::GetFlag(FLAGS_aggregate_wave);
-  cfg.aggregate_wave_only = absl::GetFlag(FLAGS_aggregate_wave_only);
-  if (cfg.aggregate_wave_only) cfg.aggregate_wave = true;
-  auto fmt = absl::GetFlag(FLAGS_loop_output_format);
-  if (fmt == "json")
-    cfg.format = my_rocperf_tool::LoopOutputFormat::Json;
-  else if (fmt == "csv")
-    cfg.format = my_rocperf_tool::LoopOutputFormat::Csv;
-  else
-    cfg.format = my_rocperf_tool::LoopOutputFormat::Text;
+  auto format = absl::GetFlag(FLAGS_output_format);
+  if (format == "json")
+    cfg.format = my_rocperf_tool::ReportFormat::Json;
+  else if (format == "csv")
+    cfg.format = my_rocperf_tool::ReportFormat::Csv;
   return cfg;
 }
 
@@ -286,16 +294,20 @@ class LoopBodies {
 };
 
 std::vector<my_rocperf_tool::LoopRecord> aggregate_loops_by_back_edge(
-    const std::vector<my_rocperf_tool::WaveLoopInfo>& wave_loops) {
+    const std::vector<my_rocperf_tool::WaveLoopInfo>& wave_loops,
+    std::optional<my_rocperf_tool::WaveSlot> slot = std::nullopt) {
   std::vector<my_rocperf_tool::LoopRecord> result;
   llvm::DenseMap<my_rocperf_tool::BackEdge, size_t> index_by_edge;
   for (const auto& wl : wave_loops) {
+    if (slot &&
+        !(my_rocperf_tool::WaveSlot{wl.cu, wl.simd, wl.wave_id} == *slot))
+      continue;
     for (const auto& dl : wl.loops) {
       const auto& edge = dl.back_edge;
       auto it = index_by_edge.find(edge);
       if (it == index_by_edge.end()) {
         it = index_by_edge.try_emplace(edge, result.size()).first;
-        result.push_back({edge, {}, 0, std::nullopt});
+        result.push_back({edge, {}, 0, std::nullopt, slot});
       }
 
       auto& agg = result[it->second];
@@ -315,30 +327,37 @@ std::vector<my_rocperf_tool::LoopRecord> aggregate_loops_by_back_edge(
   return result;
 }
 
-// The report's groups, in print order: a group per wave with loops unless
-// --aggregate_wave_only, then the aggregate under --aggregate_wave. Each
-// record is resolved here, against the profile and its loop's body, so
-// rendering reads plain data.
+// Resolve records to plain data, in the selected scope's print order.
 std::vector<my_rocperf_tool::LoopGroup> build_loop_groups(
     const std::vector<my_rocperf_tool::WaveLoopInfo>& wave_loops,
     const my_rocperf_tool::LoopProfile& profile, LoopBodies& bodies,
-    const my_rocperf_tool::LoopOutputConfig& cfg) {
-  auto resolve = [&](const my_rocperf_tool::LoopRecord& record) {
-    return my_rocperf_tool::ReportedLoop{
-        record, profile.metrics(record, bodies.of(record.back_edge))};
+    const my_rocperf_tool::ReportConfig& cfg) {
+  using namespace my_rocperf_tool;
+  auto resolve = [&](const LoopRecord& record) {
+    return ReportedLoop{record,
+                        profile.metrics(record, bodies.of(record.back_edge))};
   };
-  std::vector<my_rocperf_tool::LoopGroup> groups;
-  if (!cfg.aggregate_wave_only) {
+  std::vector<LoopGroup> groups;
+  if (cfg.aggregate == AggregateScope::Wave) {
     for (const auto& wl : wave_loops) {
-      my_rocperf_tool::LoopGroup g{false, wl.cu, wl.simd, wl.wave_id, {}};
+      LoopGroup g{AggregateScope::Wave, {wl.cu, wl.simd, wl.wave_id}, {}};
       g.loops.reserve(wl.loops.size());
       for (const auto& dl : wl.loops)
         g.loops.push_back(resolve({dl.back_edge, dl.stats, 1, wl.wave_index}));
       groups.push_back(std::move(g));
     }
-  }
-  if (cfg.aggregate_wave) {
-    my_rocperf_tool::LoopGroup g{true, 0, 0, 0, {}};
+  } else if (cfg.aggregate == AggregateScope::SimdSlot) {
+    std::set<WaveSlot> slots;
+    for (const auto& wl : wave_loops)
+      if (!wl.loops.empty()) slots.insert({wl.cu, wl.simd, wl.wave_id});
+    for (const auto& slot : slots) {
+      LoopGroup g{AggregateScope::SimdSlot, slot, {}};
+      for (const auto& record : aggregate_loops_by_back_edge(wave_loops, slot))
+        g.loops.push_back(resolve(record));
+      groups.push_back(std::move(g));
+    }
+  } else {
+    LoopGroup g{AggregateScope::All, {}, {}};
     for (const auto& record : aggregate_loops_by_back_edge(wave_loops))
       g.loops.push_back(resolve(record));
     groups.push_back(std::move(g));
@@ -372,7 +391,7 @@ struct TraceSummary {
   uint64_t se_id = 0;  // one .att per shader engine per dispatch
   my_rocperf_tool::WaveCounts counts;
   // The trace's stderr text, which run_main prints in trace order. Most
-  // traces have none, and an empty string, unlike a LoopReportChunk,
+  // traces have none, and an empty string, unlike a ReportChunk,
   // reserves nothing. Printed only once every worker has joined: an abort in
   // a later trace loses the lines buffered so far, and under
   // --verify_trace_duration=warn every warning stays in memory until the end.
@@ -399,11 +418,11 @@ struct DiagnosticWriter {
 };
 
 // `disas` is null when a code object of the trace's run failed to load.
-void run_trace(my_rocperf_tool::LoopReportChunk& out, TraceSummary& summary,
+void run_trace(my_rocperf_tool::ReportChunk& out, TraceSummary& summary,
                const my_rocperf_tool::AttOutputDir& out_dir,
                const my_rocperf_tool::AttPath& att_path,
                my_rocperf_tool::Disassembler* disas,
-               const my_rocperf_tool::LoopOutputConfig& cfg,
+               const my_rocperf_tool::ReportConfig& cfg,
                const my_rocperf_tool::WaveAnalysisOptions& options,
                std::optional<uint64_t> dispatch_id_override) {
   // Keyed before the read, so an unreadable trace still names the dispatch
@@ -491,8 +510,8 @@ void run_trace(my_rocperf_tool::LoopReportChunk& out, TraceSummary& summary,
     std::sort(result.wave_loops.begin(), result.wave_loops.end(),
               [](const my_rocperf_tool::WaveLoopInfo& a,
                  const my_rocperf_tool::WaveLoopInfo& b) {
-                return std::tie(a.cu, a.simd, a.wave_id) <
-                       std::tie(b.cu, b.simd, b.wave_id);
+                return std::tie(a.cu, a.simd, a.wave_id, a.wave_index) <
+                       std::tie(b.cu, b.simd, b.wave_id, b.wave_index);
               });
   }
 
@@ -517,7 +536,7 @@ void run_trace(my_rocperf_tool::LoopReportChunk& out, TraceSummary& summary,
 
 // `cfg` lacks only show_prefix, which run_main sets from the directory.
 int run_main(const std::string& att_output_dir_path,
-             my_rocperf_tool::LoopOutputConfig cfg,
+             my_rocperf_tool::ReportConfig cfg,
              const my_rocperf_tool::WaveAnalysisOptions& options) {
   PHASE_TIMER("TOTAL");
 
@@ -599,7 +618,7 @@ int run_main(const std::string& att_output_dir_path,
   // Memory note: chunks hold all per-trace output until emit. For
   // aggregate_wave_only this is small; --dump_loop_contents over thousands
   // of traces could reach hundreds of MB.
-  std::vector<my_rocperf_tool::LoopReportChunk> chunks(n_traces);
+  std::vector<my_rocperf_tool::ReportChunk> chunks(n_traces);
   // Same indexing as chunks; each worker writes only its own slot.
   std::vector<TraceSummary> summaries(n_traces);
 
@@ -675,7 +694,7 @@ int run_main(const std::string& att_output_dir_path,
   for (const auto& s : summaries)
     std::fwrite(s.diagnostics.data(), 1, s.diagnostics.size(), stderr);
 
-  my_rocperf_tool::write_loop_report_document(
+  my_rocperf_tool::write_report_document(
       cfg, chunks, [](std::string_view piece) {
         std::fwrite(piece.data(), 1, piece.size(), stdout);
       });
@@ -755,8 +774,7 @@ int run_main(const std::string& att_output_dir_path,
                  n_reported, tot_waves, tot_insts, tot_loops, tot_loop_waves);
     else
       fmt::print(stderr,
-                 "[summary] {} trace(s), {} waves, {} instructions decoded; "
-                 "loop detection disabled\n",
+                 "[summary] {} trace(s), {} waves, {} instructions decoded\n",
                  n_reported, tot_waves, tot_insts);
     if (unreadable_traces)
       fmt::print(stderr, "[summary] {} of {} trace(s) could not be read\n",
@@ -857,14 +875,31 @@ int main(int argc, char* argv[]) {
               << duration_check_text << "'\n";
     return 2;
   }
-  const auto cfg = loop_output_config_from_flags();
+  const auto report_text = absl::GetFlag(FLAGS_report);
+  if (!parse_report_kind(report_text)) {
+    std::cerr
+        << "--report must be one of loop_summary, loop_detail, none; got '"
+        << report_text << "'\n";
+    return 2;
+  }
+  const auto aggregate_text = absl::GetFlag(FLAGS_aggregate);
+  if (!parse_aggregate_scope(aggregate_text)) {
+    std::cerr << "--aggregate must be one of wave, simd_slot, all; got '"
+              << aggregate_text << "'\n";
+    return 2;
+  }
+  const auto cfg = report_config_from_flags();
   my_rocperf_tool::WaveAnalysisOptions options;
   options.simd = absl::GetFlag(FLAGS_simd);
-  options.detect_loops = absl::GetFlag(FLAGS_detect_loops);
+  options.detect_loops =
+      cfg.report == my_rocperf_tool::ReportKind::LoopSummary ||
+      cfg.report == my_rocperf_tool::ReportKind::LoopDetail;
   options.mfma_coexec = absl::GetFlag(FLAGS_mfma_coexec);
-  // Only the loop contents of per-wave records print a wave's rows. Taken
+  // Only the loop detail of per-wave records print a wave's rows. Taken
   // from the report's options, so the analysis keeps what they print.
-  options.wave_loop_rows = cfg.show_contents && !cfg.aggregate_wave_only;
+  options.wave_loop_rows =
+      cfg.report == my_rocperf_tool::ReportKind::LoopDetail &&
+      cfg.aggregate == my_rocperf_tool::AggregateScope::Wave;
   options.duration_check = *duration_check;
   // For crash handlers and stack traces; a Disassembler registers its target
   // itself. After absl is done with argv: on some platforms InitLLVM rewrites

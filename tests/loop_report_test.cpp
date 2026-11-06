@@ -1,4 +1,7 @@
 #include "my_rocperf_tool/loop_report.h"
+#include "my_rocperf_tool/report_document.h"
+
+#include <algorithm>
 
 #include "my_rocperf_tool/inst_kind.h"
 #include "my_rocperf_tool/loop_detection.h"
@@ -65,62 +68,71 @@ ReportedLoop loop_record(const LoopBody& body, uint32_t iterations,
   return loop;
 }
 
-// Two waves that ran the loop and, with `aggregate`, the aggregate over them.
 // The prefix needs escaping in CSV and JSON.
-TraceLoopReport trace_report(const LoopBody& body, bool aggregate,
+TraceLoopReport trace_report(const LoopBody& body, AggregateScope scope,
                              uint64_t dispatch_id) {
   TraceLoopReport report;
   report.prefix = R"(run "1",a)";
   report.dispatch_id = dispatch_id;
   report.se_id = 2;
-  report.groups.push_back({false, 1, 0, 2, {loop_record(body, 4, 1, 0)}});
-  report.groups.push_back({false, 3, 1, 0, {loop_record(body, 4, 1, 1)}});
-  if (aggregate)
+  if (scope == AggregateScope::All) {
     report.groups.push_back(
-        {true, 0, 0, 0, {loop_record(body, 8, 2, std::nullopt)}});
+        {scope, {}, {loop_record(body, 8, 2, std::nullopt)}});
+  } else if (scope == AggregateScope::Wave) {
+    report.groups.push_back({scope, {1, 0, 2}, {loop_record(body, 4, 1, 0)}});
+    report.groups.push_back({scope, {3, 1, 0}, {loop_record(body, 4, 1, 1)}});
+  } else {
+    report.groups.push_back(
+        {scope, {1, 0, 2}, {loop_record(body, 8, 2, std::nullopt)}});
+    report.groups.push_back(
+        {scope, {3, 1, 0}, {loop_record(body, 4, 1, std::nullopt)}});
+    for (auto& g : report.groups) g.loops[0].record.slot = g.slot;
+  }
   return report;
 }
 
-LoopReportChunk render(const LoopOutputConfig& cfg,
-                       const TraceLoopReport& report) {
-  LoopReportChunk chunk;
+ReportChunk render(const ReportConfig& cfg, const TraceLoopReport& report) {
+  ReportChunk chunk;
   render_loop_report(chunk, cfg, report);
   return chunk;
 }
 
-std::string to_string(const LoopReportChunk& chunk) {
+std::string to_string(const ReportChunk& chunk) {
   return std::string(chunk.data(), chunk.size());
 }
 
-std::string document(const LoopOutputConfig& cfg,
-                     llvm::ArrayRef<LoopReportChunk> chunks) {
+std::string document(const ReportConfig& cfg,
+                     llvm::ArrayRef<ReportChunk> chunks) {
   std::string doc;
-  write_loop_report_document(cfg, chunks,
-                             [&](std::string_view piece) { doc += piece; });
+  write_report_document(cfg, chunks,
+                        [&](std::string_view piece) { doc += piece; });
   return doc;
 }
 
 // Every combination of the options that add or drop columns and keys.
-std::vector<LoopOutputConfig> option_matrix(LoopOutputFormat format) {
-  std::vector<LoopOutputConfig> configs;
-  for (unsigned bits = 0; bits < 32; bits++) {
-    LoopOutputConfig cfg;
+std::vector<ReportConfig> option_matrix(ReportFormat format) {
+  std::vector<ReportConfig> configs;
+  for (unsigned bits = 0; bits < 16; bits++) {
+    ReportConfig cfg;
     cfg.format = format;
     cfg.show_avg = bits & 1;
     cfg.show_mfma_coexec = bits & 2;
-    cfg.show_contents = bits & 4;
-    cfg.aggregate_wave = bits & 8;
-    cfg.show_prefix = bits & 16;
-    configs.push_back(cfg);
+    cfg.report = bits & 4 ? ReportKind::LoopDetail : ReportKind::LoopSummary;
+    cfg.show_prefix = bits & 8;
+    for (auto scope : {AggregateScope::Wave, AggregateScope::SimdSlot,
+                       AggregateScope::All}) {
+      cfg.aggregate = scope;
+      configs.push_back(cfg);
+    }
   }
   return configs;
 }
 
-std::string describe(const LoopOutputConfig& cfg) {
+std::string describe(const ReportConfig& cfg) {
   return "show_avg=" + std::to_string(cfg.show_avg) +
          " show_mfma_coexec=" + std::to_string(cfg.show_mfma_coexec) +
-         " show_contents=" + std::to_string(cfg.show_contents) +
-         " aggregate_wave=" + std::to_string(cfg.aggregate_wave) +
+         " detail=" + std::to_string((cfg.report == ReportKind::LoopDetail)) +
+         " aggregate=" + std::to_string(static_cast<int>(cfg.aggregate)) +
          " show_prefix=" + std::to_string(cfg.show_prefix);
 }
 
@@ -174,18 +186,19 @@ size_t column(const std::vector<std::string>& header, std::string_view name) {
 
 TEST(LoopReportTest, CsvRowsHaveTheHeadersColumns) {
   auto body = list_loop();
-  for (const auto& cfg : option_matrix(LoopOutputFormat::Csv)) {
+  for (const auto& cfg : option_matrix(ReportFormat::Csv)) {
     SCOPED_TRACE(describe(cfg));
-    std::vector<LoopReportChunk> chunks;
-    chunks.push_back(render(cfg, trace_report(body, cfg.aggregate_wave, 7)));
+    std::vector<ReportChunk> chunks;
+    chunks.push_back(render(cfg, trace_report(body, cfg.aggregate, 7)));
 
     auto doc = document(cfg, chunks);
 
     auto rows = lines(doc);
     ASSERT_FALSE(rows.empty());
     const auto header = split_csv(rows[0]);
-    const size_t records = cfg.aggregate_wave ? 3 : 2;
-    const size_t rows_per_record = cfg.show_contents ? body.size() : 1;
+    const size_t records = cfg.aggregate == AggregateScope::All ? 1 : 2;
+    const size_t rows_per_record =
+        (cfg.report == ReportKind::LoopDetail) ? body.size() : 1;
     ASSERT_EQ(rows.size(), 1 + records * rows_per_record);
     for (size_t i = 1; i < rows.size(); i++) {
       SCOPED_TRACE(rows[i]);
@@ -194,7 +207,7 @@ TEST(LoopReportTest, CsvRowsHaveTheHeadersColumns) {
       if (cfg.show_prefix) {
         EXPECT_EQ(fields[column(header, "prefix")], R"(run "1",a)");
       }
-      if (!cfg.show_contents) continue;
+      if (!(cfg.report == ReportKind::LoopDetail)) continue;
       const auto& inst = body[(i - 1) % rows_per_record];
       EXPECT_EQ(fields[column(header, "instruction")], inst.text);
       if (inst.vaddr != kSkipped) continue;
@@ -209,14 +222,14 @@ TEST(LoopReportTest, CsvRowsHaveTheHeadersColumns) {
 
 TEST(LoopReportTest, JsonDocumentParses) {
   auto body = list_loop();
-  for (const auto& cfg : option_matrix(LoopOutputFormat::Json)) {
+  for (const auto& cfg : option_matrix(ReportFormat::Json)) {
     SCOPED_TRACE(describe(cfg));
-    std::vector<LoopReportChunk> chunks;
-    chunks.push_back(render(cfg, trace_report(body, cfg.aggregate_wave, 7)));
+    std::vector<ReportChunk> chunks;
+    chunks.push_back(render(cfg, trace_report(body, cfg.aggregate, 7)));
     // A trace that printed nothing, between two that did.
     chunks.push_back(render(cfg, TraceLoopReport{}));
     ASSERT_EQ(chunks.back().size(), 0u);
-    chunks.push_back(render(cfg, trace_report(body, cfg.aggregate_wave, 8)));
+    chunks.push_back(render(cfg, trace_report(body, cfg.aggregate, 8)));
 
     auto doc = document(cfg, chunks);
 
@@ -226,13 +239,13 @@ TEST(LoopReportTest, JsonDocumentParses) {
         << doc;
     const auto* entries = parsed->getAsArray();
     ASSERT_NE(entries, nullptr);
-    ASSERT_EQ(entries->size(), cfg.aggregate_wave ? 6u : 4u);
+    ASSERT_EQ(entries->size(), cfg.aggregate == AggregateScope::All ? 2u : 4u);
     for (const auto& entry : *entries) {
       const auto* loops = entry.getAsObject()->getArray("loops");
       ASSERT_NE(loops, nullptr);
       ASSERT_EQ(loops->size(), 1u);
       const auto* insts = (*loops)[0].getAsObject()->getArray("instructions");
-      ASSERT_EQ(insts != nullptr, cfg.show_contents);
+      ASSERT_EQ(insts != nullptr, (cfg.report == ReportKind::LoopDetail));
       if (!insts) continue;
       ASSERT_EQ(insts->size(), body.size());
       for (size_t i = 0; i < body.size(); i++) {
@@ -255,14 +268,14 @@ TEST(LoopReportTest, JsonDocumentParses) {
 // rather than by the entries already written breaks on the first.
 TEST(LoopReportTest, JsonDocumentSkipsEmptyChunksAnywhere) {
   auto body = list_loop();
-  LoopOutputConfig cfg;
-  cfg.format = LoopOutputFormat::Json;
+  ReportConfig cfg;
+  cfg.format = ReportFormat::Json;
   auto one_entry = [&](uint64_t dispatch_id) {
-    auto report = trace_report(body, /*aggregate=*/false, dispatch_id);
+    auto report = trace_report(body, AggregateScope::Wave, dispatch_id);
     report.groups.resize(1);
     return render(cfg, report);
   };
-  std::vector<LoopReportChunk> chunks;
+  std::vector<ReportChunk> chunks;
   chunks.push_back(render(cfg, TraceLoopReport{}));
   chunks.push_back(one_entry(7));
   chunks.push_back(render(cfg, TraceLoopReport{}));
@@ -281,9 +294,9 @@ TEST(LoopReportTest, JsonDocumentSkipsEmptyChunksAnywhere) {
 
 TEST(LoopReportTest, TextHasAHeadingPerGroup) {
   auto body = list_loop();
-  for (const auto& cfg : option_matrix(LoopOutputFormat::Text)) {
+  for (const auto& cfg : option_matrix(ReportFormat::Text)) {
     SCOPED_TRACE(describe(cfg));
-    auto report = trace_report(body, cfg.aggregate_wave, 7);
+    auto report = trace_report(body, cfg.aggregate, 7);
 
     auto text = to_string(render(cfg, report));
 
@@ -297,9 +310,9 @@ TEST(LoopReportTest, TextHasAHeadingPerGroup) {
 
 TEST(LoopReportTest, TextMatchesGolden) {
   auto body = list_loop();
-  LoopOutputConfig cfg;
-  cfg.show_contents = true;
-  auto report = trace_report(body, /*aggregate=*/false, 7);
+  ReportConfig cfg;
+  cfg.report = ReportKind::LoopDetail;
+  auto report = trace_report(body, AggregateScope::Wave, 7);
   report.groups.resize(1);
 
   auto text = to_string(render(cfg, report));
@@ -317,7 +330,7 @@ TEST(LoopReportTest, TextMatchesGolden) {
 }
 
 // A report as a trace without loops resolves it: no group, unless
-// --aggregate_wave adds the aggregate's.
+// --aggregate=all adds the aggregate's.
 TraceLoopReport loop_free_report() {
   TraceLoopReport report;
   report.prefix = "run_a";
@@ -330,7 +343,7 @@ TraceLoopReport loop_free_report() {
 }
 
 TEST(LoopReportTest, TextBannersATraceWithoutGroups) {
-  LoopOutputConfig cfg;
+  ReportConfig cfg;
   auto report = loop_free_report();
 
   EXPECT_EQ(to_string(render(cfg, report)),
@@ -346,21 +359,101 @@ TEST(LoopReportTest, TextBannersATraceWithoutGroups) {
 }
 
 TEST(LoopReportTest, EmptyAggregateHeadingSuppressesTheBanner) {
-  LoopOutputConfig cfg;
-  cfg.aggregate_wave = true;
+  ReportConfig cfg;
+  cfg.aggregate = AggregateScope::All;
   auto report = loop_free_report();
-  report.groups.push_back({true, 0, 0, 0, {}});
+  report.groups.push_back({AggregateScope::All, {}, {}});
 
   EXPECT_EQ(to_string(render(cfg, report)),
             "=== Aggregate Across Waves (DispatchID=7) ===\n");
 }
 
 TEST(LoopReportTest, NoBannerOutsideText) {
-  for (auto format : {LoopOutputFormat::Csv, LoopOutputFormat::Json}) {
-    LoopOutputConfig cfg;
+  for (auto format : {ReportFormat::Csv, ReportFormat::Json}) {
+    ReportConfig cfg;
     cfg.format = format;
 
     EXPECT_EQ(render(cfg, loop_free_report()).size(), 0u);
+  }
+}
+
+TEST(LoopReportTest, CsvSlotAndAggregateRowsNameTheirRecordType) {
+  auto body = list_loop();
+  for (auto scope :
+       {AggregateScope::Wave, AggregateScope::SimdSlot, AggregateScope::All}) {
+    ReportConfig cfg;
+    cfg.format = ReportFormat::Csv;
+    cfg.aggregate = scope;
+    std::vector<ReportChunk> chunks;
+    chunks.push_back(render(cfg, trace_report(body, scope, 7)));
+    auto doc = document(cfg, chunks);
+    auto rows = lines(doc);
+    auto header = split_csv(rows[0]);
+    auto fields = split_csv(rows[1]);
+    if (scope == AggregateScope::Wave) {
+      EXPECT_EQ(std::find(header.begin(), header.end(), "record_type"),
+                header.end());
+      EXPECT_EQ(std::find(header.begin(), header.end(), "wave_count"),
+                header.end());
+    } else {
+      EXPECT_EQ(fields[column(header, "record_type")],
+                scope == AggregateScope::SimdSlot ? "simd_slot" : "aggregate");
+      EXPECT_EQ(fields[column(header, "wave_count")], "2");
+      EXPECT_EQ(fields[column(header, "cu")],
+                scope == AggregateScope::SimdSlot ? "1" : "");
+      EXPECT_EQ(fields[column(header, "simd")],
+                scope == AggregateScope::SimdSlot ? "0" : "");
+      EXPECT_EQ(fields[column(header, "wave_id")],
+                scope == AggregateScope::SimdSlot ? "2" : "");
+    }
+  }
+}
+
+TEST(LoopReportTest, JsonSlotGroupsAreMarked) {
+  auto body = list_loop();
+  ReportConfig cfg;
+  cfg.format = ReportFormat::Json;
+  cfg.aggregate = AggregateScope::SimdSlot;
+  std::vector<ReportChunk> chunks;
+  chunks.push_back(render(cfg, trace_report(body, cfg.aggregate, 7)));
+  auto parsed = llvm::json::parse(document(cfg, chunks));
+  ASSERT_TRUE(static_cast<bool>(parsed)) << llvm::toString(parsed.takeError());
+  auto* entries = parsed->getAsArray();
+  ASSERT_NE(entries, nullptr);
+  ASSERT_EQ(entries->size(), 2u);
+  auto* g = (*entries)[0].getAsObject();
+  EXPECT_EQ(g->getBoolean("simd_slot"), true);
+  EXPECT_EQ(g->getInteger("cu"), 1);
+  EXPECT_EQ(g->get("aggregate"), nullptr);
+  EXPECT_EQ((*g->getArray("loops"))[0].getAsObject()->getInteger("wave_count"),
+            2);
+}
+
+TEST(LoopReportTest, TextSlotHeadingAndLoopLine) {
+  auto body = list_loop();
+  ReportConfig cfg;
+  cfg.aggregate = AggregateScope::SimdSlot;
+  auto report = trace_report(body, cfg.aggregate, 7);
+  report.groups.resize(1);
+  report.groups[0].loops[0] = loop_record(body, 4, 2, std::nullopt);
+  report.groups[0].loops[0].record.slot = report.groups[0].slot;
+  auto text = to_string(render(cfg, report));
+  EXPECT_EQ(text, R"(=== SIMD Slot (DispatchID=7, CU=1, SIMD=0, WaveID=2) ===
+  Loop [0x100 -> 0x110] code_object=1: 2 waves, 4 iterations, 130 total cycles (avg 32/iter), stall 26 (avg 6/iter), idle 10
+    avg/iter: dur=32.50 stall=6.50 idle=2.50 mfma_time=16 (1 mfma * 16) mfma_util=49.2%
+)");
+}
+
+TEST(LoopReportTest, ReportNoneWritesNothing) {
+  auto body = list_loop();
+  for (auto format :
+       {ReportFormat::Text, ReportFormat::Csv, ReportFormat::Json}) {
+    ReportConfig cfg;
+    cfg.format = format;
+    std::vector<ReportChunk> chunks;
+    chunks.push_back(render(cfg, trace_report(body, AggregateScope::Wave, 7)));
+    cfg.report = ReportKind::None;
+    EXPECT_EQ(document(cfg, chunks), "");
   }
 }
 
