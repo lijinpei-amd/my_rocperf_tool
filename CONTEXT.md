@@ -24,7 +24,7 @@ _Avoid_: load address, runtime address.
 ## Waves and records
 
 **Wave**:
-One wavefront's decoded records in time order, with the `cu` (WGP on gfx10+), `simd` and `wave_id` slot it ran in. Waves reuse slots, so `wave_index`, the wave's position among those its trace analyzed, tells them apart. Waves caught mid-run in lossy captures are included; a missing beginning skews their relative issue and occurrence alignment.
+One wavefront's decoded records in time order, with the `cu` (WGP on gfx10+), `simd` and `wave_id` slot it ran in. Waves reuse slots, so `wave_index`, the wave's position among those its trace analyzed, tells them apart. Waves caught mid-run in lossy traces are included; a missing beginning skews their relative issue and occurrence alignment.
 
 **Record**:
 One entry of a wave: one execution of the instruction at its PC, with a category (`JUMP` is a taken branch), `time`, `stall` and `duration`. A record with a null PC ({0, 0}) is unattributed and left out of every count.

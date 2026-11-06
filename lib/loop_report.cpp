@@ -40,7 +40,7 @@ void render_loop_json(ReportChunk& out, const ReportedLoop& loop,
     writef(out, ",\"avg_bubble\":{:.2f}", sum.avg_bubble);
   writef(out, ",\"mfma_count\":{},\"mfma_time\":{},\"mfma_util\":{:.4f}",
          sum.mfma_count, sum.mfma_time, sum.mfma_util);
-  if ((cfg.report == ReportKind::LoopDetail)) {
+  if (cfg.report == ReportKind::LoopDetail) {
     writef(out, ",\"instructions\":[\n");
     bool first_inst = true;
     for (const auto& ii : loop.metrics.rows) {
@@ -88,7 +88,7 @@ void render_json(ReportChunk& out, const ReportConfig& cfg,
     writef(out, "  {{");
     if (cfg.show_prefix)
       writef(out, "\"prefix\":\"{}\",", json_escape(report.prefix));
-    if ((g.scope == AggregateScope::All))
+    if (g.scope == AggregateScope::All)
       writef(out, "\"dispatch_id\":{},\"aggregate\":true,\"loops\":[\n",
              report.dispatch_id);
     else {
@@ -136,7 +136,7 @@ void write_per_execution(ReportChunk& out, const CsvRow& row, uint64_t total) {
 template <typename Column>
 void csv_columns(const ReportConfig& cfg, Column&& column) {
   using Out = ReportChunk;
-  if ((cfg.aggregate != AggregateScope::Wave))
+  if (cfg.aggregate != AggregateScope::Wave)
     column("record_type", [](Out& out, const CsvRow& r) {
       writef(
           out, "{}",
@@ -151,18 +151,18 @@ void csv_columns(const ReportConfig& cfg, Column&& column) {
   });
   // The aggregate is no one wave's, so its wave fields stay blank.
   column("cu", [](Out& out, const CsvRow& r) {
-    if (!(r.group.scope == AggregateScope::All))
+    if (r.group.scope != AggregateScope::All)
       writef(out, "{}", r.group.slot.cu);
   });
   column("simd", [](Out& out, const CsvRow& r) {
-    if (!(r.group.scope == AggregateScope::All))
+    if (r.group.scope != AggregateScope::All)
       writef(out, "{}", r.group.slot.simd);
   });
   column("wave_id", [](Out& out, const CsvRow& r) {
-    if (!(r.group.scope == AggregateScope::All))
+    if (r.group.scope != AggregateScope::All)
       writef(out, "{}", r.group.slot.wave_id);
   });
-  if ((cfg.aggregate != AggregateScope::Wave))
+  if (cfg.aggregate != AggregateScope::Wave)
     column("wave_count", [](Out& out, const CsvRow& r) {
       writef(out, "{}", r.record.wave_count);
     });
@@ -210,7 +210,7 @@ void csv_columns(const ReportConfig& cfg, Column&& column) {
   column("mfma_util", [](Out& out, const CsvRow& r) {
     writef(out, "{:.4f}", r.summary.mfma_util);
   });
-  if (!(cfg.report == ReportKind::LoopDetail)) return;
+  if (cfg.report != ReportKind::LoopDetail) return;
 
   column("inst_addr", [](Out& out, const CsvRow& r) {
     writef(out, "0x{:x}", r.inst->vaddr);
@@ -286,7 +286,7 @@ void render_csv(ReportChunk& out, const ReportConfig& cfg,
   for (const auto& g : report.groups) {
     for (const auto& loop : g.loops) {
       CsvRow row{report, g, loop.record, loop.metrics.summary};
-      if (!(cfg.report == ReportKind::LoopDetail)) {
+      if (cfg.report != ReportKind::LoopDetail) {
         write_csv_row(out, cfg, row);
         continue;
       }
@@ -306,7 +306,7 @@ void render_loop_text_stats(ReportChunk& out, const LoopRecordMetrics& metrics,
   if (cfg.show_mfma_coexec) writef(out, " bubble={:.2f}", sum.avg_bubble);
   writef(out, " mfma_time={} ({} mfma * {}) mfma_util={:.1f}%\n", sum.mfma_time,
          sum.mfma_count, kMfmaShadowCycles, sum.mfma_util * 100.0);
-  if (!(cfg.report == ReportKind::LoopDetail)) return;
+  if (cfg.report != ReportKind::LoopDetail) return;
 
   writef(out, "    ");
   if (cfg.show_stats) {
@@ -377,7 +377,7 @@ void render_text(ReportChunk& out, const ReportConfig& cfg,
     else
       writef(out, "=== Wave (");
     write_dispatch_label(out, cfg, report.prefix, report.dispatch_id);
-    if ((g.scope == AggregateScope::All))
+    if (g.scope == AggregateScope::All)
       writef(out, ") ===\n");
     else
       writef(out, ", CU={}, SIMD={}, WaveID={}) ===\n", g.slot.cu, g.slot.simd,

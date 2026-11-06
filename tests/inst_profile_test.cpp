@@ -4,6 +4,7 @@
 
 #include <array>
 #include <tuple>
+#include <utility>
 
 namespace my_rocperf_tool {
 namespace {
@@ -28,7 +29,7 @@ TEST(InstProfileTest, StaticRowsSumEachPcOverWaves) {
         .inst(0x110, kSalu);
     EXPECT_TRUE(profile.add_wave(b.wave(), i, table.classifier()).empty());
   }
-  auto groups = profile.groups();
+  auto groups = std::move(profile).groups();
   ASSERT_EQ(groups.size(), 1u);
   const auto& g = groups[0];
   ASSERT_EQ(g.rows.size(), 4u);
@@ -62,7 +63,7 @@ TEST(InstProfileTest, RelIsAnchoredAtTheFirstRecordAndIdleAtBeginTime) {
   b.wait(100).inst(0xf0, kSalu).inst(0x100, kValu);
   InstProfile profile(InstProfileKind::Static, AggregateScope::All, false);
   profile.add_wave(b.wave(), 0, table.classifier());
-  auto groups = profile.groups();
+  auto groups = std::move(profile).groups();
   ASSERT_EQ(groups.size(), 1u);
   EXPECT_EQ(row_at(groups[0], 0xf0).sums.idle, 100u);
   EXPECT_EQ(row_at(groups[0], 0xf0).sums.rel_issue, 0u);
@@ -81,7 +82,7 @@ TEST(InstProfileTest, MfmaShadowRunsAcrossTheWholeWave) {
   auto b = shadow_wave();
   InstProfile profile(InstProfileKind::Static, AggregateScope::All, true);
   EXPECT_TRUE(profile.add_wave(b.wave(), 0, table.classifier()).empty());
-  auto groups = profile.groups();
+  auto groups = std::move(profile).groups();
   ASSERT_EQ(groups.size(), 1u);
   EXPECT_EQ(row_at(groups[0], 0xf0).sums.bubble, 0u);
   EXPECT_EQ(row_at(groups[0], 0x100).sums.bubble, 0u);
@@ -94,7 +95,7 @@ TEST(InstProfileTest, WithoutMfmaCoexecNoBubblesButMfmasCount) {
   auto b = shadow_wave();
   InstProfile profile(InstProfileKind::Static, AggregateScope::All, false);
   EXPECT_TRUE(profile.add_wave(b.wave(), 0, table.classifier()).empty());
-  auto groups = profile.groups();
+  auto groups = std::move(profile).groups();
   ASSERT_EQ(groups.size(), 1u);
   for (const auto& r : groups[0].rows) EXPECT_EQ(r.sums.bubble, 0u);
   EXPECT_EQ(row_at(groups[0], 0xf0).kind, InstKind::Mfma);
@@ -108,7 +109,7 @@ TEST(InstProfileTest, SkipsNullPcRecords) {
   b.null_pc().inst(0xf0, kSalu).null_pc().inst(0x100, kValu);
   InstProfile profile(InstProfileKind::Static, AggregateScope::All, false);
   profile.add_wave(b.wave(), 0, table.classifier());
-  auto groups = profile.groups();
+  auto groups = std::move(profile).groups();
   ASSERT_EQ(groups.size(), 1u);
   EXPECT_EQ(groups[0].rows.size(), 2u);
   EXPECT_DOUBLE_EQ(groups[0].summary.avg_records, 2);
@@ -123,7 +124,7 @@ TEST(InstProfileTest, IssueIsZeroWhereStallExceedsDuration) {
   b.at(0xf0, kValu, 0, 2, 5).at(0x100, kValu, 10, 4, 1);
   InstProfile profile(InstProfileKind::Static, AggregateScope::All, false);
   profile.add_wave(b.wave(), 0, table.classifier());
-  auto groups = profile.groups();
+  auto groups = std::move(profile).groups();
   ASSERT_EQ(groups.size(), 1u);
   EXPECT_EQ(row_at(groups[0], 0xf0).sums.issue, 0u);
   EXPECT_EQ(row_at(groups[0], 0x100).sums.rel_issue, 6u);
@@ -141,7 +142,7 @@ TEST(InstProfileTest, DynamicRowsKeyByPcAndOccurrence) {
   KindTable table;
   InstProfile profile(InstProfileKind::Dynamic, AggregateScope::All, false);
   branching_waves(profile, table);
-  auto groups = profile.groups();
+  auto groups = std::move(profile).groups();
   ASSERT_EQ(groups.size(), 1u);
   const auto& rows = groups[0].rows;
   ASSERT_EQ(rows.size(), 4u);
@@ -161,7 +162,7 @@ TEST(InstProfileTest, StaticRowsCountEveryExecution) {
   KindTable table;
   InstProfile profile(InstProfileKind::Static, AggregateScope::All, false);
   branching_waves(profile, table);
-  auto groups = profile.groups();
+  auto groups = std::move(profile).groups();
   ASSERT_EQ(groups.size(), 1u);
   EXPECT_EQ(groups[0].rows.size(), 3u);
   EXPECT_EQ(row_at(groups[0], 0x100).sums.n, 3u);
@@ -185,7 +186,7 @@ TEST(InstProfileTest, GroupsFollowTheScope) {
         waves[i].inst(0xf0, kValu);
         profile.add_wave(waves[i].wave(), i, table.classifier());
       }
-      auto groups = profile.groups();
+      auto groups = std::move(profile).groups();
       if (scope == AggregateScope::Wave) {
         ASSERT_EQ(groups.size(), 4u);
         const std::array<uint64_t, 4> order{3, 0, 2, 1};
@@ -227,7 +228,7 @@ TEST(InstProfileTest, WaveWithoutAttributedRecordsHasAnEmptyGroup) {
       b.null_pc();
       InstProfile profile(kind, scope, true);
       profile.add_wave(b.wave(), 0, table.classifier());
-      auto groups = profile.groups();
+      auto groups = std::move(profile).groups();
       ASSERT_EQ(groups.size(), 1u);
       EXPECT_TRUE(groups[0].rows.empty());
       const auto& s = groups[0].summary;

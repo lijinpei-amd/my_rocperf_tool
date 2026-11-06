@@ -335,9 +335,9 @@ class InstProfile {
   std::vector<MfmaShadowOverlap> add_wave(const wave_t& wave,
                                           uint64_t wave_index,
                                           KindLookup kind_at);
-  // In report order: Wave groups by (slot, wave_index); SimdSlot groups by
-  // slot; one All group, or none if no wave was added.
-  std::vector<InstGroup> groups() const;
+  // Consumes the profile. In report order: Wave groups by (slot, wave_index);
+  // SimdSlot groups by slot; one All group, or none if no wave was added.
+  std::vector<InstGroup> groups() &&;
 };
 ```
 
@@ -441,7 +441,7 @@ TEST(WaveAnalysisTest, InstProfileSeesTheCoalescedWholeWave) {
   // inst_profile=Static, aggregate=All, detect_loops=false; 0xf0 is ClassicBarrier.
   // Wave: MESSAGE+IMMED token pair at 0xf0 (built as in
   // CoalescesBarrierTokenPairIntoOneRecord), then iteration(true), iteration(false).
-  // result.inst_profile->groups()[0]: row 0xf0 n=1; row kLoopHeader n=2; result.wave_loops empty.
+  // std::move(*result.inst_profile).groups()[0]: row 0xf0 n=1; row kLoopHeader n=2; result.wave_loops empty.
 }
 TEST(WaveAnalysisTest, InstProfileOverlapsBecomeDiagnostics) {
   // inst_profile=Dynamic, mfma_coexec; the overlap wave of ReportsMfmaShadowOverlaps:
@@ -596,7 +596,7 @@ git commit -m "Render static and dynamic instruction reports"
   - `parse_report_kind` also accepts `static_inst`, `dynamic_inst`.
   - `main` sets `options.inst_profile` (Static/Dynamic) and `options.aggregate` from the flags.
   - `class InstTexts { explicit InstTexts(const Disassembler&); std::string_view of(const rocprofiler_thread_trace_decoder_pc_t& pc); };`: each PC's `text_at` once per trace, in a node-based map (`std::map<std::pair<uint64_t, uint64_t>, std::string>`) so the views stay valid.
-  - In `run_trace`, under an instruction report: `groups = result.inst_profile->groups()`, each row's `text = texts.of(row.pc)`, then a `TraceInstReport` (prefix, dispatch id, SE, counts, SIMD filter) through `render_inst_report`.
+  - In `run_trace`, under an instruction report: `groups = std::move(*result.inst_profile).groups()` consumes the profile, each row's `text = texts.of(row.pc)`, then a `TraceInstReport` (prefix, dispatch id, SE, counts, SIMD filter) through `render_inst_report`.
   - `--report` help text names the five values, says `dynamic_inst` memory grows with the longest wave's records times the groups, and that waves caught mid-run (lossy captures) are included, which skews their `rel` and occurrences.
 
 - [ ] **Step 1: Implement**

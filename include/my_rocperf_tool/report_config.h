@@ -28,7 +28,10 @@ struct ReportConfig {
   bool show_prefix = false;
 };
 
-// One trace's buffered part of the document, written in trace order.
+// One trace's buffered part of the document, written in trace order. The
+// small buffer is below fmt::memory_buffer's default (500): loop summary
+// output under --aggregate=all fits in under 256 bytes, and the caller holds
+// one chunk per trace until the document is written.
 using ReportChunk = fmt::basic_memory_buffer<char, 256>;
 
 }  // namespace my_rocperf_tool

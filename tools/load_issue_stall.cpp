@@ -110,7 +110,7 @@ ABSL_FLAG(std::optional<std::string>, att_output_dir, std::nullopt,
 ABSL_FLAG(std::string, report, "loop_summary",
           "report: loop_summary, loop_detail, static_inst, dynamic_inst, none. "
           "dynamic_inst memory grows with the longest wave's records times "
-          "the groups. Waves caught mid-run in lossy captures are included, "
+          "the groups. Waves caught mid-run in lossy traces are included, "
           "which skews their relative issue times and occurrences");
 ABSL_FLAG(std::string, aggregate, "wave",
           "group records: wave, simd_slot, all");
@@ -327,8 +327,7 @@ std::vector<my_rocperf_tool::LoopRecord> aggregate_loops_by_back_edge(
   std::vector<my_rocperf_tool::LoopRecord> result;
   llvm::DenseMap<my_rocperf_tool::BackEdge, size_t> index_by_edge;
   for (const auto& wl : wave_loops) {
-    if (slot &&
-        !(my_rocperf_tool::WaveSlot{wl.cu, wl.simd, wl.wave_id} == *slot))
+    if (slot && my_rocperf_tool::WaveSlot{wl.cu, wl.simd, wl.wave_id} != *slot)
       continue;
     for (const auto& dl : wl.loops) {
       const auto& edge = dl.back_edge;
@@ -566,7 +565,7 @@ void run_trace(my_rocperf_tool::ReportChunk& out, TraceSummary& summary,
       report.se_id = att_path.se_id;
       report.counts = result.counts;
       report.simd_filter = options.simd;
-      report.groups = result.inst_profile->groups();
+      report.groups = std::move(*result.inst_profile).groups();
       for (auto& group : report.groups)
         for (auto& row : group.rows) row.text = texts.of(row.pc);
       my_rocperf_tool::render_inst_report(out, cfg, report);

@@ -499,7 +499,7 @@ TEST(WaveAnalysisTest, InstProfileSeesTheCoalescedWholeWave) {
   analysis.add_wave(b.wave());
   auto result = std::move(analysis).finish();
   ASSERT_TRUE(result.inst_profile.has_value());
-  auto groups = result.inst_profile->groups();
+  auto groups = std::move(*result.inst_profile).groups();
   ASSERT_EQ(groups.size(), 1u);
   ASSERT_EQ(groups[0].rows.size(), 5u);
   EXPECT_EQ(groups[0].rows[0].pc.address, 0xf0u);
@@ -547,7 +547,7 @@ TEST(WaveAnalysisTest, SimdFilterDropsWavesBeforeTheInstProfile) {
   analysis.add_wave(kept.wave());
   auto result = std::move(analysis).finish();
   ASSERT_TRUE(result.inst_profile.has_value());
-  auto groups = result.inst_profile->groups();
+  auto groups = std::move(*result.inst_profile).groups();
   ASSERT_EQ(groups.size(), 1u);
   EXPECT_EQ(groups[0].slot.simd, 1);
   EXPECT_EQ(groups[0].slot.wave_id, 2);

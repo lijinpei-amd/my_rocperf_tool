@@ -19,6 +19,7 @@ struct WaveSlot {
     return std::tie(cu, simd, wave_id) ==
            std::tie(other.cu, other.simd, other.wave_id);
   }
+  bool operator!=(const WaveSlot& other) const { return !(*this == other); }
   bool operator<(const WaveSlot& other) const {
     return std::tie(cu, simd, wave_id) <
            std::tie(other.cu, other.simd, other.wave_id);

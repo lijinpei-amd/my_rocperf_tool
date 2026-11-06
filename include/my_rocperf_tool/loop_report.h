@@ -4,14 +4,8 @@
 #include "my_rocperf_tool/report_config.h"
 #include "my_rocperf_tool/wave_analysis.h"
 
-#include "llvm/ADT/ArrayRef.h"
-#include "llvm/ADT/STLFunctionalExtras.h"
-
-#include "fmt/format.h"
-
 #include <cstdint>
 #include <string>
-#include <string_view>
 #include <vector>
 
 namespace my_rocperf_tool {
@@ -24,8 +18,8 @@ struct ReportedLoop {
   LoopRecordMetrics metrics;
 };
 
-// The records printed under one heading: a wave's, or the aggregate across
-// waves.
+// The records printed under one heading: a wave's, a slot's or the aggregate
+// across waves.
 struct LoopGroup {
   AggregateScope scope = AggregateScope::Wave;
   WaveSlot slot;  // unused under All

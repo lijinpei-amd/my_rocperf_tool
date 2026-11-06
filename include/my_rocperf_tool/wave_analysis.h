@@ -104,8 +104,9 @@ struct WaveAnalysisResult {
 // kept.
 //
 // Each wave goes through the same steps in a fixed order: the SIMD filter,
-// then s_barrier token coalescing, then the duration check, then loop
-// detection, then the profiles, which take the coalesced records.
+// then s_barrier token coalescing, then the duration check, then the
+// instruction profile, then loop detection and the loop profile. The
+// instruction and loop profiles are independent.
 // A filtered wave reaches no accumulator, and every accumulator sees the
 // coalesced records.
 class WaveAnalysis {

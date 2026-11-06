@@ -63,9 +63,9 @@ class InstProfile {
   std::vector<MfmaShadowOverlap> add_wave(const wave_t& wave,
                                           uint64_t wave_index,
                                           KindLookup kind_at);
-  // In report order: Wave groups by (slot, wave_index); SimdSlot groups by
-  // slot; one All group, or none if no wave was added.
-  std::vector<InstGroup> groups() const;
+  // Consumes the profile. In report order: Wave groups by (slot, wave_index);
+  // SimdSlot groups by slot; one All group, or none if no wave was added.
+  std::vector<InstGroup> groups() &&;
 
  private:
   using Key = std::pair<pc_t, uint32_t>;

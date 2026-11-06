@@ -15,8 +15,8 @@ namespace my_rocperf_tool {
 
 namespace {
 
-// Instructions are dword-aligned, so a body PC's slot is its dword offset.
-size_t body_slot(const BackEdge& edge, uint64_t addr) {
+// Instructions are dword-aligned, so a body PC indexes its dword offset.
+size_t body_dword(const BackEdge& edge, uint64_t addr) {
   return (addr - edge.target_addr) / 4;
 }
 
@@ -59,18 +59,18 @@ void LoopProfile::add_passes(const wave_t& wave, uint64_t wave_index,
                              WaveSlot wave_slot, const BackEdge& edge,
                              KindLookup kind_at,
                              std::vector<MfmaShadowOverlap>& overlaps) {
-  const size_t body_size = body_slot(edge, edge.source_addr) + 1;
+  const size_t body_size = body_dword(edge, edge.source_addr) + 1;
   auto& loop = loop_totals[edge];
-  if (loop.aggregate.slots.empty()) {
-    loop.aggregate.slots.resize(body_size);
+  if (loop.aggregate.dwords.empty()) {
+    loop.aggregate.dwords.resize(body_size);
     loop.kinds.resize(body_size);
   }
   [[maybe_unused]] auto [record_it, inserted] =
       wave_totals.try_emplace({wave_index, edge});
   assert(inserted && "a loop added twice for one wave");
   RecordTotals& record = record_it->second;
-  std::vector<SlotTotals>& slots = wave_rows ? record.slots : scratch_slots;
-  slots.assign(body_size, SlotTotals{});
+  std::vector<DwordTotals>& dwords = wave_rows ? record.dwords : scratch_dwords;
+  dwords.assign(body_size, DwordTotals{});
 
   int64_t last_time = wave.begin_time;
   int64_t iter_start = -1;
@@ -82,34 +82,34 @@ void LoopProfile::add_passes(const wave_t& wave, uint64_t wave_index,
     // detect_loops counts it.
     uint32_t idle = compute_idle(inst, last_time);
     if (!edge.contains(inst.pc)) continue;
-    const size_t index = body_slot(edge, inst.pc.address);
-    auto& slot = slots[index];
-    slot.count++;
-    slot.duration += inst.duration;
-    slot.stall += inst.stall;
-    slot.idle += idle;
-    slot.issue += issue_cycles(inst);
+    const size_t index = body_dword(edge, inst.pc.address);
+    auto& dword = dwords[index];
+    dword.count++;
+    dword.duration += inst.duration;
+    dword.stall += inst.stall;
+    dword.idle += idle;
+    dword.issue += issue_cycles(inst);
 
     // New iteration starts when we hit the loop header.
     if (inst.pc.address == edge.target_addr)
       iter_start = inst.time + inst.stall;
     if (iter_start >= 0) {
       int64_t rel = (inst.time + inst.stall) - iter_start;
-      if (rel >= 0) slot.rel_issue += static_cast<uint64_t>(rel);
+      if (rel >= 0) dword.rel_issue += static_cast<uint64_t>(rel);
     }
 
     if (!mfma_coexec) continue;
     auto& kind = loop.kinds[index];
     if (!kind) kind = kind_at(inst.pc);
-    slot.bubble += shadow.step(inst, *kind == InstKind::Mfma, overlaps);
+    dword.bubble += shadow.step(inst, *kind == InstKind::Mfma, overlaps);
   }
 
   auto& slot_record = slot_totals[{wave_slot, edge}];
-  slot_record.slots.resize(body_size);
+  slot_record.dwords.resize(body_size);
   for (size_t i = 0; i < body_size; i++) {
-    slot_record.slots[i] += slots[i];
-    loop.aggregate.slots[i] += slots[i];
-    record.bubble += slots[i].bubble;
+    slot_record.dwords[i] += dwords[i];
+    loop.aggregate.dwords[i] += dwords[i];
+    record.bubble += dwords[i].bubble;
   }
   loop.aggregate.bubble += record.bubble;
   slot_record.bubble += record.bubble;
@@ -140,15 +140,15 @@ LoopRecordMetrics LoopProfile::metrics(const LoopRecord& record,
       LoopInstRow row{inst.vaddr, inst.text, inst.kind, 0, 0,    0,
                       0,          0,         0,         0, false};
       if (totals) {
-        const auto& slot = totals->slots[body_slot(edge, inst.vaddr)];
-        row.n = slot.count;
-        row.dur = slot.duration;
-        row.stall = slot.stall;
-        row.idle = slot.idle;
-        row.issue = slot.issue;
-        row.bubble = slot.bubble;
-        row.rel_issue = slot.rel_issue;
-        row.has_stats = slot.count > 0;
+        const auto& dword = totals->dwords[body_dword(edge, inst.vaddr)];
+        row.n = dword.count;
+        row.dur = dword.duration;
+        row.stall = dword.stall;
+        row.idle = dword.idle;
+        row.issue = dword.issue;
+        row.bubble = dword.bubble;
+        row.rel_issue = dword.rel_issue;
+        row.has_stats = dword.count > 0;
       }
       result.rows.push_back(row);
     }

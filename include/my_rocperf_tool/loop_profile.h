@@ -31,8 +31,8 @@ struct LoopBodyInst {
 // ObjectFileInfo.
 using LoopBody = std::vector<LoopBodyInst>;
 
-// Names one record of a loop: the passes one wave made through its body, or
-// those of every wave in which detect_loops found it.
+// Names one record of a loop: the passes of one wave, the waves of one slot,
+// or every wave in which detect_loops found it.
 struct LoopRecord {
   BackEdge back_edge;
   // detect_loops' totals over the record's passes.
@@ -40,8 +40,8 @@ struct LoopRecord {
   // The waves the record covers, 1 for a per-wave record. Only the report
   // prints it: LoopProfile::metrics does not read it.
   uint32_t wave_count;
-  // A per-wave record's wave, by WaveLoopInfo::wave_index; nullopt for the
-  // aggregate.
+  // A per-wave record's wave, by WaveLoopInfo::wave_index; nullopt for a
+  // per-slot or aggregate record.
   std::optional<uint64_t> wave;
   // Set only for a per-slot record; wave and slot are mutually exclusive.
   std::optional<WaveSlot> slot;
@@ -84,15 +84,17 @@ struct LoopRecordMetrics {
 
 // The per-loop, per-PC metrics of one trace's waves. Waves are added one at a
 // time, each with the loops detect_loops found in it, and nothing of a wave is
-// kept but running sums: a bubble total per loop it ran, and that loop's rows
-// only where a wave's rows are kept. Memory grows with the loop bodies and the
-// waves' loops, not with the records.
+// kept but running sums: a bubble total per loop record, rows for per-slot
+// and aggregate records, and per-wave rows when requested. Memory grows with
+// the loop bodies and the waves' loops, not with the records.
 //
-// A query names the record it is for, a wave's or the aggregate, and every
-// number in the answer counts that record's executions, so averages per
-// execution and per iteration divide within one population:
+// A query names a per-wave (wave set), per-slot (slot set) or aggregate
+// (neither set) record. Every number counts that record's executions, so
+// averages per execution and per iteration divide within one population:
 // - a wave's record: each execution, in that wave, of a PC in the loop's
 //   body, which is what detect_loops sums into that wave's LoopStats;
+// - a slot's record: those of its waves in which detect_loops found the loop,
+//   the waves whose LoopStats the per-slot record sums;
 // - the aggregate: those of the waves in which detect_loops found the loop,
 //   the waves whose LoopStats the aggregate record sums.
 // A wave that runs a body without detect_loops finding the loop adds to no
@@ -131,7 +133,7 @@ class LoopProfile {
 
  private:
   // A body dword's sums over a record's executions.
-  struct SlotTotals {
+  struct DwordTotals {
     uint64_t count = 0;
     uint64_t duration = 0;
     uint64_t stall = 0;
@@ -140,7 +142,7 @@ class LoopProfile {
     uint64_t bubble = 0;
     uint64_t rel_issue = 0;
 
-    SlotTotals& operator+=(const SlotTotals& other) {
+    DwordTotals& operator+=(const DwordTotals& other) {
       count += other.count;
       duration += other.duration;
       stall += other.stall;
@@ -151,13 +153,13 @@ class LoopProfile {
       return *this;
     }
   };
-  // One record's sums. The bubble total is kept apart from the slots, so a
+  // One record's sums. The bubble total is kept apart from the dwords, so a
   // wave's summary needs no rows.
   struct RecordTotals {
-    // A slot per body dword: the walk touches every record of every pass, so
+    // Sums per body dword: the walk touches every record of every pass, so
     // its lookup must be an index rather than a hash. Empty for a wave's
     // record without wave_rows.
-    std::vector<SlotTotals> slots;
+    std::vector<DwordTotals> dwords;
     uint64_t bubble = 0;
   };
   // A loop's aggregate record, and the kind of the instruction at each body
@@ -167,8 +169,8 @@ class LoopProfile {
     std::vector<std::optional<InstKind>> kinds;
   };
 
-  // Sums the wave's executions of `edge`'s body into the wave's record and the
-  // loop's aggregate, relative issue and, under mfma_coexec, MFMA-shadow
+  // Sums the wave's executions of `edge`'s body into the wave's, slot's and
+  // aggregate records, relative issue and, under mfma_coexec, MFMA-shadow
   // bubbles included, in one walk.
   void add_passes(const wave_t& wave, uint64_t wave_index, WaveSlot wave_slot,
                   const BackEdge& edge, KindLookup kind_at,
@@ -180,9 +182,9 @@ class LoopProfile {
   // Keyed by wave_index and loop.
   llvm::DenseMap<std::pair<uint64_t, BackEdge>, RecordTotals> wave_totals;
   llvm::DenseMap<std::pair<WaveSlot, BackEdge>, RecordTotals> slot_totals;
-  // The walk's slots when the wave's are not kept, reused across waves so
+  // The walk's dwords when the wave's are not kept, reused across waves so
   // that only kept rows allocate.
-  std::vector<SlotTotals> scratch_slots;
+  std::vector<DwordTotals> scratch_dwords;
 };
 
 }  // namespace my_rocperf_tool

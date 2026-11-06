@@ -79,6 +79,7 @@ std::vector<MfmaShadowOverlap> InstProfile::add_wave(const wave_t& wave,
     int64_t issue_point = inst.time + inst.stall;
     if (!first_issue) first_issue = issue_point;
     int64_t rel = issue_point - *first_issue;
+    // Drop negative relative issue, as loop rows do for duration below stall.
     if (rel >= 0) sums.rel_issue += static_cast<uint64_t>(rel);
     if (mfma_coexec)
       sums.bubble += shadow.step(inst, inst_kind == InstKind::Mfma, overlaps);
@@ -107,13 +108,16 @@ std::vector<MfmaShadowOverlap> InstProfile::add_wave(const wave_t& wave,
   return overlaps;
 }
 
-std::vector<InstGroup> InstProfile::groups() const {
+std::vector<InstGroup> InstProfile::groups() && {
   std::vector<InstGroup> result;
   result.reserve(totals.size());
-  for (const auto& group : totals) {
+  for (auto& group : totals) {
     InstGroup g{scope, group.slot, group.wave_index, {}, {}};
     g.rows.reserve(group.rows.size());
-    for (const auto& entry : group.rows) g.rows.push_back(entry.second);
+    for (auto& entry : group.rows) g.rows.push_back(std::move(entry.second));
+    // Release the map's buckets before converting the next group; clear()
+    // may retain them even after the rows have been moved out.
+    group.rows = llvm::DenseMap<Key, InstRow>();
     std::sort(
         g.rows.begin(), g.rows.end(),
         [this](const InstRow& a, const InstRow& b) {
@@ -128,9 +132,11 @@ std::vector<InstGroup> InstProfile::groups() const {
     g.summary = summarize(group.waves, g.rows);
     result.push_back(std::move(g));
   }
+  totals.clear();
+  slot_groups.clear();
   std::sort(result.begin(), result.end(),
             [](const InstGroup& a, const InstGroup& b) {
-              if (!(a.slot == b.slot)) return a.slot < b.slot;
+              if (a.slot != b.slot) return a.slot < b.slot;
               return a.wave_index < b.wave_index;
             });
   return result;
