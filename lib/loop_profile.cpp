@@ -72,7 +72,7 @@ void LoopProfile::add_passes(const wave_t& wave, uint64_t wave_index,
 
   int64_t last_time = wave.begin_time;
   int64_t iter_start = -1;
-  int64_t mfma_shadow_end = 0;
+  MfmaShadow shadow;
   for (size_t i = 0; i < wave.instructions_size; i++) {
     const auto& inst = wave.instructions_array[i];
     if (is_null_pc(inst)) continue;
@@ -86,10 +86,7 @@ void LoopProfile::add_passes(const wave_t& wave, uint64_t wave_index,
     slot.duration += inst.duration;
     slot.stall += inst.stall;
     slot.idle += idle;
-    // A record whose stall exceeds its duration (kept unless the duration
-    // check rejects the trace) issued in no time rather than negative time.
-    int32_t issue = inst.duration - static_cast<int32_t>(inst.stall);
-    slot.issue += issue > 0 ? static_cast<uint64_t>(issue) : 0;
+    slot.issue += issue_cycles(inst);
 
     // New iteration starts when we hit the loop header.
     if (inst.pc.address == edge.target_addr)
@@ -102,31 +99,7 @@ void LoopProfile::add_passes(const wave_t& wave, uint64_t wave_index,
     if (!mfma_coexec) continue;
     auto& kind = loop.kinds[index];
     if (!kind) kind = kind_at(inst.pc);
-    if (*kind == InstKind::Mfma) {
-      // MFMA is productive work — update shadow, don't count as bubble.
-      int64_t issue_point = inst.time + inst.stall;
-      // Verify no two MFMAs issue within each other's shadow. An overlap of
-      // up to one timestamp granule is decoder slop, not a pipe violation --
-      // only a larger one means kMfmaShadowCycles is wrong for this ISA.
-      if (mfma_shadow_end > 0 &&
-          issue_point < mfma_shadow_end - kAttTimestampGranule)
-        overlaps.push_back(
-            MfmaShadowOverlap{inst.pc, issue_point, mfma_shadow_end});
-      // Never rewind: a slop-induced overlap must not un-cover cycles the
-      // previous MFMA already accounted for, which would attribute a bubble
-      // to whatever follows.
-      mfma_shadow_end =
-          std::max(mfma_shadow_end, issue_point + kMfmaShadowCycles);
-    } else {
-      // Non-MFMA: compute bubble (portion not covered by co-exec shadow).
-      int64_t end_time = inst.time + inst.duration;
-      if (end_time > mfma_shadow_end) {
-        int64_t uncovered = end_time - mfma_shadow_end;
-        int64_t bubble =
-            std::min(static_cast<int64_t>(inst.duration), uncovered);
-        if (bubble > 0) slot.bubble += static_cast<uint64_t>(bubble);
-      }
-    }
+    slot.bubble += shadow.step(inst, *kind == InstKind::Mfma, overlaps);
   }
 
   for (size_t i = 0; i < body_size; i++) {

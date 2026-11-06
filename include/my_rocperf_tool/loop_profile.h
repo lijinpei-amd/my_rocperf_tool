@@ -2,6 +2,7 @@
 
 #include "my_rocperf_tool/inst_kind.h"
 #include "my_rocperf_tool/loop_detection.h"
+#include "my_rocperf_tool/mfma_shadow.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
@@ -16,25 +17,6 @@
 #include <vector>
 
 namespace my_rocperf_tool {
-
-// Cycles an MFMA is assumed to keep the MAI pipe busy, during which a
-// co-issued non-MFMA instruction executes for free.
-inline constexpr int64_t kMfmaShadowCycles = 16;
-
-// ATT hardware timestamps land on a 4-cycle grid, and the decoder splits the
-// cycles between two timestamp packets across the instructions it saw in
-// between. A single instruction's duration can therefore be off by one
-// granule.
-inline constexpr int64_t kAttTimestampGranule = 4;
-
-// An MFMA that issued inside the previous MFMA's shadow by more than one
-// timestamp granule: more than decoder slop, so kMfmaShadowCycles is wrong for
-// this ISA.
-struct MfmaShadowOverlap {
-  rocprofiler_thread_trace_decoder_pc_t pc;
-  int64_t issue_point;
-  int64_t shadow_end;
-};
 
 // One instruction of a loop body, as the instruction source lists it.
 struct LoopBodyInst {

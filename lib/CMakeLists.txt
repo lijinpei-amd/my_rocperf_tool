@@ -9,6 +9,7 @@ add_library(my_rocperf_tool SHARED
     att_output_dir.cpp
     disassembler.cpp
     loop_detection.cpp
+    mfma_shadow.cpp
     loop_profile.cpp
     loop_report.cpp
     wave_analysis.cpp
