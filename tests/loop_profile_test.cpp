@@ -416,5 +416,42 @@ TEST(LoopProfileTest, SideBySideLoopsKeepTheirOwnShadowAndHeader) {
   }
 }
 
+// Slot (0, 0, 1) runs waves 0, 1 and 3; the loop is detected in 0 (2 passes)
+// and 1 (3 passes), not in 3 (1 pass). Slot (0, 1, 0) runs wave 2 (2 passes).
+TEST(LoopProfileTest, SlotRecordSumsItsSlotsWavesWithTheLoop) {
+  KindTable table{{{kLoopHeader, InstKind::Mfma}}};
+  LoopProfile profile(/*mfma_coexec=*/true);
+  auto passes = [](WaveBuilder& b, int n) {
+    for (int i = 0; i < n; i++) b.iteration(/*branch_taken=*/i + 1 < n);
+  };
+  WaveBuilder w0(0, 1), w1(0, 1), w2(1, 0), w3(0, 1);
+  passes(w0, 2);
+  passes(w1, 3);
+  passes(w2, 2);
+  passes(w3, 1);
+  auto l0 = add_wave(profile, w0, table, 0);
+  auto l1 = add_wave(profile, w1, table, 1);
+  auto l2 = add_wave(profile, w2, table, 2);
+  auto l3 = add_wave(profile, w3, table, 3);
+  ASSERT_TRUE(l3.loops.empty());
+  auto body = list_body(kLoop, table.kinds);
+
+  LoopStats slot_stats = l0.loops.at(0).stats;
+  slot_stats += l1.loops.at(0).stats;
+  auto slot = profile.metrics(
+      {kLoop, slot_stats, 2, std::nullopt, WaveSlot{0, 0, 1}}, body);
+  auto other = profile.metrics(
+      {kLoop, l2.loops.at(0).stats, 1, std::nullopt, WaveSlot{0, 1, 0}}, body);
+  auto all = profile.metrics({kLoop, {}, 3, std::nullopt}, body);
+
+  EXPECT_EQ(row_at(slot, kLoopHeader).n, 5u);
+  EXPECT_EQ(row_at(slot, kLoopBranch).n, 5u);
+  // Per pass the MFMA at t (stall 1) covers to t+17, so kLoopHeader + 8
+  // (t+20..t+24) has 4 bubble cycles: 5 passes in the slot.
+  EXPECT_EQ(row_at(slot, kLoopHeader + 8).bubble, 20u);
+  EXPECT_EQ(row_at(other, kLoopHeader).n, 2u);
+  EXPECT_EQ(row_at(all, kLoopHeader).n, 7u);
+}
+
 }  // namespace
 }  // namespace my_rocperf_tool

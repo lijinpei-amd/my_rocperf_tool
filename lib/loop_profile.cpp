@@ -50,12 +50,14 @@ std::vector<MfmaShadowOverlap> LoopProfile::add_wave(const wave_t& wave,
                                                      KindLookup kind_at) {
   std::vector<MfmaShadowOverlap> overlaps;
   for (const auto& loop : loops.loops)
-    add_passes(wave, loops.wave_index, loop.back_edge, kind_at, overlaps);
+    add_passes(wave, loops.wave_index, {loops.cu, loops.simd, loops.wave_id},
+               loop.back_edge, kind_at, overlaps);
   return overlaps;
 }
 
 void LoopProfile::add_passes(const wave_t& wave, uint64_t wave_index,
-                             const BackEdge& edge, KindLookup kind_at,
+                             WaveSlot wave_slot, const BackEdge& edge,
+                             KindLookup kind_at,
                              std::vector<MfmaShadowOverlap>& overlaps) {
   const size_t body_size = body_slot(edge, edge.source_addr) + 1;
   auto& loop = loop_totals[edge];
@@ -102,21 +104,29 @@ void LoopProfile::add_passes(const wave_t& wave, uint64_t wave_index,
     slot.bubble += shadow.step(inst, *kind == InstKind::Mfma, overlaps);
   }
 
+  auto& slot_record = slot_totals[{wave_slot, edge}];
+  slot_record.slots.resize(body_size);
   for (size_t i = 0; i < body_size; i++) {
+    slot_record.slots[i] += slots[i];
     loop.aggregate.slots[i] += slots[i];
     record.bubble += slots[i].bubble;
   }
   loop.aggregate.bubble += record.bubble;
+  slot_record.bubble += record.bubble;
 }
 
 LoopRecordMetrics LoopProfile::metrics(const LoopRecord& record,
                                        const LoopBody& body) const {
+  assert(!(record.wave && record.slot) && "record has both wave and slot");
   const BackEdge& edge = record.back_edge;
   const RecordTotals* totals = nullptr;
   if (record.wave) {
     auto it = wave_totals.find({*record.wave, edge});
     assert(it != wave_totals.end() && "the record's wave lacks its loop");
     if (it != wave_totals.end()) totals = &it->second;
+  } else if (record.slot) {
+    auto it = slot_totals.find({*record.slot, edge});
+    if (it != slot_totals.end()) totals = &it->second;
   } else if (auto it = loop_totals.find(edge); it != loop_totals.end()) {
     totals = &it->second.aggregate;
   }

@@ -50,7 +50,8 @@ inline rocprofiler_thread_trace_decoder_pc_t pc(uint64_t addr) {
 
 class WaveBuilder {
  public:
-  explicit WaveBuilder(uint8_t simd = 0) : simd_(simd) {}
+  explicit WaveBuilder(uint8_t simd = 0, uint8_t wave_id = 0)
+      : simd_(simd), wave_id_(wave_id) {}
 
   WaveBuilder& at(uint64_t addr, Category category, int64_t time,
                   int32_t duration, uint32_t stall = 0) {
@@ -99,6 +100,7 @@ class WaveBuilder {
   rocprofiler_thread_trace_decoder_wave_t wave() {
     rocprofiler_thread_trace_decoder_wave_t wave{};
     wave.simd = simd_;
+    wave.wave_id = wave_id_;
     wave.instructions_size = insts_.size();
     wave.instructions_array = insts_.data();
     return wave;
@@ -106,6 +108,7 @@ class WaveBuilder {
 
  private:
   uint8_t simd_;
+  uint8_t wave_id_;
   std::vector<rocprofiler_thread_trace_decoder_inst_t> insts_;
   int64_t next_time_ = 0;
 };

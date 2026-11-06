@@ -1,5 +1,6 @@
 #pragma once
 
+#include "my_rocperf_tool/aggregate_scope.h"
 #include "my_rocperf_tool/inst_kind.h"
 #include "my_rocperf_tool/loop_detection.h"
 #include "my_rocperf_tool/mfma_shadow.h"
@@ -42,6 +43,8 @@ struct LoopRecord {
   // A per-wave record's wave, by WaveLoopInfo::wave_index; nullopt for the
   // aggregate.
   std::optional<uint64_t> wave;
+  // Set only for a per-slot record; wave and slot are mutually exclusive.
+  std::optional<WaveSlot> slot;
 };
 
 // One body instruction's metrics in a loop record.
@@ -167,14 +170,16 @@ class LoopProfile {
   // Sums the wave's executions of `edge`'s body into the wave's record and the
   // loop's aggregate, relative issue and, under mfma_coexec, MFMA-shadow
   // bubbles included, in one walk.
-  void add_passes(const wave_t& wave, uint64_t wave_index, const BackEdge& edge,
-                  KindLookup kind_at, std::vector<MfmaShadowOverlap>& overlaps);
+  void add_passes(const wave_t& wave, uint64_t wave_index, WaveSlot wave_slot,
+                  const BackEdge& edge, KindLookup kind_at,
+                  std::vector<MfmaShadowOverlap>& overlaps);
 
   bool mfma_coexec = false;
   bool wave_rows = true;
   llvm::DenseMap<BackEdge, LoopTotals> loop_totals;
   // Keyed by wave_index and loop.
   llvm::DenseMap<std::pair<uint64_t, BackEdge>, RecordTotals> wave_totals;
+  llvm::DenseMap<std::pair<WaveSlot, BackEdge>, RecordTotals> slot_totals;
   // The walk's slots when the wave's are not kept, reused across waves so
   // that only kept rows allocate.
   std::vector<SlotTotals> scratch_slots;
