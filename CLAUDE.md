@@ -20,7 +20,7 @@ CMake minimum 3.28, Ninja generator, C++17, compiled with `-fPIC -fno-rtti`.
 ### Dependencies
 
 - **rocprofiler-sdk** — AMD ROCm profiler SDK (point `CMAKE_PREFIX_PATH` at the ROCm install)
-- **LLVM** (CONFIG mode) — MC disassembler infrastructure; the tests also need its `llvm-mc` and `llvm-objcopy` (from `LLVM_TOOLS_BINARY_DIR`), which build the test code objects
+- **LLVM** 20 or newer (CONFIG mode; configure checks it) — MC disassembler infrastructure; the tests also need its `llvm-mc` and `llvm-objcopy` (from `LLVM_TOOLS_BINARY_DIR`), which build the test code objects
 - **rocprof-trace-decoder** — git submodule at `3rd_party/rocm-systems` (built from `projects/rocprof-trace-decoder/source`)
 - **abseil-cpp**, **fmt** — git submodules under `3rd_party/`
 - **googletest** — git submodule at `3rd_party/googletest` (gtest only, no gmock), for `tests/`

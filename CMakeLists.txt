@@ -9,6 +9,14 @@ enable_testing()
 
 find_package(rocprofiler-sdk REQUIRED)
 find_package(LLVM REQUIRED CONFIG)
+# LLVM 20 is the first release with gfx950, which the tests assemble and whose
+# scheduling model gives its MFMA cycles. Not find_package(LLVM 20): LLVM's
+# version file accepts only an exact major.minor match.
+if(LLVM_PACKAGE_VERSION VERSION_LESS 20)
+  message(FATAL_ERROR
+    "LLVM ${LLVM_PACKAGE_VERSION} found in ${LLVM_DIR}; LLVM 20 or newer is "
+    "required (point CMAKE_PREFIX_PATH or LLVM_DIR at a newer LLVM)")
+endif()
 
 add_subdirectory(3rd_party)
 
