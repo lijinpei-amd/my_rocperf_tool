@@ -7,8 +7,11 @@
 #include "my_rocperf_tool/report_document.h"
 #include "my_rocperf_tool/wave_analysis.h"
 
+#include "absl/flags/commandlineflag.h"
 #include "absl/flags/flag.h"
 #include "absl/flags/parse.h"
+#include "absl/flags/reflection.h"
+#include "absl/flags/usage.h"
 
 #include "trace_decoder_api.h"
 #include "trace_decoder_types.h"
@@ -107,24 +110,39 @@ struct PhaseTimerSession {
 
 ABSL_FLAG(std::optional<std::string>, att_output_dir, std::nullopt,
           "output file dir");
+// A help text's first line describes the flag; print_help lists each later
+// line, one enum value with an optional ": note", on a line of its own.
 ABSL_FLAG(std::string, report, "loop_summary",
-          "report: loop_summary, loop_detail, static_inst, dynamic_inst, none. "
-          "dynamic_inst memory grows with the longest wave's records times "
-          "the groups. Waves caught mid-run in lossy traces are included, "
-          "which skews their relative issue times and occurrences");
+          "report to print. Waves caught mid-run in lossy traces are "
+          "included, which skews their relative issue times and occurrences:\n"
+          "loop_summary\n"
+          "loop_detail\n"
+          "static_inst\n"
+          "dynamic_inst: memory grows with the longest wave's records per "
+          "group\n"
+          "none");
 ABSL_FLAG(std::string, aggregate, "wave",
-          "group records: wave, simd_slot, all");
+          "group records by:\n"
+          "wave\n"
+          "simd_slot\n"
+          "all");
 ABSL_FLAG(bool, inst_stats, true, "show per-instruction stats");
 ABSL_FLAG(bool, inst_addr, true, "show instruction addresses in text");
 ABSL_FLAG(bool, inst_avg, false,
           "show average per-execution instruction stats");
-ABSL_FLAG(std::string, output_format, "text", "output format: text, csv, json");
+ABSL_FLAG(std::string, output_format, "text",
+          "output format:\n"
+          "text\n"
+          "csv\n"
+          "json");
 ABSL_FLAG(std::string, verify_trace_duration, "error",
-          "check that each trace record's duration >= stall: off; warn (print "
-          "a WARNING per offending record and continue); error (print one "
-          "error per offending trace with its count and first offending "
-          "record, emit nothing for that trace, and exit 1 once the other "
-          "traces are done). true and false are accepted as warn and off");
+          "check that each trace record's duration >= stall. true and false "
+          "are accepted as warn and off:\n"
+          "off\n"
+          "warn: print a WARNING per offending record and continue\n"
+          "error: print one error per offending trace with its count and "
+          "first offending record, emit nothing for that trace, and exit 1 "
+          "once the other traces are done");
 ABSL_FLAG(bool, mfma_coexec, false,
           "analyze MFMA shadow coverage for reported instructions");
 ABSL_FLAG(bool, color_mfma_bubble, false,
@@ -890,7 +908,104 @@ int run_main(const std::string& att_output_dir_path,
   return 0;
 }
 
+constexpr std::string_view kUsageMessage =
+    "decodes each ATT trace under --att_output_dir and reports "
+    "per-instruction stall and idle statistics, by loop or by instruction.\n"
+    "Usage: load_issue_stall --att_output_dir=<dir> [flags]";
+
+constexpr size_t kHelpWidth = 80;
+
+// Appends `line`, which already holds its indent, followed by the words of
+// `text`, wrapped at kHelpWidth columns onto lines indented by `wrap_indent`.
+void append_wrapped(std::string& out, std::string line, std::string_view text,
+                    size_t wrap_indent) {
+  bool has_word = false;
+  for (size_t pos = 0; pos <= text.size();) {
+    size_t end = std::min(text.find(' ', pos), text.size());
+    std::string_view word = text.substr(pos, end - pos);
+    pos = end + 1;
+    if (word.empty()) continue;
+    if (has_word && line.size() + 1 + word.size() > kHelpWidth) {
+      out += line;
+      out += '\n';
+      line.assign(wrap_indent, ' ');
+      has_word = false;
+    }
+    if (has_word) line += ' ';
+    line += word;
+    has_word = true;
+  }
+  out += line;
+  out += '\n';
+}
+
+// Abseil's --help wraps each flag's help in parentheses and runs its default
+// on after it. This prints the flags defined in this file as the flag and its
+// description, then one line per enum value, then the default.
+void print_help() {
+  // Abseil normalizes a flag's filename, so match --att_output_dir's.
+  const std::string file =
+      absl::FindCommandLineFlag("att_output_dir")->Filename();
+  std::vector<absl::CommandLineFlag*> flags;
+  for (const auto& [name, flag] : absl::GetAllFlags()) {
+    if (flag->Filename() == file) flags.push_back(flag);
+  }
+  std::sort(flags.begin(), flags.end(),
+            [](const absl::CommandLineFlag* a, const absl::CommandLineFlag* b) {
+              return a->Name() < b->Name();
+            });
+  std::string out;
+  std::string_view usage = kUsageMessage;
+  size_t newline = usage.find('\n');
+  append_wrapped(out, "load_issue_stall: ", usage.substr(0, newline), 0);
+  append_wrapped(out, "", usage.substr(newline + 1), 0);
+  out += "\nFlags:\n";
+  for (const absl::CommandLineFlag* flag : flags) {
+    const std::string help = flag->Help();
+    std::string_view rest = help;
+    newline = rest.find('\n');
+    append_wrapped(out, fmt::format("  --{}  ", flag->Name()),
+                   rest.substr(0, newline), 4);
+    while (newline != std::string_view::npos) {
+      rest.remove_prefix(newline + 1);
+      newline = rest.find('\n');
+      append_wrapped(out, std::string(6, ' '), rest.substr(0, newline), 8);
+    }
+    std::string default_value = flag->DefaultValue();
+    if (flag->IsOfType<std::string>()) {
+      out += fmt::format("    default: \"{}\"\n", default_value);
+    } else if (default_value.empty()) {
+      out += "    no default\n";
+    } else {
+      out += fmt::format("    default: {}\n", default_value);
+    }
+  }
+  out += '\n';
+  append_wrapped(out, "",
+                 "Try --helpfull to list every flag, including abseil's, or "
+                 "--help=substring for the flags whose name, description or "
+                 "file contains substring.",
+                 0);
+  std::fwrite(out.data(), 1, out.size(), stdout);
+}
+
+// Only a bare --help (or -help) is ours; abseil serves its other help flags.
+bool wants_help(int argc, char* argv[]) {
+  for (int i = 1; i < argc; ++i) {
+    std::string_view arg = argv[i];
+    if (arg == "--") break;
+    if (arg == "--help" || arg == "-help") return true;
+  }
+  return false;
+}
+
 int main(int argc, char* argv[]) {
+  absl::SetProgramUsageMessage(kUsageMessage);
+  // Exit 1 like abseil's own --help, so scripts see the same status.
+  if (wants_help(argc, argv)) {
+    print_help();
+    return 1;
+  }
   absl::ParseCommandLine(argc, argv);
   std::optional<std::string> att_output_dir =
       absl::GetFlag(FLAGS_att_output_dir);
