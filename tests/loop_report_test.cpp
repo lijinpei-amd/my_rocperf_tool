@@ -34,10 +34,10 @@ constexpr uint64_t kSkipped = 0x10c;
 LoopBody list_loop() {
   return {
       {0x100, "v_mfma_f32_16x16x16_f16 v[0:3], v[4:5], v[6:7], v[0:3]",
-       InstKind::Mfma},
-      {0x108, "s_cbranch_scc1 1", InstKind::Other},
-      {kSkipped, "s_add_u32 s0, s0, 1", InstKind::Other},
-      {0x110, "s_cbranch_scc0 65531", InstKind::Other},
+       InstKind::mfma(16)},
+      {0x108, "s_cbranch_scc1 1", InstKind{}},
+      {kSkipped, "s_add_u32 s0, s0, 1", InstKind{}},
+      {0x110, "s_cbranch_scc0 65531", InstKind{}},
   };
 }
 
@@ -273,13 +273,26 @@ TEST(LoopReportTest, TextMatchesGolden) {
   // The loop line truncates the averages the avg/iter line shows in full.
   EXPECT_EQ(text, R"(=== Wave (DispatchID=7, CU=1, SIMD=0, WaveID=2) ===
   Loop [0x100 -> 0x110] code_object=1: 4 iterations, 130 total cycles (avg 32/iter), stall 26 (avg 6/iter), idle 10
-    avg/iter: dur=32.50 stall=6.50 idle=2.50 mfma_time=16 (1 mfma * 16) mfma_util=49.2%
+    avg/iter: dur=32.50 stall=6.50 idle=2.50 mfma_time=16 (1 mfma) mfma_util=49.2%
     n      dur        stall      idle       issue    avg_cycle  addr           instruction
     4      36         8          4          28       5.00       0x100:  v_mfma_f32_16x16x16_f16 v[0:3], v[4:5], v[6:7], v[0:3]
     4      36         8          4          28       5.00       0x108:  s_cbranch_scc1 1
                                                                 0x10c:  s_add_u32 s0, s0, 1
     4      36         8          4          28       5.00       0x110:  s_cbranch_scc0 65531
 )");
+}
+
+TEST(LoopReportTest, TextUsesTheSummedMfmaCost) {
+  auto body = list_loop();
+  auto report = trace_report(body, AggregateScope::All, 7);
+  auto& summary = report.groups[0].loops[0].metrics.summary;
+  summary.mfma_count = 2;
+  summary.mfma_time = 48;
+  summary.mfma_util = 48 / summary.avg_dur;
+  ReportConfig cfg;
+  auto text = to_string(render(cfg, report));
+  EXPECT_NE(text.find("mfma_time=48 (2 mfma)"), std::string::npos);
+  EXPECT_EQ(text.find("mfma * 16"), std::string::npos);
 }
 
 // A report as a trace without loops resolves it: no group, unless
@@ -393,7 +406,7 @@ TEST(LoopReportTest, TextSlotHeadingAndLoopLine) {
   auto text = to_string(render(cfg, report));
   EXPECT_EQ(text, R"(=== SIMD Slot (DispatchID=7, CU=1, SIMD=0, WaveID=2) ===
   Loop [0x100 -> 0x110] code_object=1: 2 waves, 4 iterations, 130 total cycles (avg 32/iter), stall 26 (avg 6/iter), idle 10
-    avg/iter: dur=32.50 stall=6.50 idle=2.50 mfma_time=16 (1 mfma * 16) mfma_util=49.2%
+    avg/iter: dur=32.50 stall=6.50 idle=2.50 mfma_time=16 (1 mfma) mfma_util=49.2%
 )");
 }
 

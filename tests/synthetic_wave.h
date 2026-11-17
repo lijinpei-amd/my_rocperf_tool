@@ -113,6 +113,12 @@ class WaveBuilder {
   int64_t next_time_ = 0;
 };
 
+// The kinds the tables below list. A synthetic MFMA takes 16 cycles, 4
+// passes, as gfx942's v_mfma_f32_16x16x16_f16 does.
+inline constexpr uint16_t kSyntheticMfmaCycles = 16;
+inline constexpr InstKind kMfmaKind = InstKind::mfma(kSyntheticMfmaCycles);
+inline constexpr InstKind kBarrierKind = InstKind::classic_barrier();
+
 // Classifies the PCs of kCodeObject it lists, every other PC as Other, and
 // counts the calls.
 struct KindTable {
@@ -124,7 +130,7 @@ struct KindTable {
     return [this](const rocprofiler_thread_trace_decoder_pc_t& pc) {
       calls++;
       auto it = kinds.find(pc.address);
-      return it == kinds.end() ? InstKind::Other : it->second;
+      return it == kinds.end() ? InstKind{} : it->second;
     };
   }
 };
@@ -138,7 +144,7 @@ inline LoopBody list_body(const BackEdge& edge,
   for (uint64_t addr = edge.target_addr; addr <= edge.source_addr; addr += 4) {
     auto it = kinds.find(addr);
     body.push_back({addr, "inst_" + std::to_string(addr),
-                    it == kinds.end() ? InstKind::Other : it->second});
+                    it == kinds.end() ? InstKind{} : it->second});
   }
   return body;
 }

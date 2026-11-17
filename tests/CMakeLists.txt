@@ -32,6 +32,7 @@ function(add_test_code_object name mcpu)
   set(test_code_objects ${test_code_objects} "${obj}" PARENT_SCOPE)
 endfunction()
 add_test_code_object(gfx942 gfx942)
+add_test_code_object(gfx950 gfx950)
 add_test_code_object(gfx1200 gfx1200)
 # The address changes match section names as assembled, before the rename.
 add_test_code_object(gfx942_two_texts gfx942

@@ -41,7 +41,7 @@ LoopRecordMetrics loop_metrics(const WaveAnalysisResult& result,
 }
 
 TEST(WaveAnalysisTest, CoalescesBarrierTokenPairIntoOneRecord) {
-  KindTable table{{{kLoopHeader, InstKind::ClassicBarrier}}};
+  KindTable table{{{kLoopHeader, kBarrierKind}}};
   WaveBuilder builder;
   builder.at(kPrologue, kSalu, /*time=*/0, /*duration=*/4);
   for (int pass = 0; pass < 2; pass++) {
@@ -75,7 +75,7 @@ TEST(WaveAnalysisTest, CoalescesBarrierTokenPairIntoOneRecord) {
 TEST(WaveAnalysisTest, CoalescedBarrierSaturates) {
   constexpr int32_t kDurationMax = std::numeric_limits<int32_t>::max();
   constexpr uint32_t kStallMax = (1u << 24) - 1;
-  KindTable table{{{kLoopHeader, InstKind::ClassicBarrier}}};
+  KindTable table{{{kLoopHeader, kBarrierKind}}};
   WaveBuilder builder;
   for (int pass = 0; pass < 2; pass++) {
     const int64_t start = 2 * pass * int64_t{kDurationMax};
@@ -170,7 +170,7 @@ constexpr uint64_t kValuInLoop = kLoopHeader + 8;
 constexpr int64_t kPassCycles = 100;
 
 KindTable mfma_table() {
-  return KindTable{{{kMfma1, InstKind::Mfma}, {kMfma2, InstKind::Mfma}}};
+  return KindTable{{{kMfma1, kMfmaKind}, {kMfma2, kMfmaKind}}};
 }
 
 WaveAnalysisResult analyze_mfma_loop(KindTable& table, WaveBuilder& builder) {
@@ -184,7 +184,7 @@ WaveAnalysisResult analyze_mfma_loop(KindTable& table, WaveBuilder& builder) {
 }
 
 TEST(WaveAnalysisMfmaTest, OverlapWithinOneGranuleIsNotReported) {
-  static_assert(kMfmaShadowCycles - kAttTimestampGranule == 12);
+  static_assert(kSyntheticMfmaCycles - kAttTimestampGranule == 12);
   auto table = mfma_table();
   WaveBuilder builder;
   for (int pass = 0; pass < 2; pass++) {
@@ -222,7 +222,7 @@ TEST(WaveAnalysisMfmaTest, LargerOverlapIsReported) {
     EXPECT_EQ(overlap->pc.address, kMfma2);
     EXPECT_EQ(overlap->pc.code_object_id, kCodeObject);
     EXPECT_EQ(overlap->issue_point, pass * kPassCycles + 11);
-    EXPECT_EQ(overlap->shadow_end, pass * kPassCycles + kMfmaShadowCycles);
+    EXPECT_EQ(overlap->shadow_end, pass * kPassCycles + kSyntheticMfmaCycles);
   }
 }
 
@@ -250,7 +250,7 @@ TEST(WaveAnalysisMfmaTest, ShadowEndNeverRewinds) {
 }
 
 TEST(WaveAnalysisMfmaTest, BubbleIsTheUncoveredPartOfANonMfma) {
-  KindTable table{{{kMfma1, InstKind::Mfma}}};
+  KindTable table{{{kMfma1, kMfmaKind}}};
   WaveBuilder builder;
   for (int pass = 0; pass < 2; pass++) {
     const int64_t start = pass * kPassCycles;
@@ -377,7 +377,7 @@ TEST(WaveAnalysisTest, SkipsNullPcRecords) {
 // pass's barrier reaches them as one record.
 TEST(WaveAnalysisTest, LoopAnalysesSeeTheCoalescedBarrier) {
   constexpr uint64_t kBarrier = kLoopHeader + 4;
-  KindTable table{{{kBarrier, InstKind::ClassicBarrier}}};
+  KindTable table{{{kBarrier, kBarrierKind}}};
   WaveBuilder builder;
   for (int pass = 0; pass < 3; pass++) {
     const int64_t start = pass * kPassCycles;
@@ -485,7 +485,7 @@ TEST(WaveAnalysisDurationCheckTest, ErrorCountsRecordsAndKeepsTheFirst) {
 }
 
 TEST(WaveAnalysisTest, InstProfileSeesTheCoalescedWholeWave) {
-  KindTable table{{{0xf0, InstKind::ClassicBarrier}}};
+  KindTable table{{{0xf0, kBarrierKind}}};
   WaveBuilder b;
   b.at(0xf0, kMessage, 0, 5, 3)
       .at(0xf0, kImmed, 5, 7, 2)
@@ -514,7 +514,7 @@ TEST(WaveAnalysisTest, InstProfileSeesTheCoalescedWholeWave) {
 }
 
 TEST(WaveAnalysisTest, InstProfileOverlapsBecomeDiagnostics) {
-  KindTable table{{{0xf0, InstKind::Mfma}, {0x100, InstKind::Mfma}}};
+  KindTable table{{{0xf0, kMfmaKind}, {0x100, kMfmaKind}}};
   WaveBuilder b;
   b.at(0xf0, kValu, 0, 4).at(0x100, kValu, 8, 4);
   WaveAnalysisOptions options;

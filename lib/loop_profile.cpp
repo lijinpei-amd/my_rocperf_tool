@@ -23,8 +23,12 @@ size_t body_dword(const BackEdge& edge, uint64_t addr) {
 LoopSummary summarize(const LoopStats& stats, uint64_t bubble,
                       const LoopBody& body) {
   LoopSummary sum{};
-  for (const auto& inst : body)
-    if (inst.kind == InstKind::Mfma) sum.mfma_count++;
+  for (const auto& inst : body) {
+    if (inst.kind.cls == InstClass::Mfma) {
+      sum.mfma_count++;
+      sum.mfma_time += inst.kind.mfma_cycles;
+    }
+  }
   if (stats.iteration_count > 0) {
     sum.avg_dur =
         static_cast<double>(stats.total_duration) / stats.iteration_count;
@@ -34,7 +38,6 @@ LoopSummary summarize(const LoopStats& stats, uint64_t bubble,
         static_cast<double>(stats.total_idle) / stats.iteration_count;
     sum.avg_bubble = static_cast<double>(bubble) / stats.iteration_count;
   }
-  sum.mfma_time = sum.mfma_count * kMfmaShadowCycles;
   if (sum.avg_dur > 0)
     sum.mfma_util = static_cast<double>(sum.mfma_time) / sum.avg_dur;
   return sum;
@@ -101,7 +104,7 @@ void LoopProfile::add_passes(const wave_t& wave, uint64_t wave_index,
     if (!mfma_coexec) continue;
     auto& kind = loop.kinds[index];
     if (!kind) kind = kind_at(inst.pc);
-    dword.bubble += shadow.step(inst, *kind == InstKind::Mfma, overlaps);
+    dword.bubble += shadow.step(inst, *kind, overlaps);
   }
 
   auto& slot_record = slot_totals[{wave_slot, edge}];

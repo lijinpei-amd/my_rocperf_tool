@@ -78,7 +78,7 @@ WaveBuilder shadow_wave() {
 }
 
 TEST(InstProfileTest, MfmaShadowRunsAcrossTheWholeWave) {
-  KindTable table{{{0xf0, InstKind::Mfma}}};
+  KindTable table{{{0xf0, kMfmaKind}}};
   auto b = shadow_wave();
   InstProfile profile(InstProfileKind::Static, AggregateScope::All, true);
   EXPECT_TRUE(profile.add_wave(b.wave(), 0, table.classifier()).empty());
@@ -91,16 +91,46 @@ TEST(InstProfileTest, MfmaShadowRunsAcrossTheWholeWave) {
 }
 
 TEST(InstProfileTest, WithoutMfmaCoexecNoBubblesButMfmasCount) {
-  KindTable table{{{0xf0, InstKind::Mfma}}};
+  KindTable table{{{0xf0, kMfmaKind}}};
   auto b = shadow_wave();
   InstProfile profile(InstProfileKind::Static, AggregateScope::All, false);
   EXPECT_TRUE(profile.add_wave(b.wave(), 0, table.classifier()).empty());
   auto groups = std::move(profile).groups();
   ASSERT_EQ(groups.size(), 1u);
   for (const auto& r : groups[0].rows) EXPECT_EQ(r.sums.bubble, 0u);
-  EXPECT_EQ(row_at(groups[0], 0xf0).kind, InstKind::Mfma);
+  EXPECT_EQ(row_at(groups[0], 0xf0).kind, kMfmaKind);
   EXPECT_DOUBLE_EQ(groups[0].summary.avg_mfma, 1);
   EXPECT_DOUBLE_EQ(groups[0].summary.mfma_util, 16.0 / 12.0);
+}
+
+// Each MFMA covers its own cycles: a 32-cycle MFMA's shadow reaches the VALU
+// at 20 that a 16-cycle one leaves as bubble.
+TEST(InstProfileTest, ShadowAndUtilizationUseTheMfmasCycles) {
+  KindTable table{{{0xf0, InstKind::mfma(32)}}};
+  auto b = shadow_wave();
+  InstProfile profile(InstProfileKind::Static, AggregateScope::All, true);
+  EXPECT_TRUE(profile.add_wave(b.wave(), 0, table.classifier()).empty());
+  auto groups = std::move(profile).groups();
+  ASSERT_EQ(groups.size(), 1u);
+  EXPECT_EQ(row_at(groups[0], 0x104).sums.bubble, 0u);
+  EXPECT_DOUBLE_EQ(groups[0].summary.avg_bubble, 0);
+  EXPECT_DOUBLE_EQ(groups[0].summary.mfma_util, 32.0 / 12.0);
+}
+
+// Utilization weights each MFMA's cycles by its executions.
+TEST(InstProfileTest, UtilizationSumsCyclesPerExecution) {
+  KindTable table{{{0xf0, InstKind::mfma(32)}, {0x100, InstKind::mfma(16)}}};
+  WaveBuilder b;
+  b.at(0xf0, kValu, 0, 4).at(0x100, kValu, 40, 4).at(0xf0, kValu, 80, 4);
+  for (auto kind : {InstProfileKind::Static, InstProfileKind::Dynamic}) {
+    SCOPED_TRACE(kind == InstProfileKind::Static ? "static" : "dynamic");
+    InstProfile profile(kind, AggregateScope::All, false);
+    EXPECT_TRUE(profile.add_wave(b.wave(), 0, table.classifier()).empty());
+    auto groups = std::move(profile).groups();
+    ASSERT_EQ(groups.size(), 1u);
+    EXPECT_DOUBLE_EQ(groups[0].summary.avg_mfma, 3);
+    EXPECT_DOUBLE_EQ(groups[0].summary.mfma_util, (2 * 32.0 + 16.0) / 12.0);
+  }
 }
 
 TEST(InstProfileTest, SkipsNullPcRecords) {
@@ -245,7 +275,7 @@ TEST(InstProfileTest, WaveWithoutAttributedRecordsHasAnEmptyGroup) {
 }
 
 TEST(InstProfileTest, ReportsMfmaShadowOverlaps) {
-  KindTable table{{{0xf0, InstKind::Mfma}, {0x100, InstKind::Mfma}}};
+  KindTable table{{{0xf0, kMfmaKind}, {0x100, kMfmaKind}}};
   WaveBuilder b;
   b.at(0xf0, kValu, 0, 4).at(0x100, kValu, 8, 4);
   InstProfile profile(InstProfileKind::Static, AggregateScope::All, true);
@@ -254,6 +284,21 @@ TEST(InstProfileTest, ReportsMfmaShadowOverlaps) {
   EXPECT_EQ(overlaps[0].pc.address, 0x100u);
   EXPECT_EQ(overlaps[0].issue_point, 8);
   EXPECT_EQ(overlaps[0].shadow_end, 16);
+}
+
+// A 32-cycle MFMA's shadow ends at 32, so the next MFMA may issue one
+// timestamp granule early, at 28, but not at 27.
+TEST(InstProfileTest, OverlapToleranceFollowsTheMfmasCycles) {
+  KindTable table{{{0xf0, InstKind::mfma(32)}}};
+  for (int64_t second_issue : {27, 28}) {
+    SCOPED_TRACE(second_issue);
+    WaveBuilder b;
+    b.at(0xf0, kValu, 0, 4).at(0xf0, kValu, second_issue, 4);
+    InstProfile profile(InstProfileKind::Static, AggregateScope::All, true);
+    auto overlaps = profile.add_wave(b.wave(), 0, table.classifier());
+    ASSERT_EQ(overlaps.size(), second_issue == 27 ? 1u : 0u);
+    if (!overlaps.empty()) EXPECT_EQ(overlaps[0].shadow_end, 32);
+  }
 }
 
 }  // namespace

@@ -469,8 +469,7 @@ void run_trace(my_rocperf_tool::ReportChunk& out, TraceSummary& summary,
   my_rocperf_tool::WaveAnalysis analysis(
       options, [disas](const rocprofiler_thread_trace_decoder_pc_t& pc) {
         const auto* obj = disas->find_code_object(pc.code_object_id);
-        return obj ? obj->kind_at(pc.address)
-                   : my_rocperf_tool::InstKind::Other;
+        return obj ? obj->kind_at(pc.address) : my_rocperf_tool::InstKind{};
       });
   trace_decoder_context decoder_ctx(*disas, analysis);
   {

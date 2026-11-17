@@ -23,12 +23,12 @@ TraceInstReport trace_inst_report(AggregateScope scope, bool dynamic = false) {
   InstGroup g{scope, {1, 0, 2}, 0, {1, 4, 16, 4, 18, 3, 1, 1.0}, {}};
   g.rows = {{{0x100, 1},
              dynamic ? 1u : 0u,
-             InstKind::Mfma,
+             InstKind::mfma(16),
              kMfmaText,
              {2, 2, 8, 2, 0, 6, 0, 0}},
             {{0x104, 1},
              dynamic ? 2u : 0u,
-             InstKind::Other,
+             InstKind{},
              kAddText,
              {2, 1, 10, 4, 12, 6, 3, 25}}};
   if (scope == AggregateScope::All) {

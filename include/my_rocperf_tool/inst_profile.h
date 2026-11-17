@@ -38,8 +38,8 @@ struct InstSummary {
   double avg_records = 0, avg_dur = 0, avg_stall = 0, avg_idle = 0,
          avg_bubble = 0;
   double avg_mfma = 0;  // MFMA executions per wave
-  double mfma_util =
-      0;  // avg_mfma * kMfmaShadowCycles / avg_dur, 0 if avg_dur is 0
+  // Summed InstKind::mfma_cycles per wave / avg_dur, 0 if avg_dur is 0.
+  double mfma_util = 0;
 };
 
 struct InstGroup {

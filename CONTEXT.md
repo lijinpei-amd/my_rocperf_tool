@@ -96,16 +96,19 @@ Whether each record's duration is at least its stall, as the decoder's definitio
 ## MFMA
 
 **MFMA**:
-A matrix fused multiply-add: any `v_mfma_*` instruction, but not the sparse `v_smfmac_*` family.
+A matrix fused multiply-add: any `v_mfma_*` instruction but `v_mfma_ld_scale_b32`, which only loads the scales of the MFMA after it, and not the sparse `v_smfmac_*` family.
 
-**MFMA shadow** (`kMfmaShadowCycles`):
-The 16 cycles from an MFMA's issue point during which it is assumed to keep the MAI pipe busy, so a co-issued non-MFMA executes for free. Under `--mfma_coexec`, the shadow end moves only forward, independently for each loop walk or continuously across the entire wave in instruction reports.
+**MFMA cycles** (`InstKind::mfma_cycles`):
+The cycles an MFMA keeps its pipe busy: its reciprocal throughput in the ISA's LLVM scheduling model, counted in 4-cycle passes, times 4. On gfx950, for example, the 32x32 shapes take 32 cycles, the 16x16 shapes 16 and `v_mfma_f64_16x16x4_f64` 64. A variant scheduling class is resolved by the instruction's operands.
+
+**MFMA shadow**:
+The MFMA cycles from an MFMA's issue point, during which a co-issued non-MFMA executes for free. Under `--mfma_coexec`, the shadow end moves only forward, independently for each loop walk or continuously across the entire wave in instruction reports.
 
 **MFMA shadow overlap** (`MfmaShadowOverlap`):
-An MFMA that issues more than a timestamp granule inside the previous shadow, reported on stderr as a warning: a sign that `kMfmaShadowCycles` is wrong for the ISA.
+An MFMA that issues more than a timestamp granule inside the previous shadow, reported on stderr as a warning: a sign that the previous MFMA's cycles are wrong for the ISA.
 
 **MFMA utilization** (`mfma_time`, `mfma_util`):
-For loops, the body's MFMA count times `kMfmaShadowCycles` gives `mfma_time`, divided by average iteration duration for `mfma_util`. For whole-wave reports, utilization is MFMA executions per wave times the shadow length divided by summed record duration per wave; both reports give it with or without `--mfma_coexec`.
+For loops, the body's MFMA cycles, summed once per listed MFMA, give `mfma_time`, divided by average iteration duration for `mfma_util`. For whole-wave reports, utilization is each MFMA's executions times its MFMA cycles, summed per wave, divided by summed record duration per wave; both reports give it with or without `--mfma_coexec`.
 
 **Bubble**:
 Computed only under `--mfma_coexec`: the part of a non-MFMA record's span, `time` to `time + duration`, past the current shadow's end: cycles no MFMA covered. Rows sum it per instruction; `avg_bubble` is the loop record's total per iteration or the instruction group's total per wave.

@@ -97,6 +97,8 @@ class ObjectFileInfo {
   // Encoded size in bytes: 4, or more for an instruction that carries a
   // literal or a 64-bit encoding.
   uint32_t size_at(uint64_t vaddr) const;
+  // The class comes from the opcode; an MFMA's cycles come from this ISA's
+  // LLVM scheduling model, resolved for the instruction's operands.
   InstKind kind_at(uint64_t vaddr) const;
   // The instruction as LLVM prints it, trimmed. The trace decoder classifies
   // instructions by this text, so its exact bytes are part of the contract.

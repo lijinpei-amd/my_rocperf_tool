@@ -93,7 +93,7 @@ void WaveAnalysis::coalesce_barrier_tokens(const wave_t& wave) {
       continue;
     }
     const auto& nxt = wave.instructions_array[i + 1];
-    assert(kind_at(cur.pc) == InstKind::ClassicBarrier &&
+    assert(kind_at(cur.pc).cls == InstClass::ClassicBarrier &&
            "consecutive same-PC tokens at non-s_barrier PC");
     assert(cur.category == ROCPROFILER_THREAD_TRACE_DECODER_INST_MESSAGE &&
            "first s_barrier token must be MESSAGE");

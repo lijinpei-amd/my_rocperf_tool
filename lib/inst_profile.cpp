@@ -26,9 +26,13 @@ InstSummary summarize(uint64_t waves, const std::vector<InstRow>& rows) {
   if (!waves) return summary;
   InstSums sums;
   uint64_t mfmas = 0;
+  uint64_t mfma_time = 0;
   for (const auto& row : rows) {
     merge(sums, row.sums);
-    if (row.kind == InstKind::Mfma) mfmas += row.sums.n;
+    if (row.kind.cls == InstClass::Mfma) {
+      mfmas += row.sums.n;
+      mfma_time += row.sums.n * row.kind.mfma_cycles;
+    }
   }
   summary.avg_records = static_cast<double>(sums.n) / waves;
   summary.avg_dur = static_cast<double>(sums.dur) / waves;
@@ -37,7 +41,8 @@ InstSummary summarize(uint64_t waves, const std::vector<InstRow>& rows) {
   summary.avg_bubble = static_cast<double>(sums.bubble) / waves;
   summary.avg_mfma = static_cast<double>(mfmas) / waves;
   if (summary.avg_dur > 0)
-    summary.mfma_util = summary.avg_mfma * kMfmaShadowCycles / summary.avg_dur;
+    summary.mfma_util =
+        static_cast<double>(mfma_time) / waves / summary.avg_dur;
   return summary;
 }
 
@@ -81,8 +86,7 @@ std::vector<MfmaShadowOverlap> InstProfile::add_wave(const wave_t& wave,
     int64_t rel = issue_point - *first_issue;
     // Drop negative relative issue, as loop rows do for duration below stall.
     if (rel >= 0) sums.rel_issue += static_cast<uint64_t>(rel);
-    if (mfma_coexec)
-      sums.bubble += shadow.step(inst, inst_kind == InstKind::Mfma, overlaps);
+    if (mfma_coexec) sums.bubble += shadow.step(inst, inst_kind, overlaps);
   }
 
   WaveSlot slot{wave.cu, wave.simd, wave.wave_id};

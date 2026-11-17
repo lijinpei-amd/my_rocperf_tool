@@ -100,7 +100,7 @@ TEST(DisassemblerTest, DecodeAllDecodesEveryTextSection) {
 
   const auto* two_texts = disas.find_code_object(1);
   EXPECT_EQ(two_texts->text_at(0x1000), "s_nop 0");
-  EXPECT_EQ(two_texts->kind_at(0x2000), InstKind::Mfma);
+  EXPECT_EQ(two_texts->kind_at(0x2000), InstKind::mfma(32));
   EXPECT_EQ(two_texts->inst_vaddrs(0x2000, 0x200c),
             (std::vector<uint64_t>{0x2000, 0x2008, 0x200c}));
   EXPECT_EQ(disas.find_code_object(2)->text_at(0x0), "s_barrier_signal -1");
@@ -131,7 +131,7 @@ TEST(DisassemblerTest, LoadsALiveRecordOfACodeObjectInMemory) {
   const auto* obj = disas.find_code_object(7);
   ASSERT_NE(obj, nullptr);
   EXPECT_EQ(obj->text_at(0x18), "s_endpgm");
-  EXPECT_EQ(obj->kind_at(0x04), InstKind::Mfma);
+  EXPECT_EQ(obj->kind_at(0x04), InstKind::mfma(32));
 }
 
 // Neither a file nor memory: there is nothing to read the code object from.
@@ -186,14 +186,14 @@ TEST_F(ObjectFileInfoTest, AnswersSizeKindAndTextAtEachVaddr) {
     std::string text;
   };
   const Inst expected[] = {
-      {0x00, 4, InstKind::Other, "s_nop 0"},
-      {0x04, 8, InstKind::Mfma,
+      {0x00, 4, InstKind{}, "s_nop 0"},
+      {0x04, 8, InstKind::mfma(32),
        "v_mfma_f32_32x32x8_f16 a[0:15], v[0:1], v[2:3], a[0:15]"},
-      {0x0c, 4, InstKind::ClassicBarrier, "s_barrier"},
-      {0x10, 8, InstKind::Other, "s_mov_b32 s0, 0x12345678"},
-      {0x18, 4, InstKind::Other, "s_endpgm"},
-      // InstKind::Mfma leaves out the sparse v_smfmac_* family.
-      {0x1c, 8, InstKind::Other,
+      {0x0c, 4, InstKind::classic_barrier(), "s_barrier"},
+      {0x10, 8, InstKind{}, "s_mov_b32 s0, 0x12345678"},
+      {0x18, 4, InstKind{}, "s_endpgm"},
+      // InstClass::Mfma leaves out the sparse v_smfmac_* family.
+      {0x1c, 8, InstKind{},
        "v_smfmac_f32_16x16x32_f16 a[0:3], v[0:1], v[2:5], v6"},
   };
   for (const auto& e : expected) {
@@ -208,9 +208,48 @@ TEST_F(ObjectFileInfoTest, AnswersSizeKindAndTextAtEachVaddr) {
 // s_barrier whose two trace tokens the CLI merges.
 TEST_F(ObjectFileInfoTest, Gfx12SplitBarrierIsNotClassic) {
   EXPECT_EQ(gfx1200_->text_at(0x0), "s_barrier_signal -1");
-  EXPECT_EQ(gfx1200_->kind_at(0x0), InstKind::Other);
-  EXPECT_EQ(gfx1200_->kind_at(0x4), InstKind::Other);
-  EXPECT_EQ(gfx1200_->kind_at(0x8), InstKind::Other);
+  EXPECT_EQ(gfx1200_->kind_at(0x0), InstKind{});
+  EXPECT_EQ(gfx1200_->kind_at(0x4), InstKind{});
+  EXPECT_EQ(gfx1200_->kind_at(0x8), InstKind{});
+}
+
+// An MFMA's cycles are its passes in LLVM's gfx950 scheduling model, times 4:
+// 32x32 shapes and the f64 MFMA take more than the 16x16 shapes, and the
+// f8f6f4 MFMA's variant scheduling class resolves by its operands.
+// v_mfma_ld_scale_b32 is no MFMA.
+TEST(DisassemblerTest, Gfx950MfmaCyclesComeFromTheSchedulingModel) {
+  Disassembler disas;
+  auto err = disas.add_code_object(1, code_object_path("gfx950"));
+  ASSERT_FALSE(static_cast<bool>(err)) << llvm::toString(std::move(err));
+  const auto* obj = disas.find_code_object(1);
+  ASSERT_NE(obj, nullptr);
+  struct Inst {
+    uint64_t vaddr;
+    InstKind kind;
+    std::string text;
+  };
+  const Inst expected[] = {
+      {0x00, InstKind::mfma(32),
+       "v_mfma_f32_32x32x16_bf16 a[0:15], v[0:3], v[4:7], a[0:15]"},
+      {0x08, InstKind::mfma(32),
+       "v_mfma_f32_32x32x16_f16 a[0:15], v[0:3], v[4:7], a[0:15]"},
+      {0x10, InstKind::mfma(32),
+       "v_mfma_f32_32x32x8_f16 a[0:15], v[0:1], v[2:3], a[0:15]"},
+      {0x18, InstKind::mfma(16),
+       "v_mfma_f32_16x16x32_bf16 a[0:3], v[0:3], v[4:7], a[0:3]"},
+      {0x20, InstKind::mfma(64),
+       "v_mfma_f64_16x16x4_f64 v[0:7], v[8:9], v[10:11], v[0:7]"},
+      {0x28, InstKind::mfma(16),
+       "v_mfma_f32_16x16x128_f8f6f4 a[0:3], v[0:7], v[8:15], a[0:3]"},
+      // It only loads the scales of the MFMA after it.
+      {0x30, InstKind{}, "v_mfma_ld_scale_b32 v0, v1"},
+      {0x38, InstKind{}, "s_endpgm"},
+  };
+  for (const auto& e : expected) {
+    SCOPED_TRACE(e.text);
+    EXPECT_EQ(obj->text_at(e.vaddr), e.text);
+    EXPECT_EQ(obj->kind_at(e.vaddr), e.kind);
+  }
 }
 
 TEST_F(ObjectFileInfoTest, CopiesTextOnlyIntoABufferItFits) {
@@ -278,13 +317,13 @@ TEST_F(TwoTextSectionsTest, AnswersAtVaddrsInEitherSection) {
   };
   // Alternating sections, so each query moves to the other one.
   const Inst expected[] = {
-      {0x1000, 4, InstKind::Other, "s_nop 0"},
-      {0x2000, 8, InstKind::Mfma,
+      {0x1000, 4, InstKind{}, "s_nop 0"},
+      {0x2000, 8, InstKind::mfma(32),
        "v_mfma_f32_32x32x8_f16 a[0:15], v[0:1], v[2:3], a[0:15]"},
-      {0x1004, 8, InstKind::Other, "s_mov_b32 s0, 0x12345678"},
-      {0x2008, 4, InstKind::ClassicBarrier, "s_barrier"},
-      {0x100c, 4, InstKind::Other, "s_endpgm"},
-      {0x200c, 4, InstKind::Other, "s_endpgm"},
+      {0x1004, 8, InstKind{}, "s_mov_b32 s0, 0x12345678"},
+      {0x2008, 4, InstKind::classic_barrier(), "s_barrier"},
+      {0x100c, 4, InstKind{}, "s_endpgm"},
+      {0x200c, 4, InstKind{}, "s_endpgm"},
   };
   for (const auto& e : expected) {
     SCOPED_TRACE(e.vaddr);

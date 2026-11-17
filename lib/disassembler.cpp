@@ -13,6 +13,7 @@
 #include "llvm/MC/MCInstPrinter.h"
 #include "llvm/MC/MCInstrInfo.h"
 #include "llvm/MC/MCRegisterInfo.h"
+#include "llvm/MC/MCSchedule.h"
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/MC/MCSubtargetInfo.h"
 #include "llvm/MC/TargetRegistry.h"
@@ -29,6 +30,7 @@
 
 #include <cassert>
 #include <cctype>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -95,10 +97,10 @@ namespace my_rocperf_tool {
 // The MC objects that vary with the ISA -- everything downstream of one
 // (mcpu, features) pair. Code objects sharing an ISA share one of these; the
 // owning Disassembler caches them by SubTargetKey, so the whole stack is built
-// once per gfx target rather than once per loaded executable. So is the kind
+// once per gfx target rather than once per loaded executable. So is the class
 // table: an opcode is classified once per ISA for the Disassembler's lifetime.
 //
-// Not thread-safe: print_inst writes a shared scratch buffer, kind_of fills
+// Not thread-safe: print_inst writes a shared scratch buffer, class_of fills
 // its table on first use, and the MC disassembler carries per-call state. That
 // is fine as used, because each worker thread owns a Disassembler and
 // therefore its own contexts.
@@ -115,18 +117,24 @@ class SubTargetContext {
   // buffer that the next call overwrites -- copy it to keep it longer.
   llvm::StringRef print_inst(const llvm::MCInst& inst) const;
 
-  InstKind kind_of(unsigned opcode) const {
-    auto& kind = kinds[opcode];
-    if (LLVM_UNLIKELY(kind < 0)) kind = static_cast<int8_t>(classify(opcode));
-    return static_cast<InstKind>(kind);
+  InstKind kind_of(const llvm::MCInst& inst) const {
+    InstClass cls = class_of(inst.getOpcode());
+    if (cls != InstClass::Mfma) return {cls, 0};
+    return InstKind::mfma(mfma_cycles(inst));
   }
 
  private:
-  InstKind classify(unsigned opcode) const;
+  InstClass class_of(unsigned opcode) const {
+    auto& cls = classes[opcode];
+    if (LLVM_UNLIKELY(cls < 0)) cls = static_cast<int8_t>(classify(opcode));
+    return static_cast<InstClass>(cls);
+  }
+  InstClass classify(unsigned opcode) const;
+  uint16_t mfma_cycles(const llvm::MCInst& inst) const;
 
-  // An InstKind per opcode, -1 until first queried. Bytes rather than
+  // An InstClass per opcode, -1 until first queried. Bytes rather than
   // std::optional, so filling a table of every opcode is one memset.
-  mutable std::vector<int8_t> kinds;
+  mutable std::vector<int8_t> classes;
   // Declaration order is lifetime order. The streamer holds a
   // formatted_raw_ostream over inst_stream, an inst printer and code emitter
   // over mc_instr_info/mc_ctx, and an asm backend over sub_target, so it must
@@ -152,7 +160,7 @@ SubTargetContext::SubTargetContext(const Disassembler& disas,
   sub_target.reset(target->createMCSubtargetInfo(triple, mcpu, features));
   assert(sub_target);
   mc_instr_info.reset(target->createMCInstrInfo());
-  kinds.assign(mc_instr_info->getNumOpcodes(), -1);
+  classes.assign(mc_instr_info->getNumOpcodes(), -1);
   mc_ctx = std::make_unique<llvm::MCContext>(triple, &asm_info, &reg_info,
                                              sub_target.get(), nullptr,
                                              &disas.mc_options);
@@ -178,9 +186,12 @@ llvm::StringRef SubTargetContext::print_inst(const llvm::MCInst& inst) const {
   return llvm::StringRef(inst_str).trim();
 }
 
-InstKind SubTargetContext::classify(unsigned opcode) const {
+InstClass SubTargetContext::classify(unsigned opcode) const {
   auto name = mc_instr_info->getName(opcode);
-  if (name.starts_with("V_MFMA")) return InstKind::Mfma;
+  // v_mfma_ld_scale_b32 only loads the scales of the MFMA after it, off the
+  // matrix pipe.
+  if (name.starts_with("V_MFMA") && !name.starts_with("V_MFMA_LD_SCALE"))
+    return InstClass::Mfma;
   // LLVM AMDGPU decorates opcode names with a lowercase subtarget tag
   // ("S_BARRIER_vi", "S_BARRIER_gfx10", ...). The gfx12 split-barrier
   // family is distinct: S_BARRIER_WAIT_*, S_BARRIER_SIGNAL_*, etc. -- an
@@ -190,8 +201,21 @@ InstKind SubTargetContext::classify(unsigned opcode) const {
   if (name == "S_BARRIER" ||
       (name.starts_with(kPrefix) && name.size() > kPrefix.size() &&
        std::islower(static_cast<unsigned char>(name[kPrefix.size()]))))
-    return InstKind::ClassicBarrier;
-  return InstKind::Other;
+    return InstClass::ClassicBarrier;
+  return InstClass::Other;
+}
+
+// LLVM's AMDGPU scheduling models count an MFMA's pipe occupancy in passes of
+// 4 cycles: HWXDL for most, HWVALU for the f64 forms. Some gfx950 f8f6f4
+// MFMAs have variant scheduling classes that their operands resolve, so this
+// asks per instruction rather than per opcode.
+uint16_t SubTargetContext::mfma_cycles(const llvm::MCInst& inst) const {
+  constexpr double kCyclesPerPass = 4;
+  double passes = sub_target->getSchedModel().getReciprocalThroughput(
+      *sub_target, *mc_instr_info, inst);
+  long cycles = std::lround(passes * kCyclesPerPass);
+  assert(cycles > 0 && cycles <= UINT16_MAX && "MFMA without a pass count");
+  return static_cast<uint16_t>(cycles);
 }
 
 struct ObjectFileInfo::Slot {
@@ -316,7 +340,7 @@ uint32_t ObjectFileInfo::size_at(uint64_t vaddr) const {
 }
 
 InstKind ObjectFileInfo::kind_at(uint64_t vaddr) const {
-  return sub_target_ctx->kind_of(slot_at(vaddr).inst.getOpcode());
+  return sub_target_ctx->kind_of(slot_at(vaddr).inst);
 }
 
 std::string ObjectFileInfo::text_at(uint64_t vaddr) const {

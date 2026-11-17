@@ -71,7 +71,7 @@ struct LoopSummary {
   double avg_dur, avg_stall, avg_idle, avg_bubble;
   double mfma_util;  // mfma_time / avg_dur
   uint32_t mfma_count;
-  uint32_t mfma_time;  // mfma_count * kMfmaShadowCycles
+  uint32_t mfma_time;  // Sum of the body MFMAs' InstKind::mfma_cycles
 };
 
 // What the profile answers for one loop record: a row per body instruction,

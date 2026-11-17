@@ -5,15 +5,15 @@
 namespace my_rocperf_tool {
 
 uint64_t MfmaShadow::step(const rocprofiler_thread_trace_decoder_inst_t& inst,
-                          bool is_mfma,
+                          InstKind kind,
                           std::vector<MfmaShadowOverlap>& overlaps) {
-  if (is_mfma) {
+  if (kind.cls == InstClass::Mfma) {
     int64_t issue_point = inst.time + inst.stall;
     // Up to one timestamp granule of overlap is decoder slop.
     if (end > 0 && issue_point < end - kAttTimestampGranule)
       overlaps.push_back({inst.pc, issue_point, end});
     // Never rewind and uncover cycles the previous MFMA already covered.
-    end = std::max(end, issue_point + kMfmaShadowCycles);
+    end = std::max(end, issue_point + int64_t{kind.mfma_cycles});
     return 0;
   }
   int64_t uncovered = inst.time + inst.duration - end;

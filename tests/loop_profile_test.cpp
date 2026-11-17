@@ -47,7 +47,7 @@ TEST(LoopProfileTest, RowsSumEachExecutionOfTheBody) {
   LoopProfile profile;
 
   auto loops = add_wave(profile, builder, table);
-  auto body = list_body(kLoop, {{kLoopHeader + 4, InstKind::Mfma}});
+  auto body = list_body(kLoop, {{kLoopHeader + 4, kMfmaKind}});
   auto metrics = profile.metrics(wave_record(loops), body);
 
   ASSERT_EQ(metrics.rows.size(), body.size());
@@ -101,7 +101,7 @@ TEST(LoopProfileTest, IssueIsZeroWhereStallExceedsDuration) {
 }
 
 TEST(LoopProfileTest, NoBubblesWithoutMfmaCoexec) {
-  KindTable table{{{kLoopHeader, InstKind::Mfma}}};
+  KindTable table{{{kLoopHeader, kMfmaKind}}};
   WaveBuilder builder;
   builder.iteration(/*branch_taken=*/true).iteration(/*branch_taken=*/false);
   LoopProfile profile;
@@ -117,7 +117,7 @@ TEST(LoopProfileTest, NoBubblesWithoutMfmaCoexec) {
 }
 
 TEST(LoopProfileTest, SummaryAveragesTheRecordsIterations) {
-  KindTable table{{{kLoopHeader, InstKind::Mfma}}};
+  KindTable table{{{kLoopHeader, kMfmaKind}}};
   // The MFMA's shadow covers each pass's first 16 cycles. The first pass's
   // second record has its last 4 cycles uncovered; each branch all 3 of its.
   WaveBuilder builder;
@@ -128,9 +128,9 @@ TEST(LoopProfileTest, SummaryAveragesTheRecordsIterations) {
       .at(kLoopBranch, kNext, /*time=*/130, /*duration=*/3);
   LoopProfile profile(/*mfma_coexec=*/true);
   add_wave(profile, builder, table);
-  // The listing's kinds count, executed or not.
-  auto body = list_body(kLoop, {{kLoopHeader, InstKind::Mfma},
-                                {kLoopHeader + 8, InstKind::Mfma}});
+  // The listing's kinds count, executed or not, each MFMA at its own cycles.
+  auto body = list_body(
+      kLoop, {{kLoopHeader, InstKind::mfma(32)}, {kLoopHeader + 8, kMfmaKind}});
   LoopRecord record{kLoop,
                     {/*iteration_count=*/4, /*total_inst_count=*/12,
                      /*total_duration=*/100, /*total_stall=*/20,
@@ -146,15 +146,13 @@ TEST(LoopProfileTest, SummaryAveragesTheRecordsIterations) {
   // The bubble of both passes, 4 + 2 * 3, per iteration of the record.
   EXPECT_DOUBLE_EQ(summary.avg_bubble, 2.5);
   EXPECT_EQ(summary.mfma_count, 2u);
-  EXPECT_EQ(summary.mfma_time, 2 * kMfmaShadowCycles);
-  EXPECT_DOUBLE_EQ(summary.mfma_util, 2.0 * kMfmaShadowCycles / 25.0);
+  EXPECT_EQ(summary.mfma_time, 32 + kSyntheticMfmaCycles);
+  EXPECT_DOUBLE_EQ(summary.mfma_util, (32.0 + kSyntheticMfmaCycles) / 25.0);
 }
 
 // The scope tests' loop: an MFMA header, whose shadow covers what ends in the
 // 16 cycles after it issues.
-KindTable mfma_header_table() {
-  return KindTable{{{kLoopHeader, InstKind::Mfma}}};
-}
+KindTable mfma_header_table() { return KindTable{{{kLoopHeader, kMfmaKind}}}; }
 
 // Two passes of WaveBuilder::inst records, 10 cycles apart. The shadow ends
 // 17 cycles into each pass, so all 4 cycles of each of the last two records
@@ -372,7 +370,7 @@ TEST(LoopProfileTest, SideBySideLoopsKeepTheirOwnShadowAndHeader) {
   constexpr uint64_t kOtherHeader = 0x200;
   constexpr uint64_t kOtherBranch = 0x20c;
   constexpr BackEdge kOther{kCodeObject, kOtherBranch, kOtherHeader};
-  KindTable table{{{kMfma, InstKind::Mfma}}};
+  KindTable table{{{kMfma, kMfmaKind}}};
   // Back-to-back records of 4 cycles, none stalled.
   WaveBuilder builder;
   for (int pass = 0; pass < 2; pass++) {
@@ -419,7 +417,7 @@ TEST(LoopProfileTest, SideBySideLoopsKeepTheirOwnShadowAndHeader) {
 // Slot (0, 0, 1) runs waves 0, 1 and 3; the loop is detected in 0 (2 passes)
 // and 1 (3 passes), not in 3 (1 pass). Slot (0, 1, 0) runs wave 2 (2 passes).
 TEST(LoopProfileTest, SlotRecordSumsItsSlotsWavesWithTheLoop) {
-  KindTable table{{{kLoopHeader, InstKind::Mfma}}};
+  KindTable table{{{kLoopHeader, kMfmaKind}}};
   LoopProfile profile(/*mfma_coexec=*/true);
   auto passes = [](WaveBuilder& b, int n) {
     for (int i = 0; i < n; i++) b.iteration(/*branch_taken=*/i + 1 < n);

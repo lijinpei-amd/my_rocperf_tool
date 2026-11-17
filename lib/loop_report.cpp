@@ -304,8 +304,8 @@ void render_loop_text_stats(ReportChunk& out, const LoopRecordMetrics& metrics,
   writef(out, "    avg/iter: dur={:.2f} stall={:.2f} idle={:.2f}", sum.avg_dur,
          sum.avg_stall, sum.avg_idle);
   if (cfg.show_mfma_coexec) writef(out, " bubble={:.2f}", sum.avg_bubble);
-  writef(out, " mfma_time={} ({} mfma * {}) mfma_util={:.1f}%\n", sum.mfma_time,
-         sum.mfma_count, kMfmaShadowCycles, sum.mfma_util * 100.0);
+  writef(out, " mfma_time={} ({} mfma) mfma_util={:.1f}%\n", sum.mfma_time,
+         sum.mfma_count, sum.mfma_util * 100.0);
   if (cfg.report != ReportKind::LoopDetail) return;
 
   writef(out, "    ");
