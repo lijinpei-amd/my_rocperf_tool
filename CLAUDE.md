@@ -64,10 +64,10 @@ Selects one report for each trace under `--att_output_dir`:
 
 | Option | Values / behavior |
 |---|---|
-| `--report` | `loop_summary` (default), `loop_detail`, `static_inst`, `dynamic_inst`, `none` |
-| `--aggregate` | `wave` (default), `simd_slot`, `all`; every group stays within one trace / SE |
+| `--report` | `loop_summary`, `loop_detail`, `static_inst` (default), `dynamic_inst`, `none` |
+| `--aggregate` | `wave`, `simd_slot`, `all` (default); every group stays within one trace / SE |
 | `--output_format` | `text` (default), `csv`, `json` |
-| `--inst_stats`, `--inst_addr`, `--inst_avg` | Shape instruction rows; averages are per execution |
+| `--inst_stats`, `--inst_addr`, `--inst_avg` | Shape instruction rows; `--inst_avg` (default on) shows per-execution averages instead of sums |
 | `--mfma_coexec`, `--color_mfma_bubble` | Compute MFMA-shadow bubbles and color text rows |
 
 Only loop reports detect loops. `none` still decodes and prints the stderr summary, with zero stdout bytes. Static memory grows with executed PCs per group; dynamic memory grows with distinct `(PC, occurrence)` keys, up to the longest wave's records per group. Per-wave instruction reports retain a row set per wave until rendering. Lossy traces include waves caught mid-run, which skews their relative issue and occurrences.

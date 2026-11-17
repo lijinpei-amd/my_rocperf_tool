@@ -112,7 +112,7 @@ ABSL_FLAG(std::optional<std::string>, att_output_dir, std::nullopt,
           "output file dir");
 // A help text's first line describes the flag; print_help lists each later
 // line, one enum value with an optional ": note", on a line of its own.
-ABSL_FLAG(std::string, report, "loop_summary",
+ABSL_FLAG(std::string, report, "static_inst",
           "report to print. Waves caught mid-run in lossy traces are "
           "included, which skews their relative issue times and occurrences:\n"
           "loop_summary\n"
@@ -121,15 +121,14 @@ ABSL_FLAG(std::string, report, "loop_summary",
           "dynamic_inst: memory grows with the longest wave's records per "
           "group\n"
           "none");
-ABSL_FLAG(std::string, aggregate, "wave",
+ABSL_FLAG(std::string, aggregate, "all",
           "group records by:\n"
           "wave\n"
           "simd_slot\n"
           "all");
 ABSL_FLAG(bool, inst_stats, true, "show per-instruction stats");
 ABSL_FLAG(bool, inst_addr, true, "show instruction addresses in text");
-ABSL_FLAG(bool, inst_avg, false,
-          "show average per-execution instruction stats");
+ABSL_FLAG(bool, inst_avg, true, "show average per-execution instruction stats");
 ABSL_FLAG(std::string, output_format, "text",
           "output format:\n"
           "text\n"
